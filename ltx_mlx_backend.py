@@ -585,9 +585,9 @@ class LocalVideoGenerator:
                 "Missing ltx_pipelines_mlx. Install the MLX monorepo packages, e.g.:\n"
                 "  uv pip install \\\n"
                 "    \"ltx-core-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git"
-                "@v0.5.0#subdirectory=packages/ltx-core-mlx\" \\\n"
+                "@v0.8.3#subdirectory=packages/ltx-core-mlx\" \\\n"
                 "    \"ltx-pipelines-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git"
-                "@v0.5.0#subdirectory=packages/ltx-pipelines-mlx\""
+                "@v0.8.3#subdirectory=packages/ltx-pipelines-mlx\""
             ) from e
         path = self._resolve_model_dir()
         self._model_path = path

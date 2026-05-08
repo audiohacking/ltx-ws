@@ -3,9 +3,9 @@ av>=12.0
 Pillow>=10.0
 huggingface_hub>=0.20.0
 
-# MLX LTX-2.3 (Apple Silicon) — ltx-2-mlx v0.5.0 (PyPI TBD):
+# MLX LTX-2.3 (Apple Silicon) — ltx-2-mlx v0.8.3 (PyPI TBD):
 #   uv pip install \
-#     "ltx-core-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@v0.5.0#subdirectory=packages/ltx-core-mlx" \
-#     "ltx-pipelines-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@v0.5.0#subdirectory=packages/ltx-pipelines-mlx"
+#     "ltx-core-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@v0.8.3#subdirectory=packages/ltx-core-mlx" \
+#     "ltx-pipelines-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@v0.8.3#subdirectory=packages/ltx-pipelines-mlx"
 #
 # Upstream: https://github.com/dgrauet/ltx-2-mlx
