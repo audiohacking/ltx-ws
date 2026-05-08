@@ -57,8 +57,8 @@ source .venv/bin/activate   # or: source .venv/bin/activate.fish
 
 uv pip install -r requirements.txt
 uv pip install \
-  "ltx-core-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git#subdirectory=packages/ltx-core-mlx" \
-  "ltx-pipelines-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git#subdirectory=packages/ltx-pipelines-mlx"
+  "ltx-core-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@v0.5.0#subdirectory=packages/ltx-core-mlx" \
+  "ltx-pipelines-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@v0.5.0#subdirectory=packages/ltx-pipelines-mlx"
 ```
 
 Use `pip` instead of `uv pip` if you prefer.
