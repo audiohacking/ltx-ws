@@ -604,6 +604,7 @@ class LocalVideoGenerator:
         if ic_cls is not None:
             self._pipe_classes["ic_lora"] = ic_cls
         # Prefer most specific/newer class names first when multiple are present.
+        # Order rationale: V11-specific > generic X2 > generic spatial > legacy alias.
         for cls_name in (
             "SpatialUpscalerX2V11Pipeline",
             "SpatialUpscalerX2Pipeline",
@@ -729,7 +730,8 @@ class LocalVideoGenerator:
                     call_kwargs[name] = source_video_path
                     break
 
-            # Backend compatibility: select one supported tiled-sampler control arg.
+            # Backend compatibility: pick the first recognized control by preference:
+            # explicit boolean flags first, then string sampler-name style controls.
             for name, value in (
                 ("use_tiled_sampler", True),
                 ("tiled", True),
