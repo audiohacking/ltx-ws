@@ -612,6 +612,7 @@ class LocalVideoGenerator:
             up_cls = getattr(lpm, cls_name, None)
             if up_cls is not None:
                 self._pipe_classes["spatial_upscaler"] = up_cls
+                log.info("Detected spatial upscaler pipeline class: %s", cls_name)
                 break
         log.info("MLX model path resolved ✓ %s", path)
 
@@ -699,6 +700,7 @@ class LocalVideoGenerator:
                 pipe,
                 prompt=prompt,
                 output_path=output_path,
+                # Backend compatibility: different ltx-2-mlx builds use different input-video arg names.
                 video=source_video_path,
                 video_path=source_video_path,
                 source_video=source_video_path,
@@ -714,7 +716,7 @@ class LocalVideoGenerator:
                 seed=seed,
                 num_steps=num_steps,
                 lora_paths=lora_paths,
-                # Request tiled second-stage sampling using common arg names.
+                # Backend compatibility: tiled sampler flags have varied across releases.
                 tiled=True,
                 use_tiled_sampler=True,
                 sampler="tiled",
