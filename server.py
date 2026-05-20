@@ -105,7 +105,7 @@ RAM_GB_Q8_MIN        = 32.0
 RAM_GB_Q4_MIN        = 16.0
 DEFAULT_GLOBAL_LORA_PATH = (
     "https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/loras/"
-    "ltx-2.3-22b-distilled-1.1_lora-dynamic_fro09_avg_rank_111_bf16.safetensors"
+    "LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors"
 )
 DEFAULT_GLOBAL_LORA_SCALE = 1.0
 DEFAULT_NUM_FRAMES     = 97    # ~4 s @ 24 fps; LTX requires (8k+1) frames: 9, 17, 25, … 97, 105, …

@@ -128,20 +128,23 @@ Useful variants:
 python server.py --port 9000
 python server.py --model dgrauet/ltx-2.3-mlx-q8 --infer-steps 8 --num-frames 65
 python server.py --height 512 --width 768 --mlx-low-memory
-python server.py --enable-lora --lora Kijai/LTX2.3_comfy 1.0
+python server.py --enable-lora \
+  --lora https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/loras/LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors 1.0
 # multiple LoRAs (repeat --lora)
 python server.py --enable-lora \
-  --lora Kijai/LTX2.3_comfy 1.0 \
+  --lora https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/loras/LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors 1.0 \
   --lora /path/to/another_lora.safetensors 0.6
 # enable default LoRA via env
 LTX_WS_ENABLE_LORA=1 python server.py
 # override default LoRA via env (still requires enable)
-LTX_WS_DEFAULT_LORA="https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/loras/ltx-2.3-22b-distilled-1.1_lora-dynamic_fro09_avg_rank_111_bf16.safetensors" \
+LTX_WS_DEFAULT_LORA="https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/loras/LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors" \
 LTX_WS_DEFAULT_LORA_SCALE="1.0" LTX_WS_ENABLE_LORA=1 python server.py
 # multi-default via env (comma-separated path:scale)
-LTX_WS_DEFAULT_LORAS="Kijai/LTX2.3_comfy:1.0,/path/to/another_lora.safetensors:0.6" \
+LTX_WS_DEFAULT_LORAS="https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/loras/LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors:1.0,/path/to/another_lora.safetensors:0.6" \
 LTX_WS_ENABLE_LORA=1 python server.py
 ```
+
+Quality tip: for higher-quality two-stage outputs in Comfy workflows, use **LTX Tiled Sampler** as the second sampler after the upscaler.
 
 ---
 
