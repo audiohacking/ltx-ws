@@ -1069,7 +1069,7 @@ class LocalVideoGenerator:
                         base_h, base_w = self._calculate_stage1_dimensions(height, width)
                         lowres_out_path = os.path.join(tmpdir, "output_lowres.mp4")
                         log.info(
-                            "Two-stage generate enabled: stage1=%sx%s → stage2=%sx%s (tiled sampler requested)",
+                            "Two-stage generate enabled: stage1=%sx%s -> stage2=%sx%s (tiled sampler requested)",
                             base_h,
                             base_w,
                             height,
