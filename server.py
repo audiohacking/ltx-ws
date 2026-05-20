@@ -1050,8 +1050,9 @@ examples:
         action="store_true",
         help=(
             "for mode=generate only: run the normal one-stage pipeline (with standard LoRA "
-            "support) at 1/2 requested resolution, then apply LTX spatial_upscaler_x2_v1_1 "
-            "to restore final output to client size (snapped to a valid 64-px grid). "
+            "support) at 1/2 requested resolution, then apply a spatial upscaler second stage "
+            "to restore final output to client size; tiled sampler is requested for this second stage "
+            "when supported by the installed ltx-2-mlx backend. "
             "Not used for a2v/retake/extend/ic_lora."
         ),
     )
@@ -1155,10 +1156,10 @@ def main() -> None:
     if args.upscale:
         print(
             "  upscale  : on  (normal pipeline at ½ client resolution + "
-            "spatial_upscaler_x2_v1_1 to final 64-px-snapped size)"
+            "spatial upscaler second stage, with tiled sampler requested when supported)"
         )
     else:
-        print("  upscale  : off  (--upscale for normal@half-res + spatial 2× pass on generate jobs)")
+        print("  upscale  : off  (--upscale for normal@half-res + spatial upscaler second stage on generate jobs)")
     print(f"{'═' * 60}\n")
 
     spill_dir = Path(args.spill_dir).expanduser().resolve()

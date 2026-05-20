@@ -571,6 +571,7 @@ class LocalVideoGenerator:
         self._pipe_classes: dict[str, Any] = {}
         self._pipes: dict[str, Any] = {}
         self._resolved_default_loras: list[tuple[str, float]] | None = None
+        self._lpm_module: Any | None = None
 
     def _resolve_model_dir(self) -> str:
         return resolve_mlx_weights_directory(self.model, self.model_dir)
@@ -591,6 +592,7 @@ class LocalVideoGenerator:
             ) from e
         path = self._resolve_model_dir()
         self._model_path = path
+        self._lpm_module = lpm
         self._pipe_classes = {
             "t2v": lpm.TextToVideoPipeline,
             "i2v": lpm.ImageToVideoPipeline,
@@ -601,6 +603,16 @@ class LocalVideoGenerator:
         ic_cls = getattr(lpm, "ICLoraPipeline", None)
         if ic_cls is not None:
             self._pipe_classes["ic_lora"] = ic_cls
+        for cls_name in (
+            "SpatialUpscalerPipeline",
+            "SpatialUpscalerX2Pipeline",
+            "SpatialUpscalerX2V11Pipeline",
+            "LTXSpatialUpscalerPipeline",
+        ):
+            up_cls = getattr(lpm, cls_name, None)
+            if up_cls is not None:
+                self._pipe_classes["spatial_upscaler"] = up_cls
+                break
         log.info("MLX model path resolved ✓ %s", path)
 
     def _get_pipe(self, key: str) -> Any:
@@ -654,6 +666,77 @@ class LocalVideoGenerator:
         if self._resolved_default_loras is not None:
             return len(self._resolved_default_loras)
         return len(self.default_lora_specs)
+
+    def _upscale_base_size(self, height: int, width: int) -> tuple[int, int]:
+        base_h = _align_ltx2_spatial(max(LTX2_SPATIAL_ALIGN, int(round(height / 2.0))))
+        base_w = _align_ltx2_spatial(max(LTX2_SPATIAL_ALIGN, int(round(width / 2.0))))
+        return base_h, base_w
+
+    def _run_spatial_upscaler_with_tiled_sampler(
+        self,
+        *,
+        prompt: str,
+        source_video_path: str,
+        output_path: str,
+        height: int,
+        width: int,
+        num_frames: int,
+        seed: int,
+        num_steps: int,
+        lora_paths: list[tuple[str, float]],
+    ) -> bool:
+        try:
+            pipe = self._get_pipe("spatial_upscaler")
+        except Exception as exc:
+            log.warning(
+                "Spatial upscaler pipeline unavailable; using first-stage output only: %s",
+                exc,
+            )
+            return False
+
+        try:
+            _invoke_generate_and_save(
+                pipe,
+                prompt=prompt,
+                output_path=output_path,
+                video=source_video_path,
+                video_path=source_video_path,
+                source_video=source_video_path,
+                source_video_path=source_video_path,
+                input_video=source_video_path,
+                input_video_path=source_video_path,
+                height=height,
+                width=width,
+                target_height=height,
+                target_width=width,
+                num_frames=num_frames,
+                fps=float(self.fps),
+                seed=seed,
+                num_steps=num_steps,
+                lora_paths=lora_paths,
+                # Request tiled second-stage sampling using common arg names.
+                tiled=True,
+                use_tiled_sampler=True,
+                sampler="tiled",
+                sampler_name="tiled",
+                sampling_method="tiled",
+                second_sampler="tiled",
+            )
+        except Exception as exc:
+            log.warning(
+                "Spatial upscaler second stage failed; using first-stage output only: %s",
+                exc,
+            )
+            return False
+
+        out = Path(output_path)
+        if not (out.is_file() and out.stat().st_size > 0):
+            log.warning(
+                "Spatial upscaler produced no output; using first-stage output only: %s",
+                output_path,
+            )
+            return False
+        return True
 
     async def generate(
         self,
@@ -956,19 +1039,56 @@ class LocalVideoGenerator:
                         lora_paths=resolved_loras,
                     )
                 else:
-                    pipe = self._get_pipe("t2v")
-                    _invoke_generate_and_save(
-                        pipe,
-                        prompt=req.prompt,
-                        output_path=out_path,
-                        height=height,
-                        width=width,
-                        num_frames=nf,
-                        fps=float(self.fps),
-                        seed=seed,
-                        num_steps=steps,
-                        lora_paths=resolved_loras,
-                    )
+                    if self.upscale:
+                        base_h, base_w = self._upscale_base_size(height, width)
+                        lowres_out_path = os.path.join(tmpdir, "output_lowres.mp4")
+                        log.info(
+                            "Two-stage generate enabled: stage1=%sx%s → stage2=%sx%s (tiled sampler requested)",
+                            base_h,
+                            base_w,
+                            height,
+                            width,
+                        )
+                        pipe = self._get_pipe("t2v")
+                        _invoke_generate_and_save(
+                            pipe,
+                            prompt=req.prompt,
+                            output_path=lowres_out_path,
+                            height=base_h,
+                            width=base_w,
+                            num_frames=nf,
+                            fps=float(self.fps),
+                            seed=seed,
+                            num_steps=steps,
+                            lora_paths=resolved_loras,
+                        )
+                        upscaled = self._run_spatial_upscaler_with_tiled_sampler(
+                            prompt=req.prompt,
+                            source_video_path=lowres_out_path,
+                            output_path=out_path,
+                            height=height,
+                            width=width,
+                            num_frames=nf,
+                            seed=seed,
+                            num_steps=steps,
+                            lora_paths=resolved_loras,
+                        )
+                        if not upscaled:
+                            shutil.copy2(lowres_out_path, out_path)
+                    else:
+                        pipe = self._get_pipe("t2v")
+                        _invoke_generate_and_save(
+                            pipe,
+                            prompt=req.prompt,
+                            output_path=out_path,
+                            height=height,
+                            width=width,
+                            num_frames=nf,
+                            fps=float(self.fps),
+                            seed=seed,
+                            num_steps=steps,
+                            lora_paths=resolved_loras,
+                        )
             except BaseException:
                 self._salvage_mp4_to_spill(tmpdir, out_path, req.job_id, req.prompt, "ENCODE_FAIL")
                 raise
