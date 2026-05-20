@@ -603,10 +603,11 @@ class LocalVideoGenerator:
         ic_cls = getattr(lpm, "ICLoraPipeline", None)
         if ic_cls is not None:
             self._pipe_classes["ic_lora"] = ic_cls
+        # Prefer most specific/newer class names first when multiple are present.
         for cls_name in (
-            "SpatialUpscalerPipeline",
-            "SpatialUpscalerX2Pipeline",
             "SpatialUpscalerX2V11Pipeline",
+            "SpatialUpscalerX2Pipeline",
+            "SpatialUpscalerPipeline",
             "LTXSpatialUpscalerPipeline",
         ):
             up_cls = getattr(lpm, cls_name, None)
@@ -696,33 +697,51 @@ class LocalVideoGenerator:
             return False
 
         try:
+            sig = inspect.signature(pipe.generate_and_save)
+            accepted = set(sig.parameters.keys())
+            call_kwargs: dict[str, Any] = {
+                "prompt": prompt,
+                "output_path": output_path,
+                "height": height,
+                "width": width,
+                "target_height": height,
+                "target_width": width,
+                "num_frames": num_frames,
+                "fps": float(self.fps),
+                "seed": seed,
+                "num_steps": num_steps,
+                "lora_paths": lora_paths,
+            }
+
+            # Backend compatibility: select only one supported input-video arg name.
+            for name in (
+                "video",
+                "video_path",
+                "source_video",
+                "source_video_path",
+                "input_video",
+                "input_video_path",
+            ):
+                if name in accepted:
+                    call_kwargs[name] = source_video_path
+                    break
+
+            # Backend compatibility: select one supported tiled-sampler control arg.
+            for name, value in (
+                ("use_tiled_sampler", True),
+                ("tiled", True),
+                ("sampler", "tiled"),
+                ("sampler_name", "tiled"),
+                ("sampling_method", "tiled"),
+                ("second_sampler", "tiled"),
+            ):
+                if name in accepted:
+                    call_kwargs[name] = value
+                    break
+
             _invoke_generate_and_save(
                 pipe,
-                prompt=prompt,
-                output_path=output_path,
-                # Backend compatibility: different ltx-2-mlx builds use different input-video arg names.
-                video=source_video_path,
-                video_path=source_video_path,
-                source_video=source_video_path,
-                source_video_path=source_video_path,
-                input_video=source_video_path,
-                input_video_path=source_video_path,
-                height=height,
-                width=width,
-                target_height=height,
-                target_width=width,
-                num_frames=num_frames,
-                fps=float(self.fps),
-                seed=seed,
-                num_steps=num_steps,
-                lora_paths=lora_paths,
-                # Backend compatibility: tiled sampler flags have varied across releases.
-                tiled=True,
-                use_tiled_sampler=True,
-                sampler="tiled",
-                sampler_name="tiled",
-                sampling_method="tiled",
-                second_sampler="tiled",
+                **call_kwargs,
             )
         except Exception as exc:
             log.warning(
