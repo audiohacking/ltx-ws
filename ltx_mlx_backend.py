@@ -669,12 +669,12 @@ class LocalVideoGenerator:
             return len(self._resolved_default_loras)
         return len(self.default_lora_specs)
 
-    def _upscale_base_size(self, height: int, width: int) -> tuple[int, int]:
+    def _calculate_stage1_dimensions(self, height: int, width: int) -> tuple[int, int]:
         base_h = _align_ltx2_spatial(max(LTX2_SPATIAL_ALIGN, int(round(height / 2.0))))
         base_w = _align_ltx2_spatial(max(LTX2_SPATIAL_ALIGN, int(round(width / 2.0))))
         return base_h, base_w
 
-    def _run_spatial_upscaler_with_tiled_sampler(
+    def _run_spatial_upscaler_stage(
         self,
         *,
         prompt: str,
@@ -1064,7 +1064,7 @@ class LocalVideoGenerator:
                     )
                 else:
                     if self.upscale:
-                        base_h, base_w = self._upscale_base_size(height, width)
+                        base_h, base_w = self._calculate_stage1_dimensions(height, width)
                         lowres_out_path = os.path.join(tmpdir, "output_lowres.mp4")
                         log.info(
                             "Two-stage generate enabled: stage1=%sx%s → stage2=%sx%s (tiled sampler requested)",
@@ -1086,7 +1086,7 @@ class LocalVideoGenerator:
                             num_steps=steps,
                             lora_paths=resolved_loras,
                         )
-                        upscaled = self._run_spatial_upscaler_with_tiled_sampler(
+                        upscaled = self._run_spatial_upscaler_stage(
                             prompt=req.prompt,
                             source_video_path=lowres_out_path,
                             output_path=out_path,

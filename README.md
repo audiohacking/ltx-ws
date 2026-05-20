@@ -183,7 +183,7 @@ python server.py --enable-lora \
   --lora ./loras/LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors 1.0
 ```
 
-Downloaded LoRAs are cached under `./loras/` by default. To change cache/location, set `VIDEOFENTANYL_LORA_DIR=/your/path`.
+Downloaded LoRAs are cached under `./loras/` by default. To change cache location, set `VIDEOFENTANYL_LORA_DIR=/your/path`.
 
 ---
 
