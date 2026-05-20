@@ -702,16 +702,19 @@ class LocalVideoGenerator:
             call_kwargs: dict[str, Any] = {
                 "prompt": prompt,
                 "output_path": output_path,
-                "height": height,
-                "width": width,
-                "target_height": height,
-                "target_width": width,
                 "num_frames": num_frames,
                 "fps": float(self.fps),
                 "seed": seed,
                 "num_steps": num_steps,
                 "lora_paths": lora_paths,
             }
+            # Stage-2 source size comes from source_video_path; these are output target dimensions.
+            if "target_height" in accepted and "target_width" in accepted:
+                call_kwargs["target_height"] = height
+                call_kwargs["target_width"] = width
+            elif "height" in accepted and "width" in accepted:
+                call_kwargs["height"] = height
+                call_kwargs["width"] = width
 
             # Backend compatibility: select only one supported input-video arg name.
             for name in (
