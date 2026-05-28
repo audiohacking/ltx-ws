@@ -128,20 +128,62 @@ Useful variants:
 python server.py --port 9000
 python server.py --model dgrauet/ltx-2.3-mlx-q8 --infer-steps 8 --num-frames 65
 python server.py --height 512 --width 768 --mlx-low-memory
-python server.py --enable-lora --lora Kijai/LTX2.3_comfy 1.0
+python server.py --upscale --height 768 --width 1344
+python server.py --enable-lora \
+  --lora https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/loras/LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors 1.0
 # multiple LoRAs (repeat --lora)
 python server.py --enable-lora \
-  --lora Kijai/LTX2.3_comfy 1.0 \
+  --lora https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/loras/LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors 1.0 \
   --lora /path/to/another_lora.safetensors 0.6
 # enable default LoRA via env
 LTX_WS_ENABLE_LORA=1 python server.py
 # override default LoRA via env (still requires enable)
-LTX_WS_DEFAULT_LORA="https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/loras/ltx-2.3-22b-distilled-1.1_lora-dynamic_fro09_avg_rank_111_bf16.safetensors" \
+LTX_WS_DEFAULT_LORA="https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/loras/LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors" \
 LTX_WS_DEFAULT_LORA_SCALE="1.0" LTX_WS_ENABLE_LORA=1 python server.py
 # multi-default via env (comma-separated path:scale)
-LTX_WS_DEFAULT_LORAS="Kijai/LTX2.3_comfy:1.0,/path/to/another_lora.safetensors:0.6" \
+LTX_WS_DEFAULT_LORAS="https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/loras/LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors:1.0,/path/to/another_lora.safetensors:0.6" \
 LTX_WS_ENABLE_LORA=1 python server.py
 ```
+
+With `--upscale`, `ltx-ws` now runs a true two-stage generate path: stage 1 at half-resolution, then a spatial upscaler second stage where a tiled sampler is requested when supported by your installed `ltx-2-mlx` version.
+
+### OmniNFT LoRA: how to get/download it
+
+Target file:
+- `https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/loras/LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors`
+
+Method 1 (recommended): **no manual download**, let `server.py` fetch/cache it automatically:
+
+```bash
+python server.py --enable-lora \
+  --lora https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/loras/LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors 1.0
+```
+
+Method 2: download with `huggingface-cli` into a local LoRA folder:
+
+```bash
+mkdir -p ./loras/Kijai__LTX2.3_comfy
+huggingface-cli download Kijai/LTX2.3_comfy \
+  --include "loras/LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors" \
+  --local-dir ./loras/Kijai__LTX2.3_comfy
+
+python server.py --enable-lora \
+  --lora ./loras/Kijai__LTX2.3_comfy/loras/LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors 1.0
+```
+
+Method 3: direct URL download (`curl`) and load as local file:
+
+```bash
+mkdir -p ./loras
+curl -L \
+  "https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/loras/LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors" \
+  -o ./loras/LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors
+
+python server.py --enable-lora \
+  --lora ./loras/LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors 1.0
+```
+
+Downloaded LoRAs are cached under `./loras/` by default. To change cache location, set `VIDEOFENTANYL_LORA_DIR=/your/path`.
 
 ---
 
@@ -300,6 +342,7 @@ The client implements this flow for `--mode ltx` when `--server` is set.
 | `--width` | `704` | Snapped to multiple of **32**. |
 | `--fps` | `24` | Nominal rate (mux behaviour follows pipeline). |
 | `--infer-steps` | `8` | One-stage distilled step count (minimum 1). |
+| `--upscale` | off | `generate` mode only: stage 1 at ½ resolution, then spatial upscaler second stage to final size; requests tiled sampler for stage 2 when backend supports it. |
 | `--mlx-low-memory` | off | `low_memory=True` in ltx-2-mlx (slower, less RAM). |
 | `--chunk-size` | `65536` | Max bytes per WebSocket binary frame. |
 | `--spill-dir` | `fvserver_completed` | Salvage directory on client disconnect. |
