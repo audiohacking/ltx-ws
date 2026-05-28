@@ -6,6 +6,7 @@
 |-----------|------|
 | [`server.py`](server.py) | WebSocket server: loads [ltx-2-mlx](https://github.com/dgrauet/ltx-2-mlx), runs **T2V/I2V/A2V/retake/extend**, streams **MP4** to clients. |
 | [`videofentanyl.py`](videofentanyl.py) | CLI client: queues jobs, speaks the same JSON + binary protocol (`--mode ltx` + `--server`). |
+| [`mcp_server.py`](mcp_server.py) | MCP server exposing standardized tools for LTX generation (`ltx_generate_video`, `ltx_server_healthcheck`). |
 | [`ltx_mlx_backend.py`](ltx_mlx_backend.py) | MLX pipeline adapter, Hugging Face weight resolution, frame/spatial alignment. |
 | [`scripts/benchmark_local_generation.py`](scripts/benchmark_local_generation.py) | Spawns (or attaches to) `server.py`, runs one client job, prints timings + `BENCHMARK_JSON:…`. |
 
@@ -146,6 +147,21 @@ LTX_WS_ENABLE_LORA=1 python server.py
 ```
 
 With `--upscale`, `ltx-ws` now runs a true two-stage generate path: stage 1 at half-resolution, then a spatial upscaler second stage where a tiled sampler is requested when supported by your installed `ltx-2-mlx` version.
+
+## Run the MCP server
+
+After `server.py` is running, launch the MCP adapter:
+
+```bash
+python mcp_server.py --server-url ws://127.0.0.1:8765/ws
+```
+
+This MCP server exposes:
+- `ltx_server_healthcheck` — verify that your local `ltx-ws` endpoint is reachable.
+- `ltx_generate_video` — run one generation job (supports `generate`, `a2v`, `retake`, `extend`, `ic_lora`) and return output path + timing metadata.
+- `ltx_generate_sequence` — run a prompt list as chained clips with `autocontinue` support (last frame of clip N is fed as initial image to clip N+1), with optional `autoconcat`.
+
+By default, generated files are saved under `./mcp_outputs/` (override with `--output-dir`).
 
 ### OmniNFT LoRA: how to get/download it
 
@@ -294,6 +310,7 @@ The last line of output is **`BENCHMARK_JSON:{...}`** for scripts. Outputs go un
 ```
 server.py                 # WebSocket server (MLX)
 videofentanyl.py          # CLI client
+mcp_server.py             # MCP tool server for ltx-ws
 ltx_mlx_backend.py        # MLX generator + HF snapshot paths
 requirements.txt
 scripts/benchmark_local_generation.py
