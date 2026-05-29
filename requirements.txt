@@ -2,6 +2,7 @@ websockets>=12.0
 av>=12.0
 Pillow>=10.0
 huggingface_hub>=0.20.0
+mcp>=1.0.0
 
 # MLX LTX-2.3 (Apple Silicon) — ltx-2-mlx v0.8.3 (PyPI TBD):
 #   uv pip install \
