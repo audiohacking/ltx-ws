@@ -27,6 +27,17 @@ from urllib.request import url2pathname, urlopen
 log = logging.getLogger("fvserver")
 
 LTX2_SPATIAL_ALIGN = 32
+LTX2_MLX_GIT_TAG = "v0.14.9"
+
+
+def ltx2_mlx_install_hint() -> str:
+    return (
+        "  uv pip install \\\n"
+        f'    "ltx-core-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@{LTX2_MLX_GIT_TAG}'
+        '#subdirectory=packages/ltx-core-mlx" \\\n'
+        f'    "ltx-pipelines-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@{LTX2_MLX_GIT_TAG}'
+        '#subdirectory=packages/ltx-pipelines-mlx"'
+    )
 
 # Hugging Face repo id: ``org/name`` (used with huggingface_hub.snapshot_download,
 # same file set as ``huggingface-cli download org/name``).
@@ -503,13 +514,91 @@ def _decode_weighted_media_inputs(
     return decoded, temps
 
 
+def _apply_pending_loras(pipe: Any, lora_paths: list[tuple[str, float]] | None) -> None:
+    if lora_paths:
+        pipe._pending_loras = list(lora_paths)
+
+
+def _frame_rate_from_kwargs(kwargs: dict[str, Any], default: float) -> float:
+    if "frame_rate" in kwargs:
+        return float(kwargs.pop("frame_rate"))
+    if "fps" in kwargs:
+        return float(kwargs.pop("fps"))
+    return float(default)
+
+
+def _decode_latents_to_mp4(
+    pipe: Any,
+    video_latent: Any,
+    audio_latent: Any,
+    output_path: str,
+    frame_rate: float,
+) -> None:
+    if getattr(pipe, "low_memory", False):
+        pipe.dit = None
+        if hasattr(pipe, "prompt_encoder"):
+            pipe.prompt_encoder.free()
+        if hasattr(pipe, "image_conditioner"):
+            pipe.image_conditioner.free()
+        pipe._loaded = False
+        try:
+            from ltx_core_mlx.utils.memory import aggressive_cleanup
+
+            aggressive_cleanup()
+        except ImportError:
+            pass
+    pipe._load_decoders()
+    pipe._decode_and_save_video(
+        video_latent,
+        audio_latent,
+        output_path,
+        frame_rate=frame_rate,
+    )
+
+
+def _filter_call_kwargs(fn: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+    sig = inspect.signature(fn)
+    accepted = set(sig.parameters.keys())
+    has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+    if has_varkw:
+        return dict(kwargs)
+    return {k: v for k, v in kwargs.items() if k in accepted}
+
+
+def _invoke_retake_and_save(pipe: Any, *, default_fps: float, **kwargs: Any) -> None:
+    output_path = kwargs.pop("output_path")
+    frame_rate = _frame_rate_from_kwargs(kwargs, default_fps)
+    lora_paths = kwargs.pop("lora_paths", None)
+    for drop_key in ("height", "width", "num_frames"):
+        kwargs.pop(drop_key, None)
+    _apply_pending_loras(pipe, lora_paths)
+    video_latent, audio_latent = pipe.retake_from_video(
+        **_filter_call_kwargs(pipe.retake_from_video, kwargs)
+    )
+    _decode_latents_to_mp4(pipe, video_latent, audio_latent, output_path, frame_rate)
+
+
+def _invoke_extend_and_save(pipe: Any, *, default_fps: float, **kwargs: Any) -> None:
+    output_path = kwargs.pop("output_path")
+    frame_rate = _frame_rate_from_kwargs(kwargs, default_fps)
+    lora_paths = kwargs.pop("lora_paths", None)
+    for drop_key in ("height", "width", "num_frames"):
+        kwargs.pop(drop_key, None)
+    _apply_pending_loras(pipe, lora_paths)
+    video_latent, audio_latent = pipe.extend_from_video(
+        **_filter_call_kwargs(pipe.extend_from_video, kwargs)
+    )
+    _decode_latents_to_mp4(pipe, video_latent, audio_latent, output_path, frame_rate)
+
+
 def _invoke_generate_and_save(pipe: Any, **kwargs: Any) -> None:
     """
     Call ``pipe.generate_and_save`` while tolerating API drift between ltx-2-mlx versions.
 
     - Drops unsupported kwargs.
-    - Maps ``num_steps`` -> ``steps`` when needed.
-    - Maps ``fps`` -> ``frame_rate`` when upstream uses that name (Lightricks examples use ``frame_rate``).
+    - Maps ``num_steps`` -> ``stage1_steps`` / ``steps`` when needed.
+    - Maps ``fps`` -> ``frame_rate`` when upstream uses that name.
+    - Applies request LoRAs via ``pipe._pending_loras`` when supported.
     """
     fn = getattr(pipe, "generate_and_save", None)
     if fn is None:
@@ -521,8 +610,15 @@ def _invoke_generate_and_save(pipe: Any, **kwargs: Any) -> None:
     has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
 
     call_kwargs = dict(kwargs)
-    if "num_steps" in call_kwargs and "num_steps" not in accepted and "steps" in accepted:
-        call_kwargs["steps"] = call_kwargs.pop("num_steps")
+    lora_paths = call_kwargs.pop("lora_paths", None)
+    _apply_pending_loras(pipe, lora_paths)
+
+    if "num_steps" in call_kwargs:
+        steps = call_kwargs["num_steps"]
+        if "stage1_steps" in accepted and "stage1_steps" not in call_kwargs:
+            call_kwargs["stage1_steps"] = steps
+        if "num_steps" not in accepted and "steps" in accepted:
+            call_kwargs["steps"] = call_kwargs.pop("num_steps")
     if "fps" in call_kwargs and "fps" not in accepted and "frame_rate" in accepted:
         call_kwargs["frame_rate"] = float(call_kwargs.pop("fps"))
     elif "fps" in call_kwargs and "fps" not in accepted and "frame_rate" not in accepted:
@@ -536,8 +632,8 @@ def _invoke_generate_and_save(pipe: Any, **kwargs: Any) -> None:
 
 class LocalVideoGenerator:
     """
-    ``ImageToVideoPipeline`` from ``ltx-2-mlx``: text-to-video when no image,
-    image-to-video otherwise. Weights loaded once at ``load()``.
+    MLX pipeline adapter for ``ltx-2-mlx``: text/image/audio/video generation modes.
+    Weights are resolved once at ``load()``; individual pipelines lazy-load on demand.
     """
 
     def __init__(
@@ -584,27 +680,44 @@ class LocalVideoGenerator:
         except ImportError as e:
             raise RuntimeError(
                 "Missing ltx_pipelines_mlx. Install the MLX monorepo packages, e.g.:\n"
-                "  uv pip install \\\n"
-                "    \"ltx-core-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git"
-                "@v0.8.3#subdirectory=packages/ltx-core-mlx\" \\\n"
-                "    \"ltx-pipelines-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git"
-                "@v0.8.3#subdirectory=packages/ltx-pipelines-mlx\""
+                f"{ltx2_mlx_install_hint()}"
             ) from e
         path = self._resolve_model_dir()
         self._model_path = path
         self._lpm_module = lpm
-        self._pipe_classes = {
-            "t2v": lpm.TextToVideoPipeline,
-            "i2v": lpm.ImageToVideoPipeline,
-            "a2v": lpm.AudioToVideoPipeline,
-            "retake": lpm.RetakePipeline,
-            "extend": lpm.ExtendPipeline,
-        }
+
+        generate_cls = getattr(lpm, "DistilledPipeline", None)
+        if generate_cls is None:
+            generate_cls = getattr(lpm, "TextToVideoPipeline", None)
+        if self.upscale:
+            upscale_cls = getattr(lpm, "TI2VidTwoStagesPipeline", None)
+            if upscale_cls is not None:
+                generate_cls = upscale_cls
+                log.info("Using TI2VidTwoStagesPipeline for --upscale generate jobs")
+
+        a2v_cls = getattr(lpm, "A2VidPipelineTwoStage", None)
+        if a2v_cls is None:
+            a2v_cls = getattr(lpm, "AudioToVideoPipeline", None)
+
+        retake_cls = getattr(lpm, "RetakePipeline", None)
+        extend_cls = retake_cls if retake_cls is not None else getattr(lpm, "ExtendPipeline", None)
+
+        self._pipe_classes: dict[str, Any] = {}
+        if generate_cls is not None:
+            self._pipe_classes["t2v"] = generate_cls
+            self._pipe_classes["i2v"] = generate_cls
+        if a2v_cls is not None:
+            self._pipe_classes["a2v"] = a2v_cls
+        if retake_cls is not None:
+            self._pipe_classes["retake"] = retake_cls
+        if extend_cls is not None:
+            self._pipe_classes["extend"] = extend_cls
+
         ic_cls = getattr(lpm, "ICLoraPipeline", None)
         if ic_cls is not None:
             self._pipe_classes["ic_lora"] = ic_cls
-        # Prefer most specific/newer class names first when multiple are present.
-        # Order rationale: V11-specific > generic X2 > generic spatial > legacy alias.
+
+        # Legacy standalone spatial upscaler classes (pre-v0.14 monolith pipelines).
         for cls_name in (
             "SpatialUpscalerX2V11Pipeline",
             "SpatialUpscalerX2Pipeline",
@@ -618,19 +731,27 @@ class LocalVideoGenerator:
                 break
         log.info("MLX model path resolved ✓ %s", path)
 
-    def _get_pipe(self, key: str) -> Any:
-        if key in self._pipes:
+    def _get_pipe(self, key: str, *, pipe_kwargs: dict[str, Any] | None = None) -> Any:
+        if not pipe_kwargs and key in self._pipes:
             return self._pipes[key]
         self.load()
         if self._model_path is None:
             raise RuntimeError("MLX model path not initialized")
         cls = self._pipe_classes.get(key)
         if cls is None:
-            raise RuntimeError(f"Unsupported pipeline key: {key}")
+            raise RuntimeError(
+                f"Unsupported pipeline key: {key} (installed ltx-2-mlx may be too old; "
+                f"expected {LTX2_MLX_GIT_TAG}+)"
+            )
         log.info("Loading MLX pipeline %s from %s …", key, self._model_path)
-        pipe = cls(model_dir=self._model_path, low_memory=self.low_memory)
-        pipe.load()
-        self._pipes[key] = pipe
+        ctor_kwargs: dict[str, Any] = {"model_dir": self._model_path, "low_memory": self.low_memory}
+        if pipe_kwargs:
+            ctor_kwargs.update(pipe_kwargs)
+        pipe = cls(**ctor_kwargs)
+        if key not in ("retake", "extend") and hasattr(pipe, "load"):
+            pipe.load()
+        if not pipe_kwargs:
+            self._pipes[key] = pipe
         log.info("MLX pipeline ready ✓ (%s)", key)
         return pipe
 
@@ -972,21 +1093,24 @@ class LocalVideoGenerator:
                 )
 
             try:
+                common_gen_kwargs = dict(
+                    prompt=req.prompt,
+                    output_path=out_path,
+                    height=height,
+                    width=width,
+                    num_frames=nf,
+                    fps=float(self.fps),
+                    seed=seed,
+                    num_steps=steps,
+                    lora_paths=resolved_loras,
+                )
                 if mode == "a2v":
                     pipe = self._get_pipe("a2v")
                     _invoke_generate_and_save(
                         pipe,
-                        prompt=req.prompt,
-                        output_path=out_path,
+                        **common_gen_kwargs,
                         audio_path=tmp_audio,
                         image=tmp_image,
-                        height=height,
-                        width=width,
-                        num_frames=nf,
-                        fps=float(self.fps),
-                        seed=seed,
-                        num_steps=steps,
-                        lora_paths=resolved_loras,
                     )
                 elif mode == "retake":
                     if not tmp_video:
@@ -994,53 +1118,71 @@ class LocalVideoGenerator:
                     start_frame = int(req.retake_start if req.retake_start is not None else 1)
                     end_frame = int(req.retake_end if req.retake_end is not None else start_frame)
                     pipe = self._get_pipe("retake")
-                    _invoke_generate_and_save(
-                        pipe,
-                        prompt=req.prompt,
-                        output_path=out_path,
-                        video_path=tmp_video,
-                        start_frame=start_frame,
-                        end_frame=end_frame,
-                        height=height,
-                        width=width,
-                        num_frames=nf,
-                        fps=float(self.fps),
-                        seed=seed,
-                        num_steps=steps,
-                        lora_paths=resolved_loras,
-                    )
+                    if hasattr(pipe, "generate_and_save"):
+                        _invoke_generate_and_save(
+                            pipe,
+                            **common_gen_kwargs,
+                            video_path=tmp_video,
+                            start_frame=start_frame,
+                            end_frame=end_frame,
+                        )
+                    else:
+                        _invoke_retake_and_save(
+                            pipe,
+                            default_fps=float(self.fps),
+                            prompt=req.prompt,
+                            output_path=out_path,
+                            video_path=tmp_video,
+                            start_frame=start_frame,
+                            end_frame=end_frame,
+                            seed=seed,
+                            num_steps=steps,
+                            lora_paths=resolved_loras,
+                            fps=float(self.fps),
+                        )
                 elif mode == "extend":
                     if not tmp_video:
                         raise RuntimeError("extend mode requires source video input")
                     ext_frames = int(req.extend_frames if req.extend_frames is not None else 2)
                     direction = (req.extend_direction or "after").strip().lower()
                     pipe = self._get_pipe("extend")
-                    _invoke_generate_and_save(
-                        pipe,
-                        prompt=req.prompt,
-                        output_path=out_path,
-                        video_path=tmp_video,
-                        extend_frames=ext_frames,
-                        direction=direction,
-                        height=height,
-                        width=width,
-                        num_frames=nf,
-                        fps=float(self.fps),
-                        seed=seed,
-                        num_steps=steps,
-                        lora_paths=resolved_loras,
-                    )
+                    if hasattr(pipe, "generate_and_save"):
+                        _invoke_generate_and_save(
+                            pipe,
+                            **common_gen_kwargs,
+                            video_path=tmp_video,
+                            extend_frames=ext_frames,
+                            direction=direction,
+                        )
+                    else:
+                        _invoke_extend_and_save(
+                            pipe,
+                            default_fps=float(self.fps),
+                            prompt=req.prompt,
+                            output_path=out_path,
+                            video_path=tmp_video,
+                            extend_frames=ext_frames,
+                            direction=direction,
+                            seed=seed,
+                            num_steps=steps,
+                            lora_paths=resolved_loras,
+                            fps=float(self.fps),
+                        )
                 elif mode == "ic_lora":
                     if not resolved_loras:
                         raise RuntimeError("ic_lora mode requires at least one LoRA spec")
                     if not vc_items:
                         raise RuntimeError("ic_lora mode requires video_conditioning entries")
-                    pipe = self._get_pipe("ic_lora")
+                    pipe = self._get_pipe(
+                        "ic_lora",
+                        pipe_kwargs={
+                            "lora_paths": [(str(p), float(s)) for p, s in resolved_loras],
+                        },
+                    )
                     _invoke_generate_and_save(
                         pipe,
                         prompt=req.prompt,
                         output_path=out_path,
-                        lora_paths=[(str(p), float(s)) for p, s in resolved_loras],
                         video_conditioning=[(str(p), float(s)) for p, s in vc_items],
                         height=height,
                         width=width,
@@ -1049,33 +1191,18 @@ class LocalVideoGenerator:
                         seed=seed,
                         num_steps=steps,
                     )
-                elif tmp_image:
-                    pipe = self._get_pipe("i2v")
-                    _invoke_generate_and_save(
-                        pipe,
-                        prompt=req.prompt,
-                        output_path=out_path,
-                        image=tmp_image,
-                        height=height,
-                        width=width,
-                        num_frames=nf,
-                        fps=float(self.fps),
-                        seed=seed,
-                        num_steps=steps,
-                        lora_paths=resolved_loras,
-                    )
                 else:
-                    if self.upscale:
+                    pipe = self._get_pipe("t2v")
+                    if self.upscale and "spatial_upscaler" in self._pipe_classes:
                         base_h, base_w = self._calculate_stage1_dimensions(height, width)
                         lowres_out_path = os.path.join(tmpdir, "output_lowres.mp4")
                         log.info(
-                            "Two-stage generate enabled: stage1=%sx%s -> stage2=%sx%s (tiled sampler requested)",
+                            "Legacy two-stage upscale enabled: stage1=%sx%s -> stage2=%sx%s",
                             base_h,
                             base_w,
                             height,
                             width,
                         )
-                        pipe = self._get_pipe("t2v")
                         _invoke_generate_and_save(
                             pipe,
                             prompt=req.prompt,
@@ -1102,18 +1229,10 @@ class LocalVideoGenerator:
                         if not upscaled:
                             shutil.copy2(lowres_out_path, out_path)
                     else:
-                        pipe = self._get_pipe("t2v")
                         _invoke_generate_and_save(
                             pipe,
-                            prompt=req.prompt,
-                            output_path=out_path,
-                            height=height,
-                            width=width,
-                            num_frames=nf,
-                            fps=float(self.fps),
-                            seed=seed,
-                            num_steps=steps,
-                            lora_paths=resolved_loras,
+                            **common_gen_kwargs,
+                            image=tmp_image,
                         )
             except BaseException:
                 self._salvage_mp4_to_spill(tmpdir, out_path, req.job_id, req.prompt, "ENCODE_FAIL")

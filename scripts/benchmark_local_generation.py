@@ -101,9 +101,9 @@ def resolve_interpreter(
         "  uv pip install -r requirements.txt\n"
         "  uv pip install \\\n"
         '    "ltx-core-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git'
-        '@v0.8.3#subdirectory=packages/ltx-core-mlx" \\\n'
+        '@v0.14.9#subdirectory=packages/ltx-core-mlx" \\\n'
         '    "ltx-pipelines-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git'
-        '@v0.8.3#subdirectory=packages/ltx-pipelines-mlx"\n\n'
+        '@v0.14.9#subdirectory=packages/ltx-pipelines-mlx"\n\n'
         "Then re-run this script (it uses .venv/bin/python3 automatically).\n\n"
         "Escape hatch (not recommended): --allow-system-python\n",
         file=sys.stderr,
