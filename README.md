@@ -16,6 +16,7 @@ Everything below is **local-only**: your Mac, Metal / MLX, and optional Hugging 
 
 ## Features
 
+- **Agent-ready docs** — [`AGENTS.md`](AGENTS.md) and [`CLAUDE.md`](CLAUDE.md) document MCP purpose, tools, and continuity (`autocontinue`) usage for AI coding agents.
 - **MLX on Metal** — Inference via [`ltx_pipelines_mlx`](https://github.com/dgrauet/ltx-2-mlx): `TextToVideoPipeline`, `ImageToVideoPipeline`, `AudioToVideoPipeline`, `RetakePipeline`, `ExtendPipeline`.
 - **Automatic weight download** — For a Hugging Face repo id (`org/model`), the server calls [`huggingface_hub.snapshot_download`](https://huggingface.co/docs/huggingface_hub/guides/download) on load (equivalent to `huggingface-cli download`). Resumes partial downloads.
 - **Default weights** — [`dgrauet/ltx-2.3-mlx`](https://huggingface.co/dgrauet/ltx-2.3-mlx) (full MLX bf16; very large). Use [`ltx-2.3-mlx-q8`](https://huggingface.co/dgrauet/ltx-2.3-mlx-q8) or [`-q4`](https://huggingface.co/dgrauet/ltx-2.3-mlx-q4) for less RAM/disk.
@@ -58,8 +59,8 @@ source .venv/bin/activate   # or: source .venv/bin/activate.fish
 
 uv pip install -r requirements.txt
 uv pip install \
-  "ltx-core-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@v0.8.3#subdirectory=packages/ltx-core-mlx" \
-  "ltx-pipelines-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@v0.8.3#subdirectory=packages/ltx-pipelines-mlx"
+  "ltx-core-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@v0.14.9#subdirectory=packages/ltx-core-mlx" \
+  "ltx-pipelines-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@v0.14.9#subdirectory=packages/ltx-pipelines-mlx"
 ```
 
 Use `pip` instead of `uv pip` if you prefer.
@@ -70,8 +71,18 @@ Use `pip` instead of `uv pip` if you prefer.
 
 ## Model weights
 
+**MLX only.** This server uses **ltx-2-mlx** (`ltx_pipelines_mlx`) on Apple Silicon. You must use **MLX-converted** checkpoints — **not** standard upstream LTX 2.3 weights.
+
+| Use | Do **not** use |
+|-----|----------------|
+| `dgrauet/ltx-2.3-mlx`, `dgrauet/ltx-2.3-mlx-q8`, `dgrauet/ltx-2.3-mlx-q4` | `Lightricks/LTX-2.3` (PyTorch / diffusers layout) |
+| Local dirs from `snapshot_download` of the **dgrauet** MLX repos above | `Lightricks/LTX-2` or other non-MLX Hub repos |
+| `--model auto` (picks a **dgrauet** MLX variant by RAM) | ComfyUI / CUDA checkpoints without MLX conversion |
+
+See [AGENTS.md](AGENTS.md) for the full agent rule: **only ever MLX weights from the ltx-2-mlx ecosystem.**
+
 1. **Hugging Face repo id** — On first `server.py` startup, weights are downloaded under `./models/<org>__<name>/` (unless `--model-dir` or `$VIDEOFENTANYL_MODELS` applies).
-2. **Local directory** — Pass an existing folder path to `--model` instead of `org/name`.
+2. **Local directory** — Pass an existing MLX weights directory to `--model` instead of `org/name`.
 
 **Single-folder names (e.g. `./models/ltx-2.3-mlx/`)**
 
