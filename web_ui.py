@@ -1347,6 +1347,9 @@ def create_app(
     if ws_handler is not None:
         @app.websocket("/ws")
         async def websocket_inference(ws: WebSocket) -> None:
+            # Must accept in this route — delegating accept() to ws_handler alone
+            # yields HTTP 403 on the WebSocket upgrade (Starlette/FastAPI requirement).
+            await ws.accept()
             await ws_handler(ws)
 
     if mount_static and resolve_web_dist().is_dir():

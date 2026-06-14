@@ -948,7 +948,10 @@ class VideoServer:
         video_server = self
 
         async def starlette_ws_handler(websocket: Any) -> None:
-            await websocket.accept()
+            from starlette.websockets import WebSocketState
+
+            if websocket.client_state == WebSocketState.CONNECTING:
+                await websocket.accept()
             adapter = WsProtocolAdapter(websocket, websocket.client)
             await video_server.handle_ws_connection(adapter)
 
