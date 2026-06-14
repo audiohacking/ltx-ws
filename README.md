@@ -8,7 +8,7 @@
 | [`videofentanyl.py`](videofentanyl.py) | CLI client: queues jobs, speaks the same JSON + binary protocol (`--mode ltx` + `--server`). |
 | [`mcp_server.py`](mcp_server.py) | MCP server exposing standardized tools for LTX generation (`ltx_generate_video`, `ltx_server_healthcheck`). |
 | [`web_ui.py`](web_ui.py) | Web UI API + static assets; embedded in `server.py` by default (`--web-ui`). |
-| [`web/`](web/) | Minimal React frontend (Dreamverse-inspired). |
+| [`web/`](web/) | React frontend — **LTX-WS Videofentanyl** (player, library, multi-clip autocontinue/autoconcat, LoRA picker). |
 | [`web_server.py`](web_server.py) | Optional standalone UI when attaching to a remote WebSocket server. |
 | [`ltx_mlx_backend.py`](ltx_mlx_backend.py) | MLX pipeline adapter, Hugging Face weight resolution, frame/spatial alignment. |
 | [`scripts/benchmark_local_generation.py`](scripts/benchmark_local_generation.py) | Spawns (or attaches to) `server.py`, runs one client job, prints timings + `BENCHMARK_JSON:…`. |
@@ -20,7 +20,7 @@ Everything below is **local-only**: your Mac, Metal / MLX, and optional Hugging 
 ## Features
 
 - **Agent-ready docs** — [`AGENTS.md`](AGENTS.md) and [`CLAUDE.md`](CLAUDE.md) document MCP purpose, tools, and continuity (`autocontinue`) usage for AI coding agents.
-- **MLX on Metal** — Inference via [`ltx_pipelines_mlx`](https://github.com/dgrauet/ltx-2-mlx): `TextToVideoPipeline`, `ImageToVideoPipeline`, `AudioToVideoPipeline`, `RetakePipeline`, `ExtendPipeline`.
+- **MLX on Metal** — Inference via [`ltx_pipelines_mlx`](https://github.com/dgrauet/ltx-2-mlx) **v0.14.9** (`DistilledPipeline`, `TI2VidOneStagePipeline` for i2v/autocontinue, `A2VidPipelineTwoStage`, `RetakePipeline`, etc.). Legacy separate `ImageToVideoPipeline` exists only on older ltx-2-mlx installs.
 - **Automatic weight download** — For a Hugging Face repo id (`org/model`), the server calls [`huggingface_hub.snapshot_download`](https://huggingface.co/docs/huggingface_hub/guides/download) on load (equivalent to `huggingface-cli download`). Resumes partial downloads.
 - **Default weights** — [`dgrauet/ltx-2.3-mlx`](https://huggingface.co/dgrauet/ltx-2.3-mlx) (full MLX bf16; very large). Use [`ltx-2.3-mlx-q8`](https://huggingface.co/dgrauet/ltx-2.3-mlx-q8) or [`-q4`](https://huggingface.co/dgrauet/ltx-2.3-mlx-q4) for less RAM/disk.
 - **Weight paths** — `./models/<org>__<name>/` by default, or `--model-dir`, or base directory `$VIDEOFENTANYL_MODELS`.
@@ -28,12 +28,13 @@ Everything below is **local-only**: your Mac, Metal / MLX, and optional Hugging 
 - **Image/audio/video inputs** — Session / generate payloads support image keys plus `audio_input` and `source_video`; client supports `--image`, `--audio`, `--video` (path or `http(s)` URL).
 - **Cross-machine safe media upload** — Client serializes `--image`, `--audio`, and `--video` as payload data, so server and client can run on different hosts without shared filesystem paths.
 - **Operation routing** — `--generation-mode generate|a2v|retake|extend` maps to matching MLX pipelines, including `--retake-start`, `--retake-end`, `--extend-frames`, `--extend-direction`.
-- **Long runs without stalling** — Server emits `generation_keepalive` JSON during inference; client may send `generation_status` and receive `generation_status_ack` (with reserved `model_progress` for future use).
+- **Long runs without stalling** — Server emits `generation_keepalive` JSON during inference (includes **denoising step progress** when available); client may send `generation_status` and receive `generation_status_ack`.
 - **Disconnect safety** — Finished MP4s are copied to `--spill-dir` if the client drops while streaming (`fvserver_completed` by default).
 - **Single-flight generation** — One active MLX job at a time; extra clients wait in a fair queue (`queue_status` / `gpu_assigned`).
 - **Client batching** — Multiple `--prompt`s, `--count`, `--delay`, `--retries`, `--dry-run`, `--verbose`.
 - **Autocontinue / autoconcat** — Chain clips using the last frame of each as the next start image; optional `ffmpeg` stream-copy merge into one file (`--autoconcat`).
-- **Audiocontinue** — `--audiocontinue` auto-enables `--autocontinue --autoconcat --autocompact`, splits one input audio track into clip-length chunks, and feeds each chunk sequentially in `a2v` mode.
+- **Embedded Web UI** — **LTX-WS Videofentanyl** in the browser (`http://<host>:8765/`): prompt bar, clip library, denoising progress (step + ETA), multi-clip **autocontinue** + **autoconcat**, and **LoRA** dropdown (default OmniNFT RL; auto-downloads to `./loras/`).
+- **LoRA** — CLI `--enable-lora` for global defaults, or per-request via Web UI / `lora_specs` in API/MCP. Default artifact: [OmniNFT RL LoRA](https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/loras/LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors) (`DEFAULT_LORA_URL` / `LTX_WS_DEFAULT_LORA`).
 
 ---
 
@@ -285,11 +286,21 @@ This MCP server exposes:
 - `ltx_generate_video` — run one generation job (supports `generate`, `a2v`, `retake`, `extend`, `ic_lora`) and return output path + timing metadata.
 - `ltx_generate_sequence` — run a prompt list as chained clips with `autocontinue` support (last frame of clip N is fed as initial image to clip N+1), with optional `autoconcat`.
 
-## Web UI
+## Web UI (LTX-WS Videofentanyl)
 
-Dreamverse-inspired browser client: video player, clip history, prompt bar, and generation options (i2v / a2v uploads, autocontinue chains, duration × clip multiplier).
+Browser client served from `server.py` by default (`--web-ui`, same port as WebSocket). Title in the header: **LTX-WS Videofentanyl**.
+
+| Feature | Notes |
+|---------|--------|
+| Player + library | Completed clips stay in the library when you start a new generation; select a clip to restore its settings. |
+| Multi-clip | **Clips (× duration)** sets count; autocontinue + autoconcat run automatically for ×N > 1 (same as CLI `--count N --autocontinue --autoconcat`). |
+| Progress | Denoising step counter and ETA during generation (SSE from embedded worker). |
+| LoRA dropdown | Default **OmniNFT RL LoRA** (`DEFAULT_LORA_URL` / `LTX_WS_DEFAULT_LORA`); downloads on first use via `/api/loras/ensure`. **None** disables LoRA for that job. No `--enable-lora` required for UI per-request LoRA. |
+| Modes | generate, i2v, a2v, retake, extend, ic_lora (with uploads as needed). |
 
 Embedded in `server.py` by default — no separate process. See [Quick start](#quick-start) for build + run.
+
+Open from another machine on the LAN using the host IP (server binds `0.0.0.0` by default): `http://<your-mac-ip>:8765/`.
 
 **Development** (hot-reload frontend while `server.py` runs):
 
@@ -308,19 +319,33 @@ python web_server.py --server-url ws://127.0.0.1:8765/ws
 
 Generated clips persist under `./web_outputs/` (override with `--web-output-dir` on `server.py`).
 
-### OmniNFT LoRA: how to get/download it
+### OmniNFT LoRA (default)
 
-Target file:
+Canonical default URL (also `DEFAULT_LORA_URL` in `server.py`):
+
 - `https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/loras/LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors`
 
-Method 1 (recommended): **no manual download**, let `server.py` fetch/cache it automatically:
+**Web UI:** LoRA dropdown defaults to this preset; first use triggers download/cache under `./loras/`.
+
+**CLI / global server default** (applied to every request when enabled):
 
 ```bash
 python server.py --enable-lora \
   --lora https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/loras/LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors 1.0
 ```
 
-Method 2: download with `huggingface-cli` into a local LoRA folder:
+**Per-request only** (no `--enable-lora`): pass `lora_specs` in `/api/generate`, MCP, or use the Web UI dropdown.
+
+Override default via env (still used for Web UI catalog when set):
+
+```bash
+export LTX_WS_DEFAULT_LORA="https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/loras/LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors"
+export LTX_WS_DEFAULT_LORA_SCALE="1.0"
+```
+
+Other methods (manual download):
+
+**huggingface-cli:**
 
 ```bash
 mkdir -p ./loras/Kijai__LTX2.3_comfy
@@ -332,7 +357,7 @@ python server.py --enable-lora \
   --lora ./loras/Kijai__LTX2.3_comfy/loras/LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors 1.0
 ```
 
-Method 3: direct URL download (`curl`) and load as local file:
+**curl:**
 
 ```bash
 mkdir -p ./loras
@@ -344,7 +369,7 @@ python server.py --enable-lora \
   --lora ./loras/LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors 1.0
 ```
 
-Downloaded LoRAs are cached under `./loras/` by default. To change cache location, set `VIDEOFENTANYL_LORA_DIR=/your/path`.
+Downloaded LoRAs are cached under `./loras/` by default. Override with `VIDEOFENTANYL_LORA_DIR`.
 
 ---
 
