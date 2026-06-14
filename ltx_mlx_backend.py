@@ -29,6 +29,8 @@ from urllib.request import url2pathname, urlopen
 
 log = logging.getLogger("fvserver")
 
+from ltx_paths import loras_dir, models_dir, repo_root as REPO_ROOT
+
 LTX2_SPATIAL_ALIGN = 32
 LTX2_MLX_GIT_TAG = "v0.14.9"
 
@@ -96,6 +98,10 @@ def _snapshot_download_weights(snapshot_download: Any, repo_id: str, dest: Path)
         kw["resume_download"] = True
     if "local_dir_use_symlinks" in sig.parameters:
         kw["local_dir_use_symlinks"] = False
+    if "tqdm_class" in sig.parameters:
+        from system_status import StatusTqdm
+
+        kw["tqdm_class"] = StatusTqdm
     out = snapshot_download(**kw)
     return str(Path(out).resolve())
 
@@ -126,7 +132,7 @@ def hf_local_weights_directory(repo_id: str, explicit_model_dir: str | None) -> 
     if explicit_model_dir:
         return Path(explicit_model_dir).expanduser().resolve()
     env = os.environ.get(VIDEOFENTANYL_MODELS_ENV, "").strip()
-    root = Path(env).expanduser().resolve() if env else (REPO_ROOT / "models")
+    root = Path(env).expanduser().resolve() if env else models_dir()
     safe = rid.replace("/", "__")
     return (root / safe).resolve()
 
@@ -231,6 +237,15 @@ def resolve_mlx_weights_directory(model: str, explicit_model_dir: str | None) ->
         if _model_snapshot_present(dest):
             log.info("Using existing local MLX snapshot for %r at %s", raw, dest)
             return str(dest)
+        from system_status import set_status
+
+        set_status(
+            "downloading_model",
+            f"Downloading model weights: {raw}",
+            detail=str(dest),
+            model=raw,
+            pct=0.0,
+        )
         log.info(
             "Ensuring Hugging Face weights %r under %s "
             "(huggingface_hub.snapshot_download; same payload as `huggingface-cli download`) …",
@@ -238,6 +253,13 @@ def resolve_mlx_weights_directory(model: str, explicit_model_dir: str | None) ->
             dest,
         )
         _snapshot_download_weights(snapshot_download, raw, dest)
+        set_status(
+            "idle",
+            "Model weights downloaded",
+            detail=str(dest),
+            model=raw,
+            pct=100.0,
+        )
         return str(dest)
 
     return raw
@@ -347,7 +369,7 @@ def _local_lora_cache_dir() -> Path:
     env = (os.environ.get(VIDEOFENTANYL_LORA_DIR_ENV) or "").strip()
     if env:
         return Path(env).expanduser().resolve()
-    return (REPO_ROOT / "loras").resolve()
+    return loras_dir()
 
 
 def _pick_safetensors_file(root: Path) -> Path | None:
@@ -392,6 +414,13 @@ def _resolve_lora_path(spec: str) -> tuple[str, str | None]:
                     ) from e
                 cache_root = _local_lora_cache_dir()
                 cache_root.mkdir(parents=True, exist_ok=True)
+                from system_status import set_status
+
+                set_status(
+                    "downloading_lora",
+                    f"Downloading LoRA: {filename}",
+                    detail=repo_id,
+                )
                 log.info(
                     "Downloading/using cached LoRA %s (%s @ %s) …",
                     repo_id,
@@ -821,9 +850,13 @@ class LocalVideoGenerator:
     def load(self) -> None:
         if self._model_path is not None:
             return
+        from system_status import set_status
+
+        set_status("loading_mlx", "Initializing MLX…", model=self.model)
         try:
             import ltx_pipelines_mlx as lpm
         except ImportError as e:
+            set_status("error", "MLX packages missing", error=str(e))
             raise RuntimeError(
                 "Missing ltx_pipelines_mlx. Install the MLX monorepo packages, e.g.:\n"
                 f"{ltx2_mlx_install_hint()}"
@@ -894,8 +927,11 @@ class LocalVideoGenerator:
                 log.info("Detected spatial upscaler pipeline class: %s", cls_name)
                 break
         log.info("MLX model path resolved ✓ %s", path)
+        set_status("ready", "Model ready", model=self.model, detail=path, pct=100.0)
 
     def _get_pipe(self, key: str, *, pipe_kwargs: dict[str, Any] | None = None) -> Any:
+        from system_status import set_status
+
         if not pipe_kwargs and key in self._pipes:
             return self._pipes[key]
         self.load()
@@ -907,6 +943,12 @@ class LocalVideoGenerator:
                 f"Unsupported pipeline key: {key} (installed ltx-2-mlx may be too old; "
                 f"expected {LTX2_MLX_GIT_TAG}+)"
             )
+        set_status(
+            "loading_pipeline",
+            f"Loading pipeline: {key}",
+            pipeline=key,
+            model=self.model,
+        )
         log.info("Loading MLX pipeline %s from %s …", key, self._model_path)
         ctor_kwargs: dict[str, Any] = {"model_dir": self._model_path, "low_memory": self.low_memory}
         if pipe_kwargs:
@@ -937,6 +979,9 @@ class LocalVideoGenerator:
         if not self.default_lora_specs:
             self._resolved_default_loras = []
             return
+        from system_status import set_status
+
+        set_status("resolving_loras", "Resolving LoRA weights…", model=self.model)
         resolved, temps = self._resolve_lora_specs(self.default_lora_specs)
         for tmp in temps:
             if tmp and os.path.isfile(tmp) and "fvserver_lora_" in tmp:

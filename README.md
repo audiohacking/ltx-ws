@@ -141,6 +141,21 @@ Build once (or after editing `web/`):
 cd web && npm install && npm run build && cd ..
 ```
 
+### macOS app (PyInstaller)
+
+Build a double-clickable **LTX-WS Videofentanyl** `.app` (no terminal; status in the Web UI header). See [docs/PACKAGING.md](docs/PACKAGING.md).
+
+**Download:** published GitHub Releases include `LTX-WS-Videofentanyl-<tag>-macos-arm64.zip` (built by [.github/workflows/release.yml](.github/workflows/release.yml)).
+
+**Build locally:**
+
+```bash
+./scripts/ci_install_build_deps.sh
+./scripts/build_mac_app.sh
+```
+
+Output: `dist/LTX-WS Videofentanyl.app`. Models and outputs live under `~/Library/Application Support/LTX-WS/`.
+
 ### Hugging Face auth
 
 For gated or private Hub repos: set [`HF_TOKEN`](https://huggingface.co/docs/huggingface_hub/package_reference/environment_variables) or run `huggingface-cli login`.

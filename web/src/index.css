@@ -238,9 +238,68 @@ body {
 .header-status {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 12px;
   font-size: 0.8rem;
   color: var(--muted);
+}
+
+.system-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 280px;
+}
+
+.system-status.busy {
+  color: #c9b8ff;
+}
+
+.system-status.error {
+  color: #f87171;
+}
+
+.system-status.ready {
+  color: #86efac;
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.system-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.system-dot.ok {
+  background: #22c55e;
+}
+
+.system-dot.busy {
+  background: #a78bfa;
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+.system-dot.err {
+  background: #ef4444;
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.system-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .status-dot {

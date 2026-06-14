@@ -25,7 +25,14 @@ from typing import Any, AsyncIterator, Callable, Optional
 from starlette.requests import Request
 from starlette.websockets import WebSocket
 
-REPO_ROOT = Path(__file__).resolve().parent
+from ltx_paths import (
+    is_frozen,
+    models_dir,
+    repo_root as REPO_ROOT,
+    web_dist_dir,
+    web_outputs_dir,
+    web_uploads_dir,
+)
 log = logging.getLogger("web_ui")
 
 KNOWN_MODELS = [
@@ -58,8 +65,8 @@ GENERATION_MODES = [
 ]
 
 CLIP_MULTIPLIER_MAX = 10
-DEFAULT_OUTPUT_DIR = REPO_ROOT / "web_outputs"
-DEFAULT_UPLOAD_DIR = REPO_ROOT / "web_uploads"
+DEFAULT_OUTPUT_DIR = web_outputs_dir()
+DEFAULT_UPLOAD_DIR = web_uploads_dir()
 INDEX_FILE = "index.json"
 FPS = 24
 PROGRESS_KEEPALIVE_INTERVAL_S = 1.0
@@ -143,7 +150,7 @@ _RUN_BODIES: dict[str, dict[str, Any]] = {}
 
 
 def resolve_web_dist() -> Path:
-    return REPO_ROOT / "web" / "dist"
+    return web_dist_dir()
 
 
 def public_host(bind_host: str) -> str:
@@ -208,10 +215,10 @@ def _clip_settings_from_body(body: dict[str, Any]) -> dict[str, Any]:
 
 def scan_local_models() -> list[dict[str, str]]:
     found: list[dict[str, str]] = []
-    models_dir = REPO_ROOT / "models"
-    if not models_dir.is_dir():
+    models_root = models_dir()
+    if not models_root.is_dir():
         return found
-    for child in sorted(models_dir.iterdir()):
+    for child in sorted(models_root.iterdir()):
         if child.is_dir():
             found.append(
                 {
@@ -373,6 +380,8 @@ class AppState:
 
 
 def _ensure_web_deps() -> None:
+    if is_frozen():
+        return
     import importlib
     import subprocess
 
@@ -1166,6 +1175,9 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        from system_status import bind_event_loop
+
+        bind_event_loop(asyncio.get_running_loop())
         state.ensure_worker()
         yield
         if state.server_process:
@@ -1221,6 +1233,8 @@ def create_app(
         models = KNOWN_MODELS + local
         ok = await _is_connected(request)
         lora_presets, default_lora_preset_id = _lora_catalog()
+        from system_status import snapshot as system_snapshot
+
         model_note = (
             "MLX weights only (dgrauet/ltx-2.3-mlx*). "
             "Restart server.py with --model when changing model."
@@ -1246,7 +1260,24 @@ def create_app(
             "model_note": model_note,
             "lora_presets": lora_presets,
             "default_lora_preset_id": default_lora_preset_id,
+            "system": system_snapshot(),
         }
+
+    @app.get("/api/system/status")
+    async def api_system_status():
+        from system_status import snapshot as system_snapshot
+
+        return system_snapshot()
+
+    @app.get("/api/system/events")
+    async def api_system_events():
+        from system_status import subscribe
+
+        async def stream() -> AsyncIterator[str]:
+            async for snap in subscribe():
+                yield f"data: {json.dumps(snap)}\n\n"
+
+        return StreamingResponse(stream(), media_type="text/event-stream")
 
     @app.post("/api/loras/ensure")
     async def ensure_lora(body: dict[str, Any]):

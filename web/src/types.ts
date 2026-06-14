@@ -19,6 +19,19 @@ export interface PresetOption {
   seconds?: number;
 }
 
+export interface SystemStatus {
+  phase: string;
+  message: string;
+  detail?: string;
+  pct?: number | null;
+  model?: string | null;
+  pipeline?: string | null;
+  error?: string | null;
+  frozen?: boolean;
+  log_tail?: string[];
+  updated_at?: string;
+}
+
 export interface Config {
   server_connected: boolean;
   server_url: string;
@@ -41,6 +54,7 @@ export interface Config {
   active_model?: string;
   lora_presets?: LoraPreset[];
   default_lora_preset_id?: string;
+  system?: SystemStatus;
 }
 
 export interface Clip {
