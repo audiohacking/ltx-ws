@@ -626,6 +626,8 @@ def _invoke_generate_and_save(pipe: Any, **kwargs: Any) -> None:
         call_kwargs["frame_rate"] = float(call_kwargs.pop("fps"))
     elif "fps" in call_kwargs and "fps" not in accepted and "frame_rate" not in accepted:
         call_kwargs.pop("fps", None)
+    if "frame_rate" in call_kwargs and "frame_rate" not in accepted and "fps" in accepted:
+        call_kwargs["fps"] = float(call_kwargs.pop("frame_rate"))
 
     img = call_kwargs.get("image")
     if img and "image" not in accepted:
@@ -839,6 +841,9 @@ class LocalVideoGenerator:
                 generate_cls = upscale_cls
                 log.info("Using TI2VidTwoStagesPipeline for --upscale generate jobs")
 
+        legacy_t2v_cls = getattr(lpm, "TextToVideoPipeline", None)
+        legacy_i2v_cls = getattr(lpm, "ImageToVideoPipeline", None)
+
         a2v_cls = getattr(lpm, "A2VidPipelineTwoStage", None)
         if a2v_cls is None:
             a2v_cls = getattr(lpm, "AudioToVideoPipeline", None)
@@ -847,10 +852,24 @@ class LocalVideoGenerator:
         extend_cls = retake_cls if retake_cls is not None else getattr(lpm, "ExtendPipeline", None)
 
         self._pipe_classes: dict[str, Any] = {}
+        if legacy_t2v_cls is not None:
+            self._pipe_classes["t2v"] = legacy_t2v_cls
+        elif generate_cls is not None:
+            self._pipe_classes["t2v"] = generate_cls
+        if legacy_i2v_cls is not None:
+            self._pipe_classes["i2v"] = legacy_i2v_cls
+            log.info("Using ImageToVideoPipeline for i2v / autocontinue conditioning")
+        else:
+            one_stage_i2v_cls = getattr(lpm, "TI2VidOneStagePipeline", None)
+            if one_stage_i2v_cls is not None:
+                self._pipe_classes["i2v"] = one_stage_i2v_cls
+                log.info(
+                    "Using TI2VidOneStagePipeline for i2v / autocontinue conditioning"
+                )
+            elif generate_cls is not None:
+                self._pipe_classes["i2v"] = generate_cls
         if generate_cls is not None:
             self._pipe_classes["gen"] = generate_cls
-            self._pipe_classes["t2v"] = generate_cls
-            self._pipe_classes["i2v"] = generate_cls
         if a2v_cls is not None:
             self._pipe_classes["a2v"] = a2v_cls
         if retake_cls is not None:
@@ -1357,14 +1376,15 @@ class LocalVideoGenerator:
                                 width,
                                 height,
                             )
-                        pipe = self._get_pipe("gen")
+                        # Separate i2v instance (88e6872): do not reuse the t2v pipe cache entry.
+                        pipe = self._get_pipe("i2v")
                         _invoke_generate_and_save(
                             pipe,
                             **common_gen_kwargs,
                             image=tmp_image,
                         )
                     else:
-                        pipe = self._get_pipe("gen")
+                        pipe = self._get_pipe("t2v")
                         if self.upscale and "spatial_upscaler" in self._pipe_classes:
                             base_h, base_w = self._calculate_stage1_dimensions(height, width)
                             lowres_out_path = os.path.join(tmpdir, "output_lowres.mp4")
