@@ -262,7 +262,13 @@ export default function App() {
 
   const needsImageUpload = mode === "i2v";
   const needsAudioUpload = mode === "a2v";
+  const isA2v = mode === "a2v";
   const needsVideoUpload = mode === "retake" || mode === "extend";
+  const showStartImageOptional = mode === "generate";
+  const showChainedImageHint =
+    isA2v &&
+    (audiocontinue || autocontinue || isMultiClip) &&
+    Boolean(imagePath);
 
   async function uploadFile(file: File, kind: string): Promise<string> {
     const fd = new FormData();
@@ -849,11 +855,65 @@ export default function App() {
                 </label>
               </div>
 
-              {(needsImageUpload || needsAudioUpload || needsVideoUpload || mode === "generate") && (
+              {(isA2v || needsImageUpload || showStartImageOptional || needsVideoUpload) && (
                 <div className="media-panel">
-                  <span className="media-panel-title">Source media</span>
-                  {(needsImageUpload || mode === "generate") && (
-                    <label className="media-upload">
+                  {isA2v && (
+                    <>
+                      <span className="media-panel-title">Audio to video inputs</span>
+                      <div className="media-upload-row">
+                        <label className="media-upload">
+                          <span className="media-upload-label">
+                            Start image (optional, clip 1 only)
+                          </span>
+                          <input
+                            ref={imageRef}
+                            type="file"
+                            accept="image/*"
+                            onChange={async (e) => {
+                              const f = e.target.files?.[0];
+                              if (f) {
+                                setImagePath(await uploadFile(f, "image"));
+                                setImageName(f.name);
+                              }
+                            }}
+                          />
+                          <span className="media-upload-hint">
+                            {imageName ?? "Choose image file…"}
+                          </span>
+                        </label>
+                        <label className="media-upload">
+                          <span className="media-upload-label">
+                            Source audio (required)
+                          </span>
+                          <input
+                            ref={audioRef}
+                            type="file"
+                            accept="audio/*"
+                            onChange={async (e) => {
+                              const f = e.target.files?.[0];
+                              if (f) {
+                                setAudioPath(await uploadFile(f, "audio"));
+                                setAudioName(f.name);
+                              }
+                            }}
+                          />
+                          <span className="media-upload-hint">
+                            {audioName ?? "Choose audio file…"}
+                          </span>
+                        </label>
+                      </div>
+                      {showChainedImageHint && (
+                        <p className="hint">
+                          With autocontinue / audiocontinue, the start image is used for
+                          clip 1 only; later clips use the last frame of the prior clip.
+                        </p>
+                      )}
+                    </>
+                  )}
+                  {!isA2v && (needsImageUpload || showStartImageOptional) && (
+                    <>
+                      <span className="media-panel-title">Source media</span>
+                      <label className="media-upload">
                       <span className="media-upload-label">
                         {needsImageUpload
                           ? "Source image (required)"
@@ -875,45 +935,29 @@ export default function App() {
                         {imageName ?? "Choose image file…"}
                       </span>
                     </label>
-                  )}
-                  {needsAudioUpload && (
-                    <label className="media-upload">
-                      <span className="media-upload-label">
-                        Source audio {needsAudioUpload ? "(required)" : ""}
-                      </span>
-                      <input
-                        ref={audioRef}
-                        type="file"
-                        accept="audio/*"
-                        onChange={async (e) => {
-                          const f = e.target.files?.[0];
-                          if (f) {
-                            setAudioPath(await uploadFile(f, "audio"));
-                            setAudioName(f.name);
-                          }
-                        }}
-                      />
-                      <span className="media-upload-hint">
-                        {audioName ?? "Choose audio file…"}
-                      </span>
-                    </label>
+                    </>
                   )}
                   {needsVideoUpload && (
-                    <label className="media-upload">
-                      <span className="media-upload-label">Source video (required)</span>
-                      <input
-                        ref={videoRef}
-                        type="file"
-                        accept="video/*"
-                        onChange={async (e) => {
-                          const f = e.target.files?.[0];
-                          if (f) setVideoPath(await uploadFile(f, "video"));
-                        }}
-                      />
-                      <span className="media-upload-hint">
-                        {videoPath ? "✓ uploaded" : "Choose video file…"}
-                      </span>
-                    </label>
+                    <>
+                      {!isA2v && (
+                        <span className="media-panel-title">Source media</span>
+                      )}
+                      <label className="media-upload">
+                        <span className="media-upload-label">Source video (required)</span>
+                        <input
+                          ref={videoRef}
+                          type="file"
+                          accept="video/*"
+                          onChange={async (e) => {
+                            const f = e.target.files?.[0];
+                            if (f) setVideoPath(await uploadFile(f, "video"));
+                          }}
+                        />
+                        <span className="media-upload-hint">
+                          {videoPath ? "✓ uploaded" : "Choose video file…"}
+                        </span>
+                      </label>
+                    </>
                   )}
                 </div>
               )}

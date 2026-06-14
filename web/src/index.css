@@ -563,6 +563,18 @@ body {
   letter-spacing: 0.04em;
 }
 
+.media-upload-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+@media (max-width: 640px) {
+  .media-upload-row {
+    grid-template-columns: 1fr;
+  }
+}
+
 .media-upload {
   display: flex;
   flex-direction: column;

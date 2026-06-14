@@ -858,6 +858,20 @@ async def _fail_run_early(
     await state.emit(run_id, {"type": "error", "message": message})
 
 
+def _clip_request_body(
+    gen_body: dict[str, Any],
+    prompt: str,
+    index: int,
+    autocontinue: bool,
+) -> dict[str, Any]:
+    """Per-clip request body; start image upload applies only to the first clip when chaining."""
+    body = dict(gen_body)
+    body["prompt"] = prompt
+    if index > 0 and autocontinue:
+        body.pop("image_path", None)
+    return body
+
+
 def _apply_autocontinue_frame(
     params: Any,
     i: int,
@@ -1029,8 +1043,7 @@ async def _execute_run_embedded(state: AppState, run_id: str) -> None:
                 },
             )
 
-            body = dict(gen_body)
-            body["prompt"] = prompt
+            body = _clip_request_body(gen_body, prompt, i, autocontinue)
             params = _build_params_from_request(body)
             _apply_audiocontinue_audio(params, i, audio_segments)
             if i == 0 and initial_image:
@@ -1038,6 +1051,7 @@ async def _execute_run_embedded(state: AppState, run_id: str) -> None:
                     params, i, True, initial_image, extract_last_frame, Path(), ""
                 )
             elif i > 0 and autocontinue:
+                params.initial_image = None
                 prev_clip = state.clips[run.clip_ids[i - 1]]
                 prev_path = state.output_dir / prev_clip.filename
                 _apply_autocontinue_frame(
@@ -1183,8 +1197,7 @@ async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
                 },
             )
 
-            body = dict(gen_body)
-            body["prompt"] = prompt
+            body = _clip_request_body(gen_body, prompt, i, autocontinue)
             params = _build_params_from_request(body)
             _apply_audiocontinue_audio(params, i, audio_segments)
             if i == 0 and initial_image:
@@ -1192,6 +1205,7 @@ async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
                     params, i, True, initial_image, extract_last_frame, Path(), ""
                 )
             elif i > 0 and autocontinue:
+                params.initial_image = None
                 prev_clip = state.clips[run.clip_ids[i - 1]]
                 prev_path = state.output_dir / prev_clip.filename
                 _apply_autocontinue_frame(
