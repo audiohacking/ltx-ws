@@ -383,13 +383,6 @@ def _set_server_override(url: str) -> None:
     vf._SERVER_OVERRIDE = url
 
 
-def _run_ws_url(state: AppState) -> str:
-    """Loopback WS for embedded runs — same path as ``videofentanyl --server``."""
-    if state.embedded and state.video_server is not None:
-        return f"ws://127.0.0.1:{state.video_server.port}/ws"
-    return state.server_url
-
-
 async def healthcheck_ws(url: str) -> bool:
     import websockets
 
@@ -768,21 +761,9 @@ async def _finish_autoconcat(
 
 
 async def _execute_run(state: AppState, run_id: str) -> None:
-    run = state.runs.get(run_id)
-    # Multi-clip autocontinue must use the WS client path (videofentanyl --count N
-    # --autocontinue --autoconcat). In-process bypass broke i2v conditioning on clip 2+.
-    multi_autocontinue = bool(
-        run and run.autocontinue and len(run.prompts) > 1
-    )
-    if state.embedded and state.video_server is not None and not multi_autocontinue:
+    if state.embedded and state.video_server is not None:
         await _execute_run_embedded(state, run_id)
         return
-    if multi_autocontinue and state.embedded:
-        log.info(
-            "Web UI: run %s — %d-clip autocontinue via WS (videofentanyl-equivalent)",
-            run_id,
-            len(run.prompts),
-        )
     await _execute_run_via_ws(state, run_id)
 
 
@@ -917,7 +898,7 @@ async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
     run.status = RunStatus.RUNNING.value
     await state.emit(run_id, {"type": "run_started", "run_id": run_id})
 
-    _set_server_override(_run_ws_url(state))
+    _set_server_override(state.server_url)
     jobs: list[Job] = []
     gen_body = _RUN_BODIES.get(run_id, {})
     prompts = run.prompts

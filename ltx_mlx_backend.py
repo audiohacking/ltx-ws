@@ -568,46 +568,6 @@ def _filter_call_kwargs(fn: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in kwargs.items() if k in accepted}
 
 
-def _resize_conditioning_image(path: str, height: int, width: int) -> tuple[str, str | None]:
-    """Resize conditioning image to generation H×W (LTX I2V expects matching dims)."""
-    try:
-        from PIL import Image
-    except ImportError:
-        return path, None
-    try:
-        with Image.open(path) as im:
-            im = im.convert("RGB")
-            if im.size == (width, height):
-                return path, None
-            resized = im.resize((width, height), Image.Resampling.LANCZOS)
-            fd, out = tempfile.mkstemp(suffix=".jpg", prefix="fvserver_img_fit_")
-            with os.fdopen(fd, "wb") as f:
-                resized.save(f, "JPEG", quality=95)
-            return out, out
-    except OSError as exc:
-        log.warning("Could not resize conditioning image %s: %s", path, exc)
-        return path, None
-
-
-def _map_image_kwarg(call_kwargs: dict[str, Any], accepted: set[str]) -> None:
-    img = call_kwargs.get("image")
-    if not img:
-        return
-    if "image" in accepted:
-        return
-    for alias in (
-        "image_path",
-        "input_image",
-        "reference_image",
-        "init_image",
-        "first_frame_image",
-        "start_image",
-    ):
-        if alias in accepted:
-            call_kwargs[alias] = call_kwargs.pop("image")
-            return
-
-
 def _invoke_retake_and_save(pipe: Any, *, default_fps: float, **kwargs: Any) -> None:
     output_path = kwargs.pop("output_path")
     frame_rate = _frame_rate_from_kwargs(kwargs, default_fps)
@@ -666,8 +626,6 @@ def _invoke_generate_and_save(pipe: Any, **kwargs: Any) -> None:
         call_kwargs["frame_rate"] = float(call_kwargs.pop("fps"))
     elif "fps" in call_kwargs and "fps" not in accepted and "frame_rate" not in accepted:
         call_kwargs.pop("fps", None)
-
-    _map_image_kwarg(call_kwargs, accepted)
 
     if not has_varkw:
         call_kwargs = {k: v for k, v in call_kwargs.items() if k in accepted}
@@ -814,29 +772,11 @@ class LocalVideoGenerator:
 
         tqdm_mod.tqdm = _TrackingTqdm
         tqdm_mod.auto.tqdm = _TrackingTqdm
-        patched: list[Any] = [orig_tqdm, orig_auto]
-        try:
-            import ltx_pipelines_mlx.utils.samplers as samplers_mod
-
-            samplers_mod.tqdm = _TrackingTqdm
-            patched.append(getattr(samplers_mod, "tqdm", None))
-        except ImportError:
-            samplers_mod = None
-        import sys
-
-        for mod in list(sys.modules.values()):
-            if mod is not None and getattr(mod, "tqdm", None) in patched:
-                mod.tqdm = _TrackingTqdm
         try:
             yield
         finally:
             tqdm_mod.tqdm = orig_tqdm
             tqdm_mod.auto.tqdm = orig_auto
-            if samplers_mod is not None:
-                samplers_mod.tqdm = orig_tqdm
-            for mod in list(sys.modules.values()):
-                if mod is not None and getattr(mod, "tqdm", None) is _TrackingTqdm:
-                    mod.tqdm = orig_tqdm
             self._model_progress.clear()
 
     def _resolve_model_dir(self) -> str:
@@ -1202,22 +1142,6 @@ class LocalVideoGenerator:
             if not tmp_image and isinstance(req.image_data, dict):
                 tmp_image = _decode_initial_image_dict(req.image_data)
                 tmp_image_cleanup = tmp_image
-            if tmp_image:
-                fitted, fitted_cleanup = _resize_conditioning_image(tmp_image, height, width)
-                if fitted_cleanup:
-                    if tmp_image_cleanup and tmp_image_cleanup != tmp_image:
-                        try:
-                            os.unlink(tmp_image_cleanup)
-                        except OSError:
-                            pass
-                    tmp_image_cleanup = fitted_cleanup
-                tmp_image = fitted
-                log.info(
-                    "I2V conditioning image: %s (%dx%d)",
-                    tmp_image,
-                    width,
-                    height,
-                )
             tmp_audio, tmp_audio_cleanup = _decode_media_input(
                 req.audio_data,
                 temp_prefix="fvserver_audio_",
