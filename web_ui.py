@@ -64,6 +64,73 @@ INDEX_FILE = "index.json"
 FPS = 24
 PROGRESS_KEEPALIVE_INTERVAL_S = 1.0
 
+
+def _lora_catalog() -> tuple[list[dict[str, Any]], str]:
+    """
+    LoRA presets for the Web UI (default from LTX_WS_DEFAULT_LORA / server defaults).
+    Returns (presets including a None entry, default_preset_id).
+    """
+    from server import (
+        DEFAULT_GLOBAL_LORA_PATH,
+        DEFAULT_GLOBAL_LORA_SCALE,
+        ENV_DEFAULT_LORA,
+        ENV_DEFAULT_LORA_SCALE,
+        _default_loras_from_env,
+    )
+
+    def _label_for_spec(spec: str) -> str:
+        name = spec.rsplit("/", 1)[-1] if "/" in spec else spec
+        if name.endswith(".safetensors"):
+            name = name[:-12]
+        return name or spec
+
+    seen: set[str] = set()
+    presets: list[dict[str, Any]] = [
+        {"id": "none", "label": "None (no LoRA)", "spec": "", "scale": 0.0},
+    ]
+    default_id = "none"
+
+    def _add(id_: str, label: str, spec: str, scale: float, is_default: bool = False) -> None:
+        nonlocal default_id
+        key = f"{spec}:{scale}"
+        if not spec or key in seen:
+            return
+        seen.add(key)
+        presets.append({"id": id_, "label": label, "spec": spec, "scale": scale})
+        if is_default:
+            default_id = id_
+
+    default_path = os.environ.get(ENV_DEFAULT_LORA, DEFAULT_GLOBAL_LORA_PATH).strip()
+    scale_raw = os.environ.get(ENV_DEFAULT_LORA_SCALE, str(DEFAULT_GLOBAL_LORA_SCALE)).strip()
+    try:
+        default_scale = float(scale_raw)
+    except ValueError:
+        default_scale = DEFAULT_GLOBAL_LORA_SCALE
+
+    if default_path:
+        _add(
+            "default",
+            f"Default — {_label_for_spec(default_path)}",
+            default_path,
+            default_scale,
+            is_default=True,
+        )
+
+    for i, (path, scale) in enumerate(_default_loras_from_env()):
+        if path == default_path and scale == default_scale:
+            continue
+        _add(f"env_{i}", f"Env LoRA — {_label_for_spec(path)}", path, scale)
+
+    return presets, default_id
+
+
+def _ensure_lora_downloaded(spec: str) -> dict[str, Any]:
+    from ltx_mlx_backend import _resolve_lora_path
+
+    path, _ = _resolve_lora_path(spec)
+    return {"ok": True, "spec": spec, "path": path}
+
+
 _RUN_BODIES: dict[str, dict[str, Any]] = {}
 
 
@@ -1145,6 +1212,7 @@ def create_app(
         local = scan_local_models()
         models = KNOWN_MODELS + local
         ok = await _is_connected(request)
+        lora_presets, default_lora_preset_id = _lora_catalog()
         model_note = (
             "MLX weights only (dgrauet/ltx-2.3-mlx*). "
             "Restart server.py with --model when changing model."
@@ -1168,7 +1236,21 @@ def create_app(
             "clip_multiplier_max": CLIP_MULTIPLIER_MAX,
             "defaults": _defaults(),
             "model_note": model_note,
+            "lora_presets": lora_presets,
+            "default_lora_preset_id": default_lora_preset_id,
         }
+
+    @app.post("/api/loras/ensure")
+    async def ensure_lora(body: dict[str, Any]):
+        spec = str(body.get("spec") or "").strip()
+        if not spec:
+            raise HTTPException(400, "spec is required")
+        try:
+            result = _ensure_lora_downloaded(spec)
+        except Exception as exc:
+            log.warning("LoRA ensure failed for %s: %s", spec, exc)
+            raise HTTPException(500, f"LoRA download failed: {exc}") from exc
+        return result
 
     @app.post("/api/config/model")
     async def set_model(body: dict[str, Any]):

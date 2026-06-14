@@ -4,6 +4,13 @@ export interface ModelOption {
   repo: string;
 }
 
+export interface LoraPreset {
+  id: string;
+  label: string;
+  spec: string;
+  scale: number;
+}
+
 export interface PresetOption {
   id: string;
   label: string;
@@ -32,6 +39,8 @@ export interface Config {
   embedded?: boolean;
   web_url?: string;
   active_model?: string;
+  lora_presets?: LoraPreset[];
+  default_lora_preset_id?: string;
 }
 
 export interface Clip {

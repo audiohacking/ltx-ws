@@ -86,6 +86,8 @@ export default function App() {
   const [extendFrames, setExtendFrames] = useState(2);
   const [extendDirection, setExtendDirection] = useState("after");
   const [showOptions, setShowOptions] = useState(true);
+  const [loraPresetId, setLoraPresetId] = useState("none");
+  const [loraStatus, setLoraStatus] = useState<string | null>(null);
 
   const imageRef = useRef<HTMLInputElement>(null);
   const audioRef = useRef<HTMLInputElement>(null);
@@ -122,6 +124,9 @@ export default function App() {
           : cfg.preferred_model,
       );
       setNumSteps(cfg.defaults.num_steps);
+      if (cfg.default_lora_preset_id) {
+        setLoraPresetId(cfg.default_lora_preset_id);
+      }
       const all = await fetchClips();
       setClips(all);
     } catch (e) {
@@ -129,9 +134,39 @@ export default function App() {
     }
   }, []);
 
+  const ensureLoraPreset = useCallback(async (presetId: string) => {
+    if (!presetId || presetId === "none") {
+      setLoraStatus(null);
+      return;
+    }
+    const preset = config?.lora_presets?.find((p) => p.id === presetId);
+    if (!preset?.spec) return;
+    setLoraStatus("Checking LoRA…");
+    try {
+      const r = await fetch(`${API}/api/loras/ensure`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ spec: preset.spec }),
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        throw new Error(err.detail || "LoRA download failed");
+      }
+      setLoraStatus("LoRA ready");
+    } catch (e) {
+      setLoraStatus(String(e));
+    }
+  }, [config?.lora_presets]);
+
   useEffect(() => {
     load();
   }, [load]);
+
+  useEffect(() => {
+    if (config?.default_lora_preset_id) {
+      ensureLoraPreset(config.default_lora_preset_id);
+    }
+  }, [config?.default_lora_preset_id, ensureLoraPreset]);
 
   useEffect(() => {
     if (clipMultiplier > 1) {
@@ -424,6 +459,11 @@ export default function App() {
     };
     if (seed.trim()) body.seed = parseInt(seed, 10);
 
+    const loraPreset = config?.lora_presets?.find((p) => p.id === loraPresetId);
+    if (loraPreset?.spec) {
+      body.lora_specs = [[loraPreset.spec, loraPreset.scale]];
+    }
+
     try {
       const r = await fetch(`${API}/api/generate`, {
         method: "POST",
@@ -675,6 +715,21 @@ export default function App() {
                   </select>
                 </label>
                 <label>
+                  LoRA
+                  <select
+                    value={loraPresetId}
+                    onChange={(e) => {
+                      const id = e.target.value;
+                      setLoraPresetId(id);
+                      ensureLoraPreset(id);
+                    }}
+                  >
+                    {(config.lora_presets ?? []).map((p) => (
+                      <option key={p.id} value={p.id}>{p.label}</option>
+                    ))}
+                  </select>
+                </label>
+                <label>
                   Steps
                   <input
                     type="number"
@@ -694,6 +749,10 @@ export default function App() {
                   />
                 </label>
               </div>
+
+              {loraStatus && (
+                <p className="hint">{loraStatus}</p>
+              )}
 
               {isMultiClip && (
                 <p className="hint duration-total">
