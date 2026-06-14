@@ -48,7 +48,7 @@ Everything below is **local-only**: your Mac, Metal / MLX, and optional Hugging 
 | **ffmpeg** | Optional; required on the **client** machine if you use `--autoconcat`. |
 | **Disk / RAM** | Depends on model (bf16 ≫ q8 ≫ q4). Plan tens of GB disk for full bf16 weights; see [ltx-2-mlx](https://github.com/dgrauet/ltx-2-mlx) model table. |
 
-Python packages: see [`requirements.txt`](requirements.txt) (`websockets`, `av`, `Pillow`, `huggingface_hub`, `fastapi`, `uvicorn`). **MLX** packages are installed separately from the ltx-2-mlx monorepo (comments in `requirements.txt`).
+Python packages: see [`requirements.txt`](requirements.txt) (`websockets`, `av`, `Pillow`, `huggingface_hub`, `fastapi`, `starlette`, `uvicorn`, `python-multipart`, `mcp`). **MLX** packages are installed separately from the ltx-2-mlx monorepo (comments in `requirements.txt`).
 
 Optional: [uv](https://docs.astral.sh/uv/) for fast venv + installs; [Node.js](https://nodejs.org/) 18+ to build the Web UI.
 
