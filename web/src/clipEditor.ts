@@ -42,6 +42,7 @@ export interface ClipEditorSnapshot {
   seed: string;
   autocontinue: boolean;
   autoconcat: boolean;
+  audiocontinue: boolean;
 }
 
 export function snapshotFromClip(
@@ -59,5 +60,6 @@ export function snapshotFromClip(
     seed: clip.seed != null ? String(clip.seed) : "",
     autocontinue: clip.autocontinue ?? (clip.clip_count ?? 1) > 1,
     autoconcat: clip.autoconcat ?? (clip.clip_count ?? 1) > 1,
+    audiocontinue: clip.audiocontinue ?? false,
   };
 }

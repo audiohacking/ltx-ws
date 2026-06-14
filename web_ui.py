@@ -142,8 +142,41 @@ def _ensure_lora_downloaded(spec: str) -> dict[str, Any]:
 _RUN_BODIES: dict[str, dict[str, Any]] = {}
 
 
-def resolve_web_dist() -> Path:
-    return REPO_ROOT / "web" / "dist"
+def _upload_extension(kind: str, filename: str | None) -> str:
+    """Pick a safe suffix for an uploaded file."""
+    ext = Path(filename or "").suffix.lower()
+    allowed: dict[str, set[str]] = {
+        "image": {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"},
+        "audio": {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".webm"},
+        "video": {".mp4", ".mov", ".webm", ".mkv", ".avi"},
+    }
+    if ext and ext in allowed.get(kind, set()):
+        return ext
+    defaults = {"image": ".jpg", "audio": ".mp3", "video": ".mp4"}
+    return defaults.get(kind, ".bin")
+
+
+async def _save_upload_file(
+    request: Request,
+    upload_dir: Path,
+    *,
+    kind: str = "image",
+) -> dict[str, str]:
+    """Persist multipart upload; avoids FastAPI UploadFile annotations (PEP 563 ForwardRef)."""
+    form = await request.form()
+    upload_file = form.get("file")
+    if upload_file is None:
+        raise ValueError("file is required")
+    read = getattr(upload_file, "read", None)
+    if read is None:
+        raise ValueError("file is required")
+    filename = getattr(upload_file, "filename", None) or "upload.bin"
+    ext = _upload_extension(kind, filename)
+    uid = str(uuid.uuid4())
+    dest = upload_dir / f"{uid}{ext}"
+    content = await read()
+    dest.write_bytes(content)
+    return {"path": str(dest), "filename": filename, "kind": kind}
 
 
 def public_host(bind_host: str) -> str:
@@ -191,8 +224,9 @@ def duration_to_frames(seconds: float) -> int:
 def _clip_settings_from_body(body: dict[str, Any]) -> dict[str, Any]:
     duration_s = float(body.get("duration_seconds") or 5.0)
     clip_count = int(body.get("clip_count") or 1)
-    autocontinue = bool(body.get("autocontinue", False)) or clip_count > 1
-    autoconcat = bool(body.get("autoconcat", False)) or clip_count > 1
+    audiocontinue = bool(body.get("audiocontinue", False))
+    autocontinue = bool(body.get("autocontinue", False)) or clip_count > 1 or audiocontinue
+    autoconcat = bool(body.get("autoconcat", False)) or clip_count > 1 or audiocontinue
     return {
         "num_frames": body.get("num_frames") or duration_to_frames(duration_s),
         "width": body.get("width"),
@@ -203,6 +237,7 @@ def _clip_settings_from_body(body: dict[str, Any]) -> dict[str, Any]:
         "clip_count": clip_count,
         "autocontinue": autocontinue,
         "autoconcat": autoconcat,
+        "audiocontinue": audiocontinue,
     }
 
 
@@ -254,6 +289,7 @@ class ClipRecord:
     clip_count: Optional[int] = None
     autocontinue: Optional[bool] = None
     autoconcat: Optional[bool] = None
+    audiocontinue: Optional[bool] = None
 
 
 @dataclass
@@ -267,6 +303,7 @@ class RunRecord:
     error: Optional[str] = None
     autocontinue: bool = False
     autoconcat: bool = False
+    audiocontinue: bool = False
     merged_url: Optional[str] = None
     merged_clip_id: Optional[str] = None
 
@@ -494,6 +531,7 @@ async def healthcheck_ws(url: str) -> bool:
 
 
 def _api_mode(mode: str) -> str:
+    """Map Web UI mode to generation_mode (i2v → generate + initial_image; a2v stays a2v)."""
     m = (mode or "generate").strip().lower()
     if m == "i2v":
         return "generate"
@@ -755,6 +793,67 @@ async def _run_clip_inprocess(
         return False
 
 
+def _audiocontinue_segment_seconds(body: dict[str, Any]) -> float:
+    nf = body.get("num_frames")
+    if nf is None:
+        duration_s = float(body.get("duration_seconds") or 5.0)
+        nf = duration_to_frames(duration_s)
+    return max(0.25, int(nf) / float(FPS))
+
+
+def _prepare_audiocontinue_segments(
+    body: dict[str, Any],
+    num_clips: int,
+) -> tuple[list[dict[str, Any]], Path | None]:
+    """Split one audio track into per-clip segments (CLI ``--audiocontinue``)."""
+    from videofentanyl import load_media_payload, split_audio_for_jobs
+
+    audio_path = str(body.get("audio_path") or "").strip()
+    if not audio_path:
+        raise ValueError("audiocontinue requires audio_path")
+    segment_seconds = _audiocontinue_segment_seconds(body)
+    segs, temp_dir = split_audio_for_jobs(
+        audio_path,
+        segment_seconds=segment_seconds,
+        required_segments=num_clips,
+    )
+    payloads = [load_media_payload(str(p), kind="audio") for p in segs]
+    log.info(
+        "Web UI: audiocontinue — %d segment(s), ~%.2fs each",
+        len(payloads),
+        segment_seconds,
+    )
+    return payloads, temp_dir
+
+
+def _apply_audiocontinue_audio(
+    params: Any,
+    index: int,
+    audio_segments: list[dict[str, Any]] | None,
+) -> None:
+    if audio_segments is not None:
+        params.audio_input = audio_segments[index]
+
+
+async def _fail_run_early(
+    state: AppState,
+    run_id: str,
+    message: str,
+) -> None:
+    run = state.runs.get(run_id)
+    if not run:
+        return
+    run.status = RunStatus.FAILED.value
+    run.error = message
+    for clip_id in run.clip_ids:
+        clip = state.clips.get(clip_id)
+        if clip and clip.status != RunStatus.DONE.value:
+            clip.status = RunStatus.FAILED.value
+            clip.error = message
+    state.save_index()
+    await state.emit(run_id, {"type": "error", "message": message})
+
+
 def _apply_autocontinue_frame(
     params: Any,
     i: int,
@@ -802,7 +901,8 @@ async def _finish_autoconcat(
 ) -> None:
     if not run.autoconcat or len(jobs) < 2:
         return
-    try_autoconcat_clips(jobs, prefix, "mp4", verbose=False)
+    autocompact = bool(gen_body.get("autocompact", False))
+    try_autoconcat_clips(jobs, prefix, "mp4", verbose=False, compact=autocompact)
     merged_files = sorted(state.output_dir.glob(f"{prefix}_merged_*.mp4"))
     if not merged_files:
         return
@@ -878,6 +978,7 @@ async def _execute_run_embedded(state: AppState, run_id: str) -> None:
             "type": "run_started",
             "run_id": run_id,
             "autoconcat": run.autoconcat,
+            "audiocontinue": run.audiocontinue,
             "clip_count": len(run.prompts),
         },
     )
@@ -888,107 +989,124 @@ async def _execute_run_embedded(state: AppState, run_id: str) -> None:
     autocontinue = run.autocontinue
     prefix = sanitize_filename(prompts[0]) or "clip"
 
-    continue_from = gen_body.get("continue_from")
-    initial_image = None
-    if continue_from:
-        parent = state.clips.get(continue_from)
-        if parent and parent.filename:
-            parent_path = state.output_dir / parent.filename
-            if parent_path.exists():
-                initial_image = extract_last_frame(parent_path)
-
-    for i, prompt in enumerate(prompts):
-        clip_id = run.clip_ids[i]
-        clip = state.clips[clip_id]
-        clip.status = RunStatus.RUNNING.value
-        await state.emit(
-            run_id,
-            {
-                "type": "clip_started",
-                "clip_id": clip_id,
-                "index": i,
-                "total_clips": len(prompts),
-            },
-        )
-
-        body = dict(gen_body)
-        body["prompt"] = prompt
-        params = _build_params_from_request(body)
-        if i == 0 and initial_image:
-            _apply_autocontinue_frame(
-                params, i, True, initial_image, extract_last_frame, Path(), ""
+    audio_segments: list[dict[str, Any]] | None = None
+    temp_audio_dir: Path | None = None
+    if gen_body.get("audiocontinue"):
+        try:
+            audio_segments, temp_audio_dir = _prepare_audiocontinue_segments(
+                gen_body, len(prompts)
             )
-        elif i > 0 and autocontinue:
-            prev_clip = state.clips[run.clip_ids[i - 1]]
-            prev_path = state.output_dir / prev_clip.filename
-            _apply_autocontinue_frame(
-                params,
-                i,
-                True,
-                None,
-                extract_last_frame,
-                prev_path,
-                prev_clip.filename,
-            )
+        except Exception as exc:
+            log.exception("Web UI: audiocontinue setup failed")
+            await _fail_run_early(state, run_id, str(exc))
+            return
 
-        out_name = clip.filename
-        job = Job(
-            id=i + 1,
-            params=params,
-            output_path=state.output_dir / out_name,
-            max_attempts=1,
-        )
-        jobs.append(job)
+    try:
+        continue_from = gen_body.get("continue_from")
+        initial_image = None
+        if continue_from:
+            parent = state.clips.get(continue_from)
+            if parent and parent.filename:
+                parent_path = state.output_dir / parent.filename
+                if parent_path.exists():
+                    initial_image = extract_last_frame(parent_path)
 
-        async def on_event(event: dict[str, Any], _clip_id: str = clip_id) -> None:
-            event["clip_id"] = _clip_id
-            await state.emit(run_id, event)
-
-        ok = await _run_clip_inprocess(state.video_server, job, on_event)
-
-        if ok:
-            clip.status = RunStatus.DONE.value
-            clip.elapsed_s = round(job.elapsed, 2)
-            clip.bytes = job.file_bytes
-            clip.video_url = state.clip_url(out_name)
-            for c in state.clips.values():
-                if c.chain_id == run.chain_id and c.label == "CURRENT":
-                    c.label = "EDIT"
-            clip.label = "CURRENT"
+        for i, prompt in enumerate(prompts):
+            clip_id = run.clip_ids[i]
+            clip = state.clips[clip_id]
+            clip.status = RunStatus.RUNNING.value
             await state.emit(
                 run_id,
                 {
-                    "type": "clip_done",
+                    "type": "clip_started",
                     "clip_id": clip_id,
-                    "video_url": clip.video_url,
-                    "bytes": clip.bytes,
                     "index": i,
                     "total_clips": len(prompts),
-                    "autoconcat": run.autoconcat,
                 },
             )
-        else:
-            clip.status = RunStatus.FAILED.value
-            clip.error = job.error or "Generation failed"
-            run.status = RunStatus.FAILED.value
-            run.error = clip.error
-            state.save_index()
-            await state.emit(
-                run_id,
-                {"type": "clip_failed", "clip_id": clip_id, "error": clip.error},
+
+            body = dict(gen_body)
+            body["prompt"] = prompt
+            params = _build_params_from_request(body)
+            _apply_audiocontinue_audio(params, i, audio_segments)
+            if i == 0 and initial_image:
+                _apply_autocontinue_frame(
+                    params, i, True, initial_image, extract_last_frame, Path(), ""
+                )
+            elif i > 0 and autocontinue:
+                prev_clip = state.clips[run.clip_ids[i - 1]]
+                prev_path = state.output_dir / prev_clip.filename
+                _apply_autocontinue_frame(
+                    params,
+                    i,
+                    True,
+                    None,
+                    extract_last_frame,
+                    prev_path,
+                    prev_clip.filename,
+                )
+
+            out_name = clip.filename
+            job = Job(
+                id=i + 1,
+                params=params,
+                output_path=state.output_dir / out_name,
+                max_attempts=1,
             )
-            return
+            jobs.append(job)
 
-    await _finish_autoconcat(
-        state, run, run_id, jobs, prefix, prompts, gen_body, try_autoconcat_clips
-    )
+            async def on_event(event: dict[str, Any], _clip_id: str = clip_id) -> None:
+                event["clip_id"] = _clip_id
+                await state.emit(run_id, event)
 
-    run.status = RunStatus.DONE.value
-    state.save_index()
-    await state.emit(
-        run_id,
-        {"type": "run_done", "run_id": run_id, "chain_id": run.chain_id},
-    )
+            ok = await _run_clip_inprocess(state.video_server, job, on_event)
+
+            if ok:
+                clip.status = RunStatus.DONE.value
+                clip.elapsed_s = round(job.elapsed, 2)
+                clip.bytes = job.file_bytes
+                clip.video_url = state.clip_url(out_name)
+                for c in state.clips.values():
+                    if c.chain_id == run.chain_id and c.label == "CURRENT":
+                        c.label = "EDIT"
+                clip.label = "CURRENT"
+                await state.emit(
+                    run_id,
+                    {
+                        "type": "clip_done",
+                        "clip_id": clip_id,
+                        "video_url": clip.video_url,
+                        "bytes": clip.bytes,
+                        "index": i,
+                        "total_clips": len(prompts),
+                        "autoconcat": run.autoconcat,
+                    },
+                )
+            else:
+                clip.status = RunStatus.FAILED.value
+                clip.error = job.error or "Generation failed"
+                run.status = RunStatus.FAILED.value
+                run.error = clip.error
+                state.save_index()
+                await state.emit(
+                    run_id,
+                    {"type": "clip_failed", "clip_id": clip_id, "error": clip.error},
+                )
+                return
+
+        await _finish_autoconcat(
+            state, run, run_id, jobs, prefix, prompts, gen_body, try_autoconcat_clips
+        )
+
+        run.status = RunStatus.DONE.value
+        state.save_index()
+        await state.emit(
+            run_id,
+            {"type": "run_done", "run_id": run_id, "chain_id": run.chain_id},
+        )
+    finally:
+        if temp_audio_dir is not None:
+            shutil.rmtree(temp_audio_dir, ignore_errors=True)
 
 
 async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
@@ -1013,6 +1131,7 @@ async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
             "type": "run_started",
             "run_id": run_id,
             "autoconcat": run.autoconcat,
+            "audiocontinue": run.audiocontinue,
             "clip_count": len(run.prompts),
         },
     )
@@ -1024,110 +1143,127 @@ async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
     autocontinue = run.autocontinue
     prefix = sanitize_filename(prompts[0]) or "clip"
 
-    continue_from = gen_body.get("continue_from")
-    initial_image = None
-    if continue_from:
-        parent = state.clips.get(continue_from)
-        if parent and parent.filename:
-            parent_path = state.output_dir / parent.filename
-            if parent_path.exists():
-                initial_image = extract_last_frame(parent_path)
-
-    for i, prompt in enumerate(prompts):
-        clip_id = run.clip_ids[i]
-        clip = state.clips[clip_id]
-        clip.status = RunStatus.RUNNING.value
-        await state.emit(
-            run_id,
-            {
-                "type": "clip_started",
-                "clip_id": clip_id,
-                "index": i,
-                "total_clips": len(prompts),
-            },
-        )
-
-        body = dict(gen_body)
-        body["prompt"] = prompt
-        params = _build_params_from_request(body)
-        if i == 0 and initial_image:
-            _apply_autocontinue_frame(
-                params, i, True, initial_image, extract_last_frame, Path(), ""
+    audio_segments: list[dict[str, Any]] | None = None
+    temp_audio_dir: Path | None = None
+    if gen_body.get("audiocontinue"):
+        try:
+            audio_segments, temp_audio_dir = _prepare_audiocontinue_segments(
+                gen_body, len(prompts)
             )
-        elif i > 0 and autocontinue:
-            prev_clip = state.clips[run.clip_ids[i - 1]]
-            prev_path = state.output_dir / prev_clip.filename
-            _apply_autocontinue_frame(
-                params,
-                i,
-                True,
-                None,
-                extract_last_frame,
-                prev_path,
-                prev_clip.filename,
-            )
+        except Exception as exc:
+            log.exception("Web UI: audiocontinue setup failed")
+            await _fail_run_early(state, run_id, str(exc))
+            return
 
-        out_name = clip.filename
-        job = Job(
-            id=i + 1,
-            params=params,
-            output_path=state.output_dir / out_name,
-            max_attempts=1,
-        )
-        jobs.append(job)
+    try:
+        continue_from = gen_body.get("continue_from")
+        initial_image = None
+        if continue_from:
+            parent = state.clips.get(continue_from)
+            if parent and parent.filename:
+                parent_path = state.output_dir / parent.filename
+                if parent_path.exists():
+                    initial_image = extract_last_frame(parent_path)
 
-        async def on_event(event: dict[str, Any], _clip_id: str = clip_id) -> None:
-            event["clip_id"] = _clip_id
-            await state.emit(run_id, event)
-
-        session = ProgressVideoSession(
-            job, "ltx", False, on_event, VideoSession
-        )
-        ok = await session.run(idle_timeout=None)
-
-        if ok:
-            clip.status = RunStatus.DONE.value
-            clip.elapsed_s = round(job.elapsed, 2)
-            clip.bytes = job.file_bytes
-            clip.video_url = state.clip_url(out_name)
-            for c in state.clips.values():
-                if c.chain_id == run.chain_id and c.label == "CURRENT":
-                    c.label = "EDIT"
-            clip.label = "CURRENT"
+        for i, prompt in enumerate(prompts):
+            clip_id = run.clip_ids[i]
+            clip = state.clips[clip_id]
+            clip.status = RunStatus.RUNNING.value
             await state.emit(
                 run_id,
                 {
-                    "type": "clip_done",
+                    "type": "clip_started",
                     "clip_id": clip_id,
-                    "video_url": clip.video_url,
-                    "bytes": clip.bytes,
                     "index": i,
                     "total_clips": len(prompts),
-                    "autoconcat": run.autoconcat,
                 },
             )
-        else:
-            clip.status = RunStatus.FAILED.value
-            clip.error = job.error or "Generation failed"
-            run.status = RunStatus.FAILED.value
-            run.error = clip.error
-            state.save_index()
-            await state.emit(
-                run_id,
-                {"type": "clip_failed", "clip_id": clip_id, "error": clip.error},
+
+            body = dict(gen_body)
+            body["prompt"] = prompt
+            params = _build_params_from_request(body)
+            _apply_audiocontinue_audio(params, i, audio_segments)
+            if i == 0 and initial_image:
+                _apply_autocontinue_frame(
+                    params, i, True, initial_image, extract_last_frame, Path(), ""
+                )
+            elif i > 0 and autocontinue:
+                prev_clip = state.clips[run.clip_ids[i - 1]]
+                prev_path = state.output_dir / prev_clip.filename
+                _apply_autocontinue_frame(
+                    params,
+                    i,
+                    True,
+                    None,
+                    extract_last_frame,
+                    prev_path,
+                    prev_clip.filename,
+                )
+
+            out_name = clip.filename
+            job = Job(
+                id=i + 1,
+                params=params,
+                output_path=state.output_dir / out_name,
+                max_attempts=1,
             )
-            return
+            jobs.append(job)
 
-    await _finish_autoconcat(
-        state, run, run_id, jobs, prefix, prompts, gen_body, try_autoconcat_clips
-    )
+            async def on_event(event: dict[str, Any], _clip_id: str = clip_id) -> None:
+                event["clip_id"] = _clip_id
+                await state.emit(run_id, event)
 
-    run.status = RunStatus.DONE.value
-    state.save_index()
-    await state.emit(
-        run_id,
-        {"type": "run_done", "run_id": run_id, "chain_id": run.chain_id},
-    )
+            session = ProgressVideoSession(
+                job, "ltx", False, on_event, VideoSession
+            )
+            ok = await session.run(idle_timeout=None)
+
+            if ok:
+                clip.status = RunStatus.DONE.value
+                clip.elapsed_s = round(job.elapsed, 2)
+                clip.bytes = job.file_bytes
+                clip.video_url = state.clip_url(out_name)
+                for c in state.clips.values():
+                    if c.chain_id == run.chain_id and c.label == "CURRENT":
+                        c.label = "EDIT"
+                clip.label = "CURRENT"
+                await state.emit(
+                    run_id,
+                    {
+                        "type": "clip_done",
+                        "clip_id": clip_id,
+                        "video_url": clip.video_url,
+                        "bytes": clip.bytes,
+                        "index": i,
+                        "total_clips": len(prompts),
+                        "autoconcat": run.autoconcat,
+                    },
+                )
+            else:
+                clip.status = RunStatus.FAILED.value
+                clip.error = job.error or "Generation failed"
+                run.status = RunStatus.FAILED.value
+                run.error = clip.error
+                state.save_index()
+                await state.emit(
+                    run_id,
+                    {"type": "clip_failed", "clip_id": clip_id, "error": clip.error},
+                )
+                return
+
+        await _finish_autoconcat(
+            state, run, run_id, jobs, prefix, prompts, gen_body, try_autoconcat_clips
+        )
+
+        run.status = RunStatus.DONE.value
+        state.save_index()
+        await state.emit(
+            run_id,
+            {"type": "run_done", "run_id": run_id, "chain_id": run.chain_id},
+        )
+    finally:
+        if temp_audio_dir is not None:
+            shutil.rmtree(temp_audio_dir, ignore_errors=True)
 
 
 async def _worker_loop(state: AppState) -> None:
@@ -1159,7 +1295,7 @@ def create_app(
     ws_handler: Callable[..., Any] | None = None,
 ) -> Any:
     _ensure_web_deps()
-    from fastapi import FastAPI, File, HTTPException, UploadFile
+    from fastapi import FastAPI, HTTPException
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import FileResponse, StreamingResponse
     from fastapi.staticfiles import StaticFiles
@@ -1246,6 +1382,7 @@ def create_app(
             "model_note": model_note,
             "lora_presets": lora_presets,
             "default_lora_preset_id": default_lora_preset_id,
+            "ffmpeg_available": bool(shutil.which("ffmpeg")),
         }
 
     @app.post("/api/loras/ensure")
@@ -1370,14 +1507,28 @@ def create_app(
         if clip_count > 1 and len(prompts) == 1:
             prompts = [prompts[0]] * clip_count
 
+        audiocontinue = bool(body.get("audiocontinue", False))
+        if audiocontinue:
+            if ui_mode != "a2v":
+                raise HTTPException(400, "audiocontinue only supports a2v mode")
+            if not body.get("audio_path"):
+                raise HTTPException(400, "audiocontinue requires an audio upload")
+            if not shutil.which("ffmpeg"):
+                raise HTTPException(
+                    400,
+                    "audiocontinue requires ffmpeg on PATH to split audio",
+                )
+
         mode = ui_mode
         run_id = str(uuid.uuid4())
-        autocontinue = bool(body.get("autocontinue", False)) or clip_count > 1
-        autoconcat = bool(body.get("autoconcat", False)) or clip_count > 1
+        autocontinue = bool(body.get("autocontinue", False)) or clip_count > 1 or audiocontinue
+        autoconcat = bool(body.get("autoconcat", False)) or clip_count > 1 or audiocontinue
         if autoconcat:
             autocontinue = True
 
         body = dict(body)
+        if audiocontinue:
+            body["autocompact"] = True
         if clip_count > 1:
             body.pop("continue_from", None)
             body["chain_id"] = chain_id
@@ -1423,6 +1574,7 @@ def create_app(
             created_at=datetime.now().isoformat(),
             autocontinue=autocontinue or (continue_from is not None),
             autoconcat=autoconcat,
+            audiocontinue=audiocontinue,
         )
         state.runs[run_id] = run
         _RUN_BODIES[run_id] = body
@@ -1431,11 +1583,12 @@ def create_app(
         state.event_queues[run_id] = asyncio.Queue()
         await state._pending.put(run_id)
         log.info(
-            "Web UI: queued run %s  chain=%s  clips=%d  mode=%s",
+            "Web UI: queued run %s  chain=%s  clips=%d  mode=%s  audiocontinue=%s",
             run_id,
             chain_id,
             len(clip_ids),
             mode,
+            audiocontinue,
         )
 
         return {"run_id": run_id, "chain_id": chain_id, "clip_ids": clip_ids}
@@ -1454,23 +1607,25 @@ def create_app(
                 if run.status == RunStatus.DONE.value and run.merged_clip_id:
                     merged = state.clips.get(run.merged_clip_id)
                     if merged and merged.video_url:
-                        yield f"data: {json.dumps({
-                            'type': 'merged',
-                            'video_url': merged.video_url,
-                            'clip_id': merged.id,
-                            'filename': merged.filename,
-                            'chain_id': merged.chain_id,
-                        })}\n\n"
+                        payload = {
+                            "type": "merged",
+                            "video_url": merged.video_url,
+                            "clip_id": merged.id,
+                            "filename": merged.filename,
+                            "chain_id": merged.chain_id,
+                        }
+                        yield f"data: {json.dumps(payload)}\n\n"
                 elif run.status == RunStatus.DONE.value:
                     for clip_id in run.clip_ids:
                         clip = state.clips.get(clip_id)
                         if clip and clip.status == RunStatus.DONE.value and clip.video_url:
-                            yield f"data: {json.dumps({
-                                'type': 'clip_done',
-                                'clip_id': clip.id,
-                                'video_url': clip.video_url,
-                                'bytes': clip.bytes,
-                            })}\n\n"
+                            payload = {
+                                "type": "clip_done",
+                                "clip_id": clip.id,
+                                "video_url": clip.video_url,
+                                "bytes": clip.bytes,
+                            }
+                            yield f"data: {json.dumps(payload)}\n\n"
                 yield f"data: {json.dumps({'type': 'run_complete', 'run_id': run_id, 'chain_id': run.chain_id})}\n\n"
                 return
             while True:
@@ -1486,13 +1641,19 @@ def create_app(
         return StreamingResponse(stream(), media_type="text/event-stream")
 
     @app.post("/api/upload")
-    async def upload(file: UploadFile = File(...), kind: str = "image"):
-        ext = Path(file.filename or "upload.bin").suffix or ".bin"
-        uid = str(uuid.uuid4())
-        dest = state.upload_dir / f"{uid}{ext}"
-        content = await file.read()
-        dest.write_bytes(content)
-        return {"path": str(dest), "filename": file.filename, "kind": kind}
+    async def upload(request: Request, kind: str = "image"):
+        kind = (kind or "image").strip().lower()
+        if kind not in ("image", "audio", "video"):
+            raise HTTPException(400, f"unsupported upload kind: {kind}")
+        try:
+            return await _save_upload_file(request, state.upload_dir, kind=kind)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except HTTPException:
+            raise
+        except Exception as exc:
+            log.exception("Upload failed for kind=%s", kind)
+            raise HTTPException(500, f"Upload failed: {exc}") from exc
 
     @app.get("/api/videos/{filename}")
     async def serve_video(filename: str):

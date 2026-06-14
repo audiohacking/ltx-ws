@@ -469,6 +469,10 @@ def _decode_media_input(
         data_url = str(media_data.get("data_url") or "").strip()
         if not data_url:
             return None, None
+        name_hint = str(
+            media_data.get("name") or media_data.get("filename") or ""
+        ).strip()
+        name_suffix = Path(name_hint).suffix if name_hint else ""
         if data_url.startswith(("http://", "https://")):
             tmp = _download_remote_to_temp(data_url, temp_prefix, default_suffix)
             return tmp, tmp
@@ -485,7 +489,7 @@ def _decode_media_input(
         else:
             mime = str(media_data.get("mime_type") or "")
             encoded = data_url
-        ext = mimetypes.guess_extension(mime) or default_suffix
+        ext = name_suffix or mimetypes.guess_extension(mime) or default_suffix
         if ext == ".jpe":
             ext = ".jpg"
         fd, path = tempfile.mkstemp(prefix=temp_prefix, suffix=ext)
@@ -1270,6 +1274,8 @@ class LocalVideoGenerator:
                         lora_paths=resolved_loras,
                     )
                     if mode == "a2v":
+                        if not tmp_audio:
+                            raise RuntimeError("a2v mode requires audio input")
                         pipe = self._get_pipe("a2v")
                         _invoke_generate_and_save(
                             pipe,
