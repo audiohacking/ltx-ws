@@ -112,6 +112,24 @@ def duration_to_frames(seconds: float) -> int:
     return snap_frames(int(seconds * FPS))
 
 
+def _clip_settings_from_body(body: dict[str, Any]) -> dict[str, Any]:
+    duration_s = float(body.get("duration_seconds") or 5.0)
+    clip_count = int(body.get("clip_count") or 1)
+    autocontinue = bool(body.get("autocontinue", False)) or clip_count > 1
+    autoconcat = bool(body.get("autoconcat", False)) or clip_count > 1
+    return {
+        "num_frames": body.get("num_frames") or duration_to_frames(duration_s),
+        "width": body.get("width"),
+        "height": body.get("height"),
+        "seed": body.get("seed"),
+        "num_steps": body.get("num_steps"),
+        "duration_seconds": duration_s,
+        "clip_count": clip_count,
+        "autocontinue": autocontinue,
+        "autoconcat": autoconcat,
+    }
+
+
 def scan_local_models() -> list[dict[str, str]]:
     found: list[dict[str, str]] = []
     models_dir = REPO_ROOT / "models"
@@ -155,6 +173,11 @@ class ClipRecord:
     width: Optional[int] = None
     height: Optional[int] = None
     seed: Optional[int] = None
+    num_steps: Optional[int] = None
+    duration_seconds: Optional[float] = None
+    clip_count: Optional[int] = None
+    autocontinue: Optional[bool] = None
+    autoconcat: Optional[bool] = None
 
 
 @dataclass
@@ -219,7 +242,9 @@ class AppState:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             for c in data.get("clips", []):
-                self.clips[c["id"]] = ClipRecord(**c)
+                self.clips[c["id"]] = ClipRecord(
+                    **{k: v for k, v in c.items() if k in ClipRecord.__dataclass_fields__}
+                )
             for r in data.get("runs", []):
                 self.runs[r["id"]] = RunRecord(**r)
         except (json.JSONDecodeError, TypeError, KeyError):
@@ -236,6 +261,31 @@ class AppState:
 
     def clip_url(self, filename: str) -> str:
         return f"/api/videos/{filename}"
+
+    def delete_clip_record(self, clip_id: str) -> bool:
+        clip = self.clips.get(clip_id)
+        if not clip:
+            return False
+        path = self.output_dir / clip.filename
+        if path.is_file():
+            try:
+                path.unlink()
+            except OSError as exc:
+                log.warning("Could not delete clip file %s: %s", path, exc)
+        del self.clips[clip_id]
+        return True
+
+    def delete_chain(self, chain_id: str) -> int:
+        removed = 0
+        for clip_id, clip in list(self.clips.items()):
+            if clip.chain_id == chain_id:
+                if self.delete_clip_record(clip_id):
+                    removed += 1
+        for run_id, run in list(self.runs.items()):
+            if run.chain_id == chain_id:
+                del self.runs[run_id]
+        self.save_index()
+        return removed
 
     async def emit(self, run_id: str, event: dict[str, Any]) -> None:
         q = self.event_queues.get(run_id)
@@ -673,9 +723,13 @@ async def _finish_autoconcat(
     merged_path = merged_files[-1]
     merged_name = merged_path.name
     run.merged_url = state.clip_url(merged_name)
+    # Fragment files were removed by autoconcat; drop their index entries.
+    for clip_id in list(run.clip_ids):
+        state.clips.pop(clip_id, None)
     merged_id = str(uuid.uuid4())
     max_idx = max(
-        c.clip_index for c in state.clips.values() if c.chain_id == run.chain_id
+        (c.clip_index for c in state.clips.values() if c.chain_id == run.chain_id),
+        default=-1,
     )
     for c in state.clips.values():
         if c.chain_id == run.chain_id and c.label == "CURRENT":
@@ -692,6 +746,7 @@ async def _finish_autoconcat(
         status=RunStatus.DONE.value,
         created_at=datetime.now().isoformat(),
         bytes=merged_path.stat().st_size,
+        **_clip_settings_from_body(gen_body),
     )
     await state.emit(
         run_id,
@@ -1101,6 +1156,20 @@ def create_app(
         clips.sort(key=lambda c: c.created_at)
         return {"clips": [asdict(c) for c in clips]}
 
+    @app.delete("/api/clips/{clip_id}")
+    async def delete_clip(clip_id: str):
+        if not state.delete_clip_record(clip_id):
+            raise HTTPException(404, "Clip not found")
+        state.save_index()
+        return {"ok": True, "deleted": clip_id}
+
+    @app.delete("/api/chains/{chain_id}")
+    async def delete_chain(chain_id: str):
+        count = state.delete_chain(chain_id)
+        if count == 0:
+            raise HTTPException(404, "Chain not found")
+        return {"ok": True, "deleted": count, "chain_id": chain_id}
+
     @app.get("/api/runs/{run_id}")
     async def get_run(run_id: str):
         run = state.runs.get(run_id)
@@ -1184,12 +1253,7 @@ def create_app(
                 mode=mode,
                 status=RunStatus.QUEUED.value,
                 created_at=datetime.now().isoformat(),
-                num_frames=body.get("num_frames") or duration_to_frames(
-                    float(body.get("duration_seconds") or 5.0)
-                ),
-                width=body.get("width"),
-                height=body.get("height"),
-                seed=body.get("seed"),
+                **_clip_settings_from_body(body),
             )
             state.clips[clip_id] = clip
             clip_ids.append(clip_id)

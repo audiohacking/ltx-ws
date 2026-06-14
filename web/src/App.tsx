@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { snapshotFromClip } from "./clipEditor";
 import { applyProgressEvent } from "./progress";
 import type { Clip, Config, ProgressState } from "./types";
 
@@ -72,12 +73,14 @@ export default function App() {
       .slice(0, 48);
   }, [clips]);
 
-  const chainClips = useMemo(() => {
-    if (!chainId) return [];
+  const chainParts = useMemo(() => {
+    if (!chainId || !selectedClipId) return [];
     return clips
-      .filter((c) => c.chain_id === chainId)
+      .filter((c) => c.chain_id === chainId && c.status === "done" && c.video_url)
       .sort((a, b) => a.clip_index - b.clip_index);
-  }, [clips, chainId]);
+  }, [clips, chainId, selectedClipId]);
+
+  const showChainPicker = chainParts.length > 1;
 
   const activeClip = useMemo(() => {
     if (!selectedClipId) return null;
@@ -129,6 +132,48 @@ export default function App() {
   const editingChain =
     !isMultiClip &&
     Boolean(chainId && activeClip?.status === "done");
+
+  function applyClipSelection(clip: Clip) {
+    const snap = snapshotFromClip(clip, config, {
+      numSteps: config?.defaults.num_steps ?? 8,
+    });
+    setSelectedClipId(clip.id);
+    setChainId(clip.chain_id);
+    setPrompt(snap.prompt);
+    setMode(snap.mode);
+    setResolutionId(snap.resolutionId);
+    setDurationId(snap.durationId);
+    setClipMultiplier(snap.clipMultiplier);
+    setNumSteps(snap.numSteps);
+    setSeed(snap.seed);
+    setAutocontinue(snap.autocontinue);
+    setAutoconcat(snap.autoconcat);
+    setShowOptions(true);
+    setError(null);
+  }
+
+  async function deleteGeneration(clip: Clip) {
+    const siblings = clips.filter((c) => c.chain_id === clip.chain_id);
+    const deleteChain = siblings.length > 1;
+    const msg = deleteChain
+      ? "Delete this entire generation (all clips in the chain)?"
+      : "Delete this video?";
+    if (!confirm(msg)) return;
+
+    const url = deleteChain
+      ? `${API}/api/chains/${encodeURIComponent(clip.chain_id)}`
+      : `${API}/api/clips/${encodeURIComponent(clip.id)}`;
+    const r = await fetch(url, { method: "DELETE" });
+    if (!r.ok) {
+      setError("Could not delete");
+      return;
+    }
+    const all = await fetchClips();
+    setClips(all);
+    if (selectedClipId === clip.id || deleteChain) {
+      startNewProject();
+    }
+  }
 
   function startNewProject() {
     setChainId(null);
@@ -391,38 +436,30 @@ export default function App() {
           </div>
 
           {error && <div className="error-banner">{error}</div>}
-        </section>
-
-        <section className="history history-inline">
-          {chainClips.length > 1 && (
-            <p className="hint chain-hint">
-              Chain · {chainClips.length} clip{chainClips.length !== 1 ? "s" : ""}
-              {chainClips.some((c) => c.label === "MERGED") ? " · merged" : ""}
-            </p>
+          {showChainPicker && (
+            <div className="chain-picker">
+              <label className="chain-picker-label">
+                Chain part
+                <select
+                  className="chain-picker-select"
+                  value={selectedClipId ?? ""}
+                  onChange={(e) => {
+                    const c = chainParts.find((x) => x.id === e.target.value);
+                    if (c) applyClipSelection(c);
+                  }}
+                >
+                  {chainParts.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.label}
+                      {c.num_frames
+                        ? ` · ${formatDuration(c.num_frames, config?.defaults.fps ?? 24)}`
+                        : ""}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
           )}
-          {chainClips.map((clip) => (
-            <button
-              key={clip.id}
-              type="button"
-              className={`history-item history-item-compact ${
-                activeClip?.id === clip.id ? "active" : ""
-              }`}
-              onClick={() => setSelectedClipId(clip.id)}
-            >
-              <span className={`history-label ${clip.label.toLowerCase()}`}>
-                {clip.label}
-              </span>
-              {clip.video_url && (
-                <video
-                  className="history-thumb"
-                  src={clip.video_url}
-                  muted
-                  playsInline
-                  preload="metadata"
-                />
-              )}
-            </button>
-          ))}
         </section>
 
         <section className="composer">
@@ -720,32 +757,44 @@ export default function App() {
           </div>
           <div className="library-grid">
             {libraryClips.map((clip) => (
-              <button
+              <div
                 key={clip.id}
-                type="button"
-                className={`library-card ${
+                className={`library-card-wrap ${
                   activeClip?.id === clip.id ? "active" : ""
                 }`}
-                onClick={() => {
-                  setSelectedClipId(clip.id);
-                  setChainId(clip.chain_id);
-                }}
-                title={clip.prompt}
               >
-                {clip.video_url && (
-                  <video
-                    className="library-thumb"
-                    src={clip.video_url}
-                    muted
-                    playsInline
-                    preload="metadata"
-                  />
-                )}
-                <span className={`library-label ${clip.label.toLowerCase()}`}>
-                  {clip.label}
-                </span>
-                <span className="library-prompt">{clip.prompt}</span>
-              </button>
+                <button
+                  type="button"
+                  className="library-card"
+                  onClick={() => applyClipSelection(clip)}
+                  title={clip.prompt}
+                >
+                  {clip.video_url && (
+                    <video
+                      className="library-thumb"
+                      src={clip.video_url}
+                      muted
+                      playsInline
+                      preload="metadata"
+                    />
+                  )}
+                  <span className={`library-label ${clip.label.toLowerCase()}`}>
+                    {clip.label}
+                  </span>
+                  <span className="library-prompt">{clip.prompt}</span>
+                </button>
+                <button
+                  type="button"
+                  className="library-delete"
+                  title="Delete"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    deleteGeneration(clip);
+                  }}
+                >
+                  ×
+                </button>
+              </div>
             ))}
           </div>
         </aside>

@@ -101,9 +101,62 @@ body {
   border-color: #cbd5e1;
 }
 
-.library-card.active {
+.library-card-wrap {
+  position: relative;
+}
+
+.library-card-wrap.active .library-card {
   border-color: var(--accent);
   background: var(--accent-soft);
+}
+
+.library-delete {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.library-card-wrap:hover .library-delete,
+.library-card-wrap.active .library-delete {
+  opacity: 1;
+}
+
+.chain-picker {
+  margin-top: 10px;
+  padding: 10px 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.chain-picker-label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 0.75rem;
+  color: var(--muted);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+.chain-picker-select {
+  font-size: 0.9rem;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text);
 }
 
 .library-thumb {

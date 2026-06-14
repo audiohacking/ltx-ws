@@ -52,6 +52,11 @@ export interface Clip {
   width?: number;
   height?: number;
   seed?: number;
+  num_steps?: number;
+  duration_seconds?: number;
+  clip_count?: number;
+  autocontinue?: boolean;
+  autoconcat?: boolean;
 }
 
 export interface ModelProgress {
