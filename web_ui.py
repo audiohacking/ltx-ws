@@ -737,6 +737,9 @@ async def _run_clip_inprocess(
                         else None
                     ),
                     job_id=generation_id,
+                    a2v_visual_i2v_continue=bool(
+                        getattr(params, "a2v_visual_i2v_continue", False)
+                    ),
                 )
             finally:
                 progress_stop.set()
@@ -1063,6 +1066,12 @@ async def _execute_run_embedded(state: AppState, run_id: str) -> None:
                     prev_path,
                     prev_clip.filename,
                 )
+                if (
+                    params.generation_mode == "a2v"
+                    and params.initial_image is not None
+                    and params.audio_input is not None
+                ):
+                    params.a2v_visual_i2v_continue = True
 
             out_name = clip.filename
             job = Job(
@@ -1217,6 +1226,12 @@ async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
                     prev_path,
                     prev_clip.filename,
                 )
+                if (
+                    params.generation_mode == "a2v"
+                    and params.initial_image is not None
+                    and params.audio_input is not None
+                ):
+                    params.a2v_visual_i2v_continue = True
 
             out_name = clip.filename
             job = Job(

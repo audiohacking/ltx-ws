@@ -233,6 +233,8 @@ class GenerationParams:
     extend_direction:      Optional[str] = None
     lora_specs: list[tuple[str, float]] = dataclasses.field(default_factory=list)
     video_conditioning_specs: list[tuple[dict, float]] = dataclasses.field(default_factory=list)
+    # a2v chain clip 2+: i2v last-frame visual + mux audio (avoids A2V re-conditioning glitches).
+    a2v_visual_i2v_continue: bool = False
 
 
 @dataclasses.dataclass
@@ -358,6 +360,8 @@ def msg_simple_generate(p: GenerationParams) -> str:
         d["video_conditioning"] = [
             [payload, float(scale)] for payload, scale in p.video_conditioning_specs
         ]
+    if p.a2v_visual_i2v_continue:
+        d["a2v_visual_i2v_continue"] = True
     return json.dumps(d)
 
 
@@ -1414,10 +1418,10 @@ def split_audio_for_jobs(
 
 
 def extract_last_frame(video_path: Path) -> Optional[dict]:
-    """Extract the last full frame from a video file without calling external tools.
+    """Extract the last presented frame from a video for autocontinue conditioning.
 
-    Uses PyAV (av) for decoding and Pillow (PIL) for JPEG encoding.
-    Returns an initial_image payload dict, or None on any failure.
+    Uses PyAV for decode and Pillow for PNG encoding (less loss than JPEG before
+  the pipeline's I2V preprocess round-trip).
     """
     import importlib
     for pkg, mod in (("av", "av"), ("Pillow", "PIL")):
@@ -1441,18 +1445,26 @@ def extract_last_frame(video_path: Path) -> Optional[dict]:
         last = None
         with av.open(str(video_path)) as container:
             stream = container.streams.video[0]
-            stream.codec_context.skip_frame = "NONREF"   # skip non-reference frames for speed
+            stream.thread_type = "AUTO"
+            # Seek near the end so we decode only tail frames (not the whole clip).
+            if stream.duration is not None and stream.time_base is not None:
+                dur_s = float(stream.duration * stream.time_base)
+                if dur_s > 0.2:
+                    try:
+                        container.seek(int((dur_s - 0.1) / stream.time_base), stream=stream)
+                    except av.AVError:
+                        pass
             for frame in container.decode(stream):
                 last = frame
         if last is None:
             return None
         buf = io.BytesIO()
-        last.to_image().save(buf, "JPEG")
+        last.to_image().save(buf, "PNG")
         data = base64.b64encode(buf.getvalue()).decode()
         return {
-            "name":      "autocontinue.jpg",
-            "mime_type": "image/jpeg",
-            "data_url":  f"data:image/jpeg;base64,{data}",
+            "name": "autocontinue.png",
+            "mime_type": "image/png",
+            "data_url": f"data:image/png;base64,{data}",
         }
     except Exception as exc:
         print(f"  [autocontinue] frame extraction failed: {exc}")

@@ -765,6 +765,9 @@ class RequestHandler:
                         lora_specs=lora_specs,
                         video_conditioning_specs=video_conditioning_specs,
                         job_id=generation_id,
+                        a2v_visual_i2v_continue=bool(
+                            msg.get("a2v_visual_i2v_continue", False)
+                        ),
                     )
                 )
                 try:
