@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -21,6 +22,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Optional
 
 REPO_ROOT = Path(__file__).resolve().parent
+log = logging.getLogger("web_ui")
 
 KNOWN_MODELS = [
     {"id": "auto", "label": "Auto (RAM-based)", "repo": "auto"},
@@ -172,6 +174,17 @@ class AppState:
         self.clips: dict[str, ClipRecord] = {}
         self.event_queues: dict[str, asyncio.Queue[dict[str, Any]]] = {}
         self._pending: asyncio.Queue[str] = asyncio.Queue()
+        self._worker_started = False
+
+    def ensure_worker(self) -> None:
+        """Start background generation worker (idempotent)."""
+        if self._worker_started:
+            return
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.upload_dir.mkdir(parents=True, exist_ok=True)
+        self.load_index()
+        asyncio.create_task(_worker_loop(self))
+        self._worker_started = True
 
     def load_index(self) -> None:
         path = self.output_dir / INDEX_FILE
@@ -383,6 +396,7 @@ def _build_params_from_request(body: dict[str, Any]) -> Any:
 
 
 async def _execute_run(state: AppState, run_id: str) -> None:
+    log.info("Web UI: executing run %s", run_id)
     (
         _GenerationParams,
         Job,
@@ -512,19 +526,20 @@ async def _worker_loop(state: AppState) -> None:
             await state.emit(run_id, {"type": "run_complete", "run_id": run_id})
 
 
-def create_app(state: AppState, mount_static: bool = True) -> Any:
+def create_app(
+    state: AppState,
+    mount_static: bool = True,
+    ws_handler: Callable[..., Any] | None = None,
+) -> Any:
     _ensure_web_deps()
-    from fastapi import FastAPI, File, HTTPException, UploadFile
+    from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import FileResponse, StreamingResponse
     from fastapi.staticfiles import StaticFiles
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        state.output_dir.mkdir(parents=True, exist_ok=True)
-        state.upload_dir.mkdir(parents=True, exist_ok=True)
-        state.load_index()
-        asyncio.create_task(_worker_loop(state))
+        state.ensure_worker()
         yield
         if state.server_process:
             state.server_process.terminate()
@@ -737,6 +752,13 @@ def create_app(state: AppState, mount_static: bool = True) -> Any:
 
         state.event_queues[run_id] = asyncio.Queue()
         await state._pending.put(run_id)
+        log.info(
+            "Web UI: queued run %s  chain=%s  clips=%d  mode=%s",
+            run_id,
+            chain_id,
+            len(clip_ids),
+            mode,
+        )
 
         return {"run_id": run_id, "chain_id": chain_id, "clip_ids": clip_ids}
 
@@ -781,6 +803,11 @@ def create_app(state: AppState, mount_static: bool = True) -> Any:
             raise HTTPException(404, "Video not found")
         return FileResponse(path, media_type="video/mp4", filename=filename)
 
+    if ws_handler is not None:
+        @app.websocket("/ws")
+        async def websocket_inference(ws: WebSocket) -> None:
+            await ws_handler(ws)
+
     if mount_static and resolve_web_dist().is_dir():
         app.mount("/", StaticFiles(directory=str(resolve_web_dist()), html=True), name="static")
 
@@ -791,22 +818,8 @@ def build_combined_application(
     ws_handler: Callable[..., Any],
     state: AppState,
 ) -> Any:
-    """Starlette app: WebSocket /ws + FastAPI HTTP (API + static UI)."""
-    _ensure_web_deps()
-    from starlette.applications import Starlette
-    from starlette.routing import Mount, WebSocketRoute
-
-    fastapi_app = create_app(state, mount_static=True)
-
-    async def ws_endpoint(websocket):
-        await ws_handler(websocket)
-
-    return Starlette(
-        routes=[
-            WebSocketRoute("/ws", ws_endpoint),
-            Mount("/", app=fastapi_app),
-        ]
-    )
+    """Single FastAPI app: WebSocket /ws + HTTP API + static UI (lifespan runs)."""
+    return create_app(state, mount_static=True, ws_handler=ws_handler)
 
 
 async def run_uvicorn(app: Any, host: str, port: int) -> None:

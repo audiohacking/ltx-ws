@@ -155,7 +155,11 @@ export default function App() {
     const es = new EventSource(`${API}/api/runs/${runId}/events`);
     es.onmessage = (ev) => {
       const msg = JSON.parse(ev.data);
-      if (msg.type === "protocol") {
+      if (msg.type === "run_started") {
+        setProgress({ phase: "queued", message: "Generation queued…" });
+      } else if (msg.type === "clip_started") {
+        setProgress({ phase: "running", message: "Generating clip…" });
+      } else if (msg.type === "protocol") {
         const e = msg.event;
         if (e.type === "queue_status") {
           setProgress({
@@ -195,6 +199,8 @@ export default function App() {
     es.onerror = () => {
       es.close();
       setBusy(false);
+      setProgress(null);
+      setError((prev) => prev ?? "Lost connection to server while waiting for progress.");
     };
   }
 
@@ -237,11 +243,19 @@ export default function App() {
       });
       if (!r.ok) {
         const err = await r.json().catch(() => ({}));
-        throw new Error(err.detail || "Generate failed");
+        const detail = err.detail;
+        const message =
+          typeof detail === "string"
+            ? detail
+            : Array.isArray(detail)
+              ? detail.map((d: { msg?: string }) => d.msg).join("; ")
+              : "Generate failed";
+        throw new Error(message);
       }
       const data = await r.json();
       if (!chainId) setChainId(data.chain_id);
       setPrompt("");
+      setProgress({ phase: "queued", message: "Queued — starting…" });
       subscribeRun(data.run_id);
       const all = await fetchClips(data.chain_id);
       setClips(all);
