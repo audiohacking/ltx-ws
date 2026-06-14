@@ -65,22 +65,24 @@ export default function App() {
   const audioRef = useRef<HTMLInputElement>(null);
   const videoRef = useRef<HTMLInputElement>(null);
 
+  const libraryClips = useMemo(() => {
+    return clips
+      .filter((c) => c.status === "done" && c.video_url)
+      .sort((a, b) => b.created_at.localeCompare(a.created_at))
+      .slice(0, 48);
+  }, [clips]);
+
   const chainClips = useMemo(() => {
-    if (!chainId) return clips.filter((c) => c.status === "done").slice(-20);
+    if (!chainId) return [];
     return clips
       .filter((c) => c.chain_id === chainId)
       .sort((a, b) => a.clip_index - b.clip_index);
   }, [clips, chainId]);
 
   const activeClip = useMemo(() => {
-    if (selectedClipId) {
-      const c = clips.find((x) => x.id === selectedClipId);
-      if (c) return c;
-    }
-    const current = chainClips.find((c) => c.label === "CURRENT");
-    if (current) return current;
-    return chainClips[chainClips.length - 1];
-  }, [clips, chainClips, selectedClipId]);
+    if (!selectedClipId) return null;
+    return clips.find((x) => x.id === selectedClipId) ?? null;
+  }, [clips, selectedClipId]);
 
   const load = useCallback(async () => {
     try {
@@ -94,18 +96,21 @@ export default function App() {
       setNumSteps(cfg.defaults.num_steps);
       const all = await fetchClips();
       setClips(all);
-      if (!chainId && all.length) {
-        const last = all[all.length - 1];
-        setChainId(last.chain_id);
-      }
     } catch (e) {
       setError(String(e));
     }
-  }, [chainId]);
+  }, []);
 
   useEffect(() => {
     load();
   }, [load]);
+
+  useEffect(() => {
+    if (clipMultiplier > 1) {
+      setAutocontinue(true);
+      setAutoconcat(true);
+    }
+  }, [clipMultiplier]);
 
   const resolution = useMemo(() => {
     if (!config) return { width: 704, height: 480 };
@@ -120,7 +125,18 @@ export default function App() {
   }, [config, durationId]);
 
   const totalDurationSeconds = durationSeconds * clipMultiplier;
-  const editingChain = Boolean(activeClip?.status === "done" && chainId);
+  const isMultiClip = clipMultiplier > 1;
+  const editingChain =
+    !isMultiClip &&
+    Boolean(chainId && activeClip?.status === "done");
+
+  function startNewProject() {
+    setChainId(null);
+    setSelectedClipId(null);
+    setPrompt("");
+    setClipMultiplier(1);
+    setError(null);
+  }
 
   const needsImageUpload = mode === "i2v";
   const needsAudioUpload = mode === "a2v";
@@ -195,11 +211,27 @@ export default function App() {
         });
       } else if (msg.type === "clip_done") {
         setProgress({ phase: "clip_done", message: "Clip saved" });
+        if (msg.clip_id) setSelectedClipId(msg.clip_id as string);
+      } else if (msg.type === "merged") {
+        setProgress({ phase: "merged", message: "Clips merged" });
+        if (msg.clip_id) setSelectedClipId(msg.clip_id as string);
+        fetchClips(chainId ?? undefined).then(setClips);
       } else if (msg.type === "run_complete" || msg.type === "run_done") {
         es.close();
         setBusy(false);
         setProgress(null);
-        fetchClips(chainId ?? undefined).then(setClips);
+        fetchClips(chainId ?? undefined).then((all) => {
+          setClips(all);
+          if (chainId) {
+            const merged = all.find(
+              (c) => c.chain_id === chainId && c.label === "MERGED",
+            );
+            const current = all.find(
+              (c) => c.chain_id === chainId && c.label === "CURRENT",
+            );
+            setSelectedClipId(merged?.id ?? current?.id ?? null);
+          }
+        });
       } else if (msg.type === "error" || msg.type === "clip_failed") {
         setError(msg.error || msg.message || "Failed");
         es.close();
@@ -220,8 +252,7 @@ export default function App() {
     setBusy(true);
     setProgress({ phase: "starting", message: "Submitting…" });
 
-    const continueFrom =
-      autocontinue && activeClip?.status === "done" ? activeClip.id : undefined;
+    const isChainEdit = editingChain && autocontinue;
 
     const body: Record<string, unknown> = {
       prompt: prompt.trim(),
@@ -231,10 +262,10 @@ export default function App() {
       duration_seconds: durationSeconds,
       clip_count: clipMultiplier,
       num_steps: numSteps,
-      autocontinue,
-      autoconcat,
-      chain_id: chainId ?? undefined,
-      continue_from: continueFrom,
+      autocontinue: autocontinue || isMultiClip,
+      autoconcat: autoconcat || isMultiClip,
+      chain_id: isChainEdit ? chainId : undefined,
+      continue_from: isChainEdit ? activeClip?.id : undefined,
       image_path: imagePath,
       audio_path: audioPath,
       video_path: videoPath,
@@ -263,7 +294,8 @@ export default function App() {
         throw new Error(message);
       }
       const data = await r.json();
-      if (!chainId) setChainId(data.chain_id);
+      setChainId(data.chain_id);
+      setSelectedClipId(null);
       setPrompt("");
       setProgress({ phase: "queued", message: "Queued — starting…" });
       subscribeRun(data.run_id);
@@ -286,8 +318,7 @@ export default function App() {
 
   const canSubmit = useMemo(() => {
     if (!prompt.trim() || busy || !serverOk) return false;
-    const continuing =
-      autocontinue && activeClip?.status === "done" && chainId;
+    const continuing = editingChain && autocontinue;
     if (mode === "i2v" && !imagePath && !continuing) return false;
     if (mode === "a2v" && !audioPath) return false;
     if ((mode === "retake" || mode === "extend") && !videoPath) return false;
@@ -313,15 +344,8 @@ export default function App() {
           <span className="brand-sub">local WebSocket</span>
         </div>
         <div className="header-status">
-          <button
-            type="button"
-            className="btn-secondary"
-            onClick={() => {
-              setChainId(null);
-              setSelectedClipId(null);
-            }}
-          >
-            New chain
+          <button type="button" className="btn-secondary" onClick={startNewProject}>
+            New project
           </button>
           <span
             className={`status-dot ${serverOk ? "ok" : "off"}`}
@@ -331,7 +355,8 @@ export default function App() {
         </div>
       </header>
 
-      <main className="main">
+      <div className="app-body">
+        <div className="app-main">
         <section className="player-section">
           <div className="player-wrap">
             {activeClip?.video_url ? (
@@ -368,21 +393,25 @@ export default function App() {
           {error && <div className="error-banner">{error}</div>}
         </section>
 
-        <section className="history">
+        <section className="history history-inline">
+          {chainClips.length > 1 && (
+            <p className="hint chain-hint">
+              Chain · {chainClips.length} clip{chainClips.length !== 1 ? "s" : ""}
+              {chainClips.some((c) => c.label === "MERGED") ? " · merged" : ""}
+            </p>
+          )}
           {chainClips.map((clip) => (
             <button
               key={clip.id}
               type="button"
-              className={`history-item ${
+              className={`history-item history-item-compact ${
                 activeClip?.id === clip.id ? "active" : ""
               }`}
               onClick={() => setSelectedClipId(clip.id)}
             >
               <span className={`history-label ${clip.label.toLowerCase()}`}>
-                {clip.label === "CURRENT" && "✓ "}
                 {clip.label}
               </span>
-              <span className="history-prompt">{clip.prompt}</span>
               {clip.video_url && (
                 <video
                   className="history-thumb"
@@ -490,7 +519,7 @@ export default function App() {
                   </select>
                 </label>
                 <label>
-                  Clips (autocontinue)
+                  Clips (× duration)
                   <select
                     value={clipMultiplier}
                     onChange={(e) => setClipMultiplier(Number(e.target.value))}
@@ -526,10 +555,10 @@ export default function App() {
                 </label>
               </div>
 
-              {clipMultiplier > 1 && (
+              {isMultiClip && (
                 <p className="hint duration-total">
                   ~{durationSeconds}s × {clipMultiplier} clips ≈ ~{totalDurationSeconds}s
-                  total with autocontinue
+                  merged (autocontinue + autoconcat on)
                 </p>
               )}
 
@@ -539,6 +568,7 @@ export default function App() {
                     type="checkbox"
                     checked={autocontinue}
                     onChange={(e) => setAutocontinue(e.target.checked)}
+                    disabled={isMultiClip}
                   />
                   Autocontinue (last frame → next clip)
                 </label>
@@ -547,6 +577,7 @@ export default function App() {
                     type="checkbox"
                     checked={autoconcat}
                     onChange={(e) => setAutoconcat(e.target.checked)}
+                    disabled={isMultiClip}
                   />
                   Autoconcat (merge clips with ffmpeg)
                 </label>
@@ -680,7 +711,45 @@ export default function App() {
             </div>
           )}
         </section>
-      </main>
+        </div>
+
+        <aside className="library">
+          <div className="library-header">
+            <span className="library-title">Library</span>
+            <span className="library-count">{libraryClips.length}</span>
+          </div>
+          <div className="library-grid">
+            {libraryClips.map((clip) => (
+              <button
+                key={clip.id}
+                type="button"
+                className={`library-card ${
+                  activeClip?.id === clip.id ? "active" : ""
+                }`}
+                onClick={() => {
+                  setSelectedClipId(clip.id);
+                  setChainId(clip.chain_id);
+                }}
+                title={clip.prompt}
+              >
+                {clip.video_url && (
+                  <video
+                    className="library-thumb"
+                    src={clip.video_url}
+                    muted
+                    playsInline
+                    preload="metadata"
+                  />
+                )}
+                <span className={`library-label ${clip.label.toLowerCase()}`}>
+                  {clip.label}
+                </span>
+                <span className="library-prompt">{clip.prompt}</span>
+              </button>
+            ))}
+          </div>
+        </aside>
+      </div>
     </div>
   );
 }

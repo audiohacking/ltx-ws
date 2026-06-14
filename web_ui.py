@@ -619,6 +619,91 @@ async def _run_clip_inprocess(
         return False
 
 
+def _apply_autocontinue_frame(
+    params: Any,
+    i: int,
+    autocontinue: bool,
+    initial_image: Any,
+    extract_last_frame: Any,
+    prev_path: Path,
+    prev_filename: str,
+) -> None:
+    if i == 0 and initial_image:
+        params.initial_image = initial_image
+        params.seed = int(time.time_ns() % (2**31 - 1)) or 1
+    elif i > 0 and autocontinue:
+        if prev_path.exists():
+            frame = extract_last_frame(prev_path)
+            if frame:
+                params.initial_image = frame
+                params.seed = int(time.time_ns() % (2**31 - 1)) or 1
+                log.info(
+                    "Web UI: autocontinue clip %d ← last frame of %s",
+                    i + 1,
+                    prev_filename,
+                )
+            else:
+                log.warning(
+                    "Web UI: autocontinue failed — no frame from %s",
+                    prev_path,
+                )
+        else:
+            log.warning(
+                "Web UI: autocontinue failed — missing prior clip %s",
+                prev_path,
+            )
+
+
+async def _finish_autoconcat(
+    state: AppState,
+    run: RunRecord,
+    run_id: str,
+    jobs: list[Any],
+    prefix: str,
+    prompts: list[str],
+    gen_body: dict[str, Any],
+    try_autoconcat_clips: Any,
+) -> None:
+    if not run.autoconcat or len(jobs) < 2:
+        return
+    try_autoconcat_clips(jobs, prefix, "mp4", verbose=False)
+    merged_files = sorted(state.output_dir.glob(f"{prefix}_merged_*.mp4"))
+    if not merged_files:
+        return
+    merged_path = merged_files[-1]
+    merged_name = merged_path.name
+    run.merged_url = state.clip_url(merged_name)
+    merged_id = str(uuid.uuid4())
+    max_idx = max(
+        c.clip_index for c in state.clips.values() if c.chain_id == run.chain_id
+    )
+    for c in state.clips.values():
+        if c.chain_id == run.chain_id and c.label == "CURRENT":
+            c.label = "EDIT"
+    state.clips[merged_id] = ClipRecord(
+        id=merged_id,
+        prompt=f"{prompts[0]} (×{len(jobs)} merged)",
+        label="CURRENT",
+        video_url=run.merged_url,
+        filename=merged_name,
+        chain_id=run.chain_id,
+        clip_index=max_idx + 1,
+        mode=str(gen_body.get("mode") or "generate"),
+        status=RunStatus.DONE.value,
+        created_at=datetime.now().isoformat(),
+        bytes=merged_path.stat().st_size,
+    )
+    await state.emit(
+        run_id,
+        {
+            "type": "merged",
+            "video_url": run.merged_url,
+            "clip_id": merged_id,
+            "filename": merged_name,
+        },
+    )
+
+
 async def _execute_run(state: AppState, run_id: str) -> None:
     if state.embedded and state.video_server is not None:
         await _execute_run_embedded(state, run_id)
@@ -669,16 +754,21 @@ async def _execute_run_embedded(state: AppState, run_id: str) -> None:
         body["prompt"] = prompt
         params = _build_params_from_request(body)
         if i == 0 and initial_image:
-            params.initial_image = initial_image
-            params.seed = int(time.time_ns() % (2**31 - 1)) or 1
+            _apply_autocontinue_frame(
+                params, i, True, initial_image, extract_last_frame, Path(), ""
+            )
         elif i > 0 and autocontinue:
             prev_clip = state.clips[run.clip_ids[i - 1]]
             prev_path = state.output_dir / prev_clip.filename
-            if prev_path.exists():
-                frame = extract_last_frame(prev_path)
-                if frame:
-                    params.initial_image = frame
-                    params.seed = int(time.time_ns() % (2**31 - 1)) or 1
+            _apply_autocontinue_frame(
+                params,
+                i,
+                True,
+                None,
+                extract_last_frame,
+                prev_path,
+                prev_clip.filename,
+            )
 
         out_name = clip.filename
         job = Job(
@@ -725,12 +815,9 @@ async def _execute_run_embedded(state: AppState, run_id: str) -> None:
             )
             return
 
-    if run.autoconcat and len(jobs) >= 2:
-        try_autoconcat_clips(jobs, prefix, "mp4", verbose=False)
-        merged = sorted(state.output_dir.glob(f"{prefix}_merged_*.mp4"))
-        if merged:
-            run.merged_url = state.clip_url(merged[-1].name)
-            await state.emit(run_id, {"type": "merged", "video_url": run.merged_url})
+    await _finish_autoconcat(
+        state, run, run_id, jobs, prefix, prompts, gen_body, try_autoconcat_clips
+    )
 
     run.status = RunStatus.DONE.value
     state.save_index()
@@ -781,16 +868,21 @@ async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
         body["prompt"] = prompt
         params = _build_params_from_request(body)
         if i == 0 and initial_image:
-            params.initial_image = initial_image
-            params.seed = int(time.time_ns() % (2**31 - 1)) or 1
+            _apply_autocontinue_frame(
+                params, i, True, initial_image, extract_last_frame, Path(), ""
+            )
         elif i > 0 and autocontinue:
             prev_clip = state.clips[run.clip_ids[i - 1]]
             prev_path = state.output_dir / prev_clip.filename
-            if prev_path.exists():
-                frame = extract_last_frame(prev_path)
-                if frame:
-                    params.initial_image = frame
-                    params.seed = int(time.time_ns() % (2**31 - 1)) or 1
+            _apply_autocontinue_frame(
+                params,
+                i,
+                True,
+                None,
+                extract_last_frame,
+                prev_path,
+                prev_clip.filename,
+            )
 
         out_name = clip.filename
         job = Job(
@@ -840,12 +932,9 @@ async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
             )
             return
 
-    if run.autoconcat and len(jobs) >= 2:
-        try_autoconcat_clips(jobs, prefix, "mp4", verbose=False)
-        merged = sorted(state.output_dir.glob(f"{prefix}_merged_*.mp4"))
-        if merged:
-            run.merged_url = state.clip_url(merged[-1].name)
-            await state.emit(run_id, {"type": "merged", "video_url": run.merged_url})
+    await _finish_autoconcat(
+        state, run, run_id, jobs, prefix, prompts, gen_body, try_autoconcat_clips
+    )
 
     run.status = RunStatus.DONE.value
     state.save_index()
@@ -1033,6 +1122,12 @@ def create_app(
         continue_from = body.get("continue_from")
         clip_count = int(body.get("clip_count") or 1)
         clip_count = max(1, min(CLIP_MULTIPLIER_MAX, clip_count))
+        # Multi-clip runs are one self-contained autocontinue chain (README --count N).
+        if clip_count > 1:
+            continue_from = None
+            chain_id = str(uuid.uuid4())
+        else:
+            chain_id = body.get("chain_id") or str(uuid.uuid4())
 
         if ui_mode == "i2v" and not body.get("image_path") and not continue_from:
             raise HTTPException(400, "i2v mode requires an image upload")
@@ -1052,9 +1147,15 @@ def create_app(
 
         mode = ui_mode
         run_id = str(uuid.uuid4())
-        chain_id = body.get("chain_id") or str(uuid.uuid4())
         autocontinue = bool(body.get("autocontinue", False)) or clip_count > 1
-        autoconcat = bool(body.get("autoconcat", False))
+        autoconcat = bool(body.get("autoconcat", False)) or clip_count > 1
+        if autoconcat:
+            autocontinue = True
+
+        body = dict(body)
+        if clip_count > 1:
+            body.pop("continue_from", None)
+            body["chain_id"] = chain_id
 
         existing = [c for c in state.clips.values() if c.chain_id == chain_id]
         base_index = len(existing)
