@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Optional
 
 from starlette.requests import Request
+from starlette.websockets import WebSocket
 
 REPO_ROOT = Path(__file__).resolve().parent
 log = logging.getLogger("web_ui")
@@ -1037,7 +1038,7 @@ def create_app(
     ws_handler: Callable[..., Any] | None = None,
 ) -> Any:
     _ensure_web_deps()
-    from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket
+    from fastapi import FastAPI, File, HTTPException, UploadFile
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import FileResponse, StreamingResponse
     from fastapi.staticfiles import StaticFiles
