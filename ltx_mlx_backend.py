@@ -627,7 +627,29 @@ def _invoke_generate_and_save(pipe: Any, **kwargs: Any) -> None:
     elif "fps" in call_kwargs and "fps" not in accepted and "frame_rate" not in accepted:
         call_kwargs.pop("fps", None)
 
+    img = call_kwargs.get("image")
+    if img and "image" not in accepted:
+        for alias in (
+            "image_path",
+            "input_image",
+            "reference_image",
+            "init_image",
+            "first_frame_image",
+            "start_image",
+        ):
+            if alias in accepted:
+                call_kwargs[alias] = call_kwargs.pop("image")
+                break
+
     if not has_varkw:
+        dropped_image = img and "image" not in call_kwargs and not any(
+            k in call_kwargs for k in ("image_path", "input_image", "reference_image", "init_image")
+        )
+        if dropped_image:
+            log.warning(
+                "Pipeline %s.generate_and_save does not accept image= — I2V conditioning disabled",
+                type(pipe).__name__,
+            )
         call_kwargs = {k: v for k, v in call_kwargs.items() if k in accepted}
 
     fn(**call_kwargs)
@@ -826,6 +848,7 @@ class LocalVideoGenerator:
 
         self._pipe_classes: dict[str, Any] = {}
         if generate_cls is not None:
+            self._pipe_classes["gen"] = generate_cls
             self._pipe_classes["t2v"] = generate_cls
             self._pipe_classes["i2v"] = generate_cls
         if a2v_cls is not None:
@@ -1222,7 +1245,7 @@ class LocalVideoGenerator:
                         height=height,
                         width=width,
                         num_frames=nf,
-                        fps=float(self.fps),
+                        frame_rate=float(self.fps),
                         seed=seed,
                         num_steps=steps,
                         lora_paths=resolved_loras,
@@ -1315,16 +1338,33 @@ class LocalVideoGenerator:
                             num_steps=steps,
                         )
                     elif tmp_image:
-                        # Autocontinue / i2v: must use the i2v pipeline (not t2v + image kwarg).
-                        log.info("I2V pipeline (conditioning image present)")
-                        pipe = self._get_pipe("i2v")
+                        try:
+                            from PIL import Image as PILImage
+
+                            with PILImage.open(tmp_image) as im:
+                                log.info(
+                                    "I2V conditioning image: %s (%dx%d) → generation %dx%d",
+                                    tmp_image,
+                                    im.size[0],
+                                    im.size[1],
+                                    width,
+                                    height,
+                                )
+                        except Exception:
+                            log.info(
+                                "I2V conditioning image: %s → generation %dx%d",
+                                tmp_image,
+                                width,
+                                height,
+                            )
+                        pipe = self._get_pipe("gen")
                         _invoke_generate_and_save(
                             pipe,
                             **common_gen_kwargs,
                             image=tmp_image,
                         )
                     else:
-                        pipe = self._get_pipe("t2v")
+                        pipe = self._get_pipe("gen")
                         if self.upscale and "spatial_upscaler" in self._pipe_classes:
                             base_h, base_w = self._calculate_stage1_dimensions(height, width)
                             lowres_out_path = os.path.join(tmpdir, "output_lowres.mp4")
