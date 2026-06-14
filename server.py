@@ -940,11 +940,10 @@ class VideoServer:
             await asyncio.Future()
 
     async def _serve_with_web_ui(self, web_state: Any) -> None:
-        from web_ui import build_combined_application, build_server_urls, run_uvicorn
+        from web_ui import build_combined_application, bind_all_http_hint, run_uvicorn
 
-        ws_url, http_url = build_server_urls(self.host, self.port)
-        web_state.server_url = ws_url
-        web_state.http_url = http_url
+        web_state.video_server = self
+        http_hint = bind_all_http_hint(self.port)
 
         video_server = self
 
@@ -954,8 +953,8 @@ class VideoServer:
             await video_server.handle_ws_connection(adapter)
 
         app = build_combined_application(starlette_ws_handler, web_state)
-        log.info("Web UI       : %s", http_url)
-        log.info("WebSocket    : %s", ws_url)
+        log.info("Web UI       : %s  (use your machine IP/hostname in the browser)", http_hint)
+        log.info("WebSocket    : ws://<this-host>:%s/ws", self.port)
         await run_uvicorn(app, self.host, self.port)
 
 
@@ -1228,10 +1227,9 @@ def main() -> None:
     print(f"  Runtime  : Apple Silicon / MLX")
     print(f"  Endpoint : ws://{args.host}:{args.port}/ws")
     if args.web_ui:
-        from web_ui import build_server_urls, resolve_web_dist
+        from web_ui import bind_all_http_hint, resolve_web_dist
 
-        _, http_url = build_server_urls(args.host, args.port)
-        print(f"  Web UI   : {http_url}")
+        print(f"  Web UI   : {bind_all_http_hint(args.port)}  (same host in browser)")
         if not resolve_web_dist().is_dir():
             print(
                 "  [warn] web/dist missing — build UI: cd web && npm install && npm run build",
@@ -1297,18 +1295,16 @@ def main() -> None:
             AppState,
             DEFAULT_OUTPUT_DIR,
             DEFAULT_UPLOAD_DIR,
-            build_server_urls,
         )
 
-        ws_url, http_url = build_server_urls(args.host, args.port)
         out_dir = (
             args.web_output_dir.expanduser().resolve()
             if args.web_output_dir
             else DEFAULT_OUTPUT_DIR.resolve()
         )
         web_state = AppState(
-            server_url=ws_url,
-            http_url=http_url,
+            server_url="",
+            http_url="",
             output_dir=out_dir,
             upload_dir=DEFAULT_UPLOAD_DIR.resolve(),
             preferred_model=args.model,
@@ -1322,6 +1318,7 @@ def main() -> None:
                 "fps": args.fps,
             },
         )
+        web_state.video_server = server
 
     try:
         asyncio.run(server.serve(web_state))

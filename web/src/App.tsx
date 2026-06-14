@@ -268,6 +268,12 @@ export default function App() {
 
   const serverOk = config?.server_connected;
 
+  const endpointLabel = useMemo(() => {
+    if (typeof window === "undefined") return config?.server_url ?? "";
+    const ws = `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}/ws`;
+    return ws;
+  }, [config?.server_url]);
+
   const canSubmit = useMemo(() => {
     if (!prompt.trim() || busy || !serverOk) return false;
     const continuing =
@@ -309,7 +315,7 @@ export default function App() {
           </button>
           <span
             className={`status-dot ${serverOk ? "ok" : "off"}`}
-            title={config?.server_url ?? ""}
+            title={endpointLabel}
           />
           {serverOk ? "Server connected" : "Server offline"}
         </div>

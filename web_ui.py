@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -72,11 +73,31 @@ def public_host(bind_host: str) -> str:
     return bind_host
 
 
+def urls_from_request(request: Any) -> tuple[str, str]:
+    """Build ws/http URLs from the incoming HTTP request (browser host)."""
+    host = (
+        request.headers.get("x-forwarded-host")
+        or request.headers.get("host")
+        or ""
+    ).split(",")[0].strip()
+    proto = (
+        request.headers.get("x-forwarded-proto") or "http"
+    ).split(",")[0].strip().lower()
+    if not host:
+        return "", ""
+    ws_proto = "wss" if proto == "https" else "ws"
+    return f"{ws_proto}://{host}/ws", f"{proto}://{host}/"
+
+
 def build_server_urls(bind_host: str, port: int) -> tuple[str, str]:
     host = public_host(bind_host)
     ws_url = f"ws://{host}:{port}/ws"
     http_url = f"http://{host}:{port}/"
     return ws_url, http_url
+
+
+def bind_all_http_hint(port: int) -> str:
+    return f"http://<this-host>:{port}/"
 
 
 def snap_frames(raw: int) -> int:
@@ -160,6 +181,7 @@ class AppState:
         active_model: str = "",
         runtime_defaults: dict[str, Any] | None = None,
         server_process: Optional[subprocess.Popen] = None,
+        video_server: Any = None,
     ):
         self.server_url = server_url
         self.http_url = http_url
@@ -170,6 +192,7 @@ class AppState:
         self.embedded = embedded
         self.runtime_defaults = runtime_defaults or {}
         self.server_process = server_process
+        self.video_server = video_server
         self.runs: dict[str, RunRecord] = {}
         self.clips: dict[str, ClipRecord] = {}
         self.event_queues: dict[str, asyncio.Queue[dict[str, Any]]] = {}
@@ -395,7 +418,262 @@ def _build_params_from_request(body: dict[str, Any]) -> Any:
     )
 
 
+def _cleanup_temp_video(path: str | None) -> None:
+    if not path:
+        return
+    try:
+        p = Path(path)
+        p.unlink(missing_ok=True)
+        try:
+            p.parent.rmdir()
+        except OSError:
+            pass
+    except OSError:
+        pass
+
+
+async def _emit_protocol(on_event: Any, payload: dict[str, Any]) -> None:
+    await on_event({"type": "protocol", "event": payload})
+
+
+async def _run_clip_inprocess(
+    video_server: Any,
+    job: Any,
+    on_event: Any,
+) -> bool:
+    """Run one clip via the embedded VideoServer (no WebSocket round-trip)."""
+    from videofentanyl import JobStatus
+
+    params = job.params
+    vs = video_server
+    t0 = time.time()
+
+    async def notify(**kwargs: Any) -> None:
+        await _emit_protocol(on_event, kwargs)
+
+    job.started_at = time.time()
+    try:
+        async with vs.scheduler.generation_slot(notify) as generation_id:
+            await _emit_protocol(
+                on_event,
+                {
+                    "type": "gpu_assigned",
+                    "gpu_id": "mlx:0",
+                    "session_timeout": 7200,
+                    "generation_id": generation_id,
+                },
+            )
+            await _emit_protocol(
+                on_event,
+                {
+                    "type": "ltx2_stream_start",
+                    "total_segments": 1,
+                    "stream_mode": "single",
+                },
+            )
+            await _emit_protocol(
+                on_event,
+                {
+                    "type": "ltx2_segment_start",
+                    "segment_idx": 0,
+                    "total_segments": 1,
+                },
+            )
+
+            video_path = await vs.generator.generate(
+                prompt=params.prompt,
+                image_data=params.initial_image,
+                audio_data=params.audio_input,
+                source_video_data=params.source_video,
+                seed=int(params.seed or 1024),
+                num_frames=params.num_frames,
+                height=params.height,
+                width=params.width,
+                mode=params.generation_mode,
+                num_steps=params.num_steps,
+                retake_start=params.retake_start,
+                retake_end=params.retake_end,
+                extend_frames=params.extend_frames,
+                extend_direction=params.extend_direction or "after",
+                lora_specs=list(params.lora_specs) if params.lora_specs else None,
+                video_conditioning_specs=(
+                    list(params.video_conditioning_specs)
+                    if params.video_conditioning_specs
+                    else None
+                ),
+                job_id=generation_id,
+            )
+
+            job.output_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(video_path, job.output_path)
+            job.file_bytes = job.output_path.stat().st_size
+            job.chunk_count = 1
+            job.ttff_ms = (time.time() - t0) * 1000
+            job.gen_latency_ms = job.ttff_ms
+            job.e2e_latency_ms = job.ttff_ms
+
+            await on_event(
+                {
+                    "type": "download_progress",
+                    "chunks": 1,
+                    "kb": round(job.file_bytes / 1024, 1),
+                }
+            )
+            await _emit_protocol(
+                on_event,
+                {
+                    "type": "ltx2_segment_complete",
+                    "segment_idx": 0,
+                    "total_segments": 1,
+                },
+            )
+            await _emit_protocol(on_event, {"type": "ltx2_stream_complete"})
+            await _emit_protocol(
+                on_event,
+                {
+                    "type": "latency",
+                    "generation_ms": int(job.gen_latency_ms or 0),
+                    "e2e_ms": int(job.e2e_latency_ms or 0),
+                },
+            )
+            _cleanup_temp_video(video_path)
+            job.finished_at = time.time()
+            job.status = JobStatus.DONE
+            return True
+    except Exception as exc:
+        job.finished_at = time.time()
+        job.error = str(exc)
+        job.status = JobStatus.FAILED
+        await _emit_protocol(
+            on_event,
+            {
+                "type": "error",
+                "error_code": "generation_failed",
+                "message": str(exc),
+            },
+        )
+        return False
+
+
 async def _execute_run(state: AppState, run_id: str) -> None:
+    if state.embedded and state.video_server is not None:
+        await _execute_run_embedded(state, run_id)
+        return
+    await _execute_run_via_ws(state, run_id)
+
+
+async def _execute_run_embedded(state: AppState, run_id: str) -> None:
+    log.info("Web UI: executing run %s (in-process)", run_id)
+    (
+        _GenerationParams,
+        Job,
+        JobStatus,
+        _VideoSession,
+        extract_last_frame,
+        _load_image,
+        _load_media,
+        sanitize_filename,
+        try_autoconcat_clips,
+    ) = _import_videofentanyl()
+
+    run = state.runs[run_id]
+    run.status = RunStatus.RUNNING.value
+    await state.emit(run_id, {"type": "run_started", "run_id": run_id})
+
+    jobs: list[Job] = []
+    gen_body = _RUN_BODIES.get(run_id, {})
+    prompts = run.prompts
+    autocontinue = run.autocontinue
+    prefix = sanitize_filename(prompts[0]) or "clip"
+
+    continue_from = gen_body.get("continue_from")
+    initial_image = None
+    if continue_from:
+        parent = state.clips.get(continue_from)
+        if parent and parent.filename:
+            parent_path = state.output_dir / parent.filename
+            if parent_path.exists():
+                initial_image = extract_last_frame(parent_path)
+
+    for i, prompt in enumerate(prompts):
+        clip_id = run.clip_ids[i]
+        clip = state.clips[clip_id]
+        clip.status = RunStatus.RUNNING.value
+        await state.emit(run_id, {"type": "clip_started", "clip_id": clip_id, "index": i})
+
+        body = dict(gen_body)
+        body["prompt"] = prompt
+        params = _build_params_from_request(body)
+        if i == 0 and initial_image:
+            params.initial_image = initial_image
+            params.seed = int(time.time_ns() % (2**31 - 1)) or 1
+        elif i > 0 and autocontinue:
+            prev_clip = state.clips[run.clip_ids[i - 1]]
+            prev_path = state.output_dir / prev_clip.filename
+            if prev_path.exists():
+                frame = extract_last_frame(prev_path)
+                if frame:
+                    params.initial_image = frame
+                    params.seed = int(time.time_ns() % (2**31 - 1)) or 1
+
+        out_name = clip.filename
+        job = Job(
+            id=i + 1,
+            params=params,
+            output_path=state.output_dir / out_name,
+            max_attempts=1,
+        )
+        jobs.append(job)
+
+        async def on_event(event: dict[str, Any], _clip_id: str = clip_id) -> None:
+            event["clip_id"] = _clip_id
+            await state.emit(run_id, event)
+
+        ok = await _run_clip_inprocess(state.video_server, job, on_event)
+
+        if ok:
+            clip.status = RunStatus.DONE.value
+            clip.elapsed_s = round(job.elapsed, 2)
+            clip.bytes = job.file_bytes
+            clip.video_url = state.clip_url(out_name)
+            for c in state.clips.values():
+                if c.chain_id == run.chain_id and c.label == "CURRENT":
+                    c.label = "EDIT"
+            clip.label = "CURRENT"
+            await state.emit(
+                run_id,
+                {
+                    "type": "clip_done",
+                    "clip_id": clip_id,
+                    "video_url": clip.video_url,
+                    "bytes": clip.bytes,
+                },
+            )
+        else:
+            clip.status = RunStatus.FAILED.value
+            clip.error = job.error or "Generation failed"
+            run.status = RunStatus.FAILED.value
+            run.error = clip.error
+            state.save_index()
+            await state.emit(
+                run_id,
+                {"type": "clip_failed", "clip_id": clip_id, "error": clip.error},
+            )
+            return
+
+    if run.autoconcat and len(jobs) >= 2:
+        try_autoconcat_clips(jobs, prefix, "mp4", verbose=False)
+        merged = sorted(state.output_dir.glob(f"{prefix}_merged_*.mp4"))
+        if merged:
+            run.merged_url = state.clip_url(merged[-1].name)
+            await state.emit(run_id, {"type": "merged", "video_url": run.merged_url})
+
+    run.status = RunStatus.DONE.value
+    state.save_index()
+    await state.emit(run_id, {"type": "run_done", "run_id": run_id})
+
+
+async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
     log.info("Web UI: executing run %s", run_id)
     (
         _GenerationParams,
@@ -532,7 +810,7 @@ def create_app(
     ws_handler: Callable[..., Any] | None = None,
 ) -> Any:
     _ensure_web_deps()
-    from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket
+    from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import FileResponse, StreamingResponse
     from fastapi.staticfiles import StaticFiles
@@ -563,21 +841,36 @@ def create_app(
             "fps": FPS,
         }
 
-    async def _is_connected() -> bool:
+    async def _is_connected(request: Request | None = None) -> bool:
         if state.embedded:
             return True
-        return await healthcheck_ws(state.server_url)
+        url = state.server_url
+        if request is not None:
+            ws_url, _ = urls_from_request(request)
+            if ws_url:
+                url = ws_url
+        return await healthcheck_ws(url)
 
     @app.get("/api/health")
-    async def api_health():
-        ok = await _is_connected()
+    async def api_health(request: Request):
+        ws_url, http_url = urls_from_request(request)
+        if ws_url:
+            state.server_url = ws_url
+        if http_url:
+            state.http_url = http_url
+        ok = await _is_connected(request)
         return {"ok": ok, "server_url": state.server_url, "web_url": state.http_url}
 
     @app.get("/api/config")
-    async def api_config():
+    async def api_config(request: Request):
+        ws_url, http_url = urls_from_request(request)
+        if ws_url:
+            state.server_url = ws_url
+        if http_url:
+            state.http_url = http_url
         local = scan_local_models()
         models = KNOWN_MODELS + local
-        ok = await _is_connected()
+        ok = await _is_connected(request)
         model_note = (
             "MLX weights only (dgrauet/ltx-2.3-mlx*). "
             "Restart server.py with --model when changing model."
