@@ -62,12 +62,18 @@ NotifyJson = Callable[..., Awaitable[None]]
 # ── Dependency bootstrap ───────────────────────────────────────────────────────
 
 def _ensure(pkg: str, import_as: str | None = None):
-    """Import a package, auto-installing it if missing."""
+    """Import a package, auto-installing it if missing (skipped in frozen apps)."""
     import importlib
+
+    from ltx_paths import is_frozen
+
     name = import_as or pkg
     try:
         return __import__(name)
     except ImportError:
+        if is_frozen():
+            print(f"Error: required package '{pkg}' is missing from the app bundle.")
+            sys.exit(1)
         print(f"  '{pkg}' not found — installing…", flush=True)
         try:
             subprocess.check_call(
@@ -1163,6 +1169,12 @@ examples:
         metavar="DIR",
         help="directory for Web UI generated clips (default: ./web_outputs)",
     )
+    ui.add_argument(
+        "--open-browser",
+        action="store_true",
+        default=False,
+        help="open the Web UI in the default browser after startup",
+    )
     return p
 
 
@@ -1323,6 +1335,20 @@ def main() -> None:
             },
         )
         web_state.video_server = server
+
+    if args.web_ui and args.open_browser:
+        import threading
+        import time
+        import webbrowser
+
+        from web_ui import public_host
+
+        _host = public_host(args.host)
+        _url = f"http://{_host}:{args.port}/"
+        threading.Thread(
+            target=lambda: (time.sleep(1.5), webbrowser.open(_url)),
+            daemon=True,
+        ).start()
 
     try:
         asyncio.run(server.serve(web_state))

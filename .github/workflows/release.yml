@@ -1,0 +1,90 @@
+# Build LTX-WS Videofentanyl macOS .app with PyInstaller and attach to GitHub Releases.
+#
+# Normal path: publish a GitHub Release → builds that tag and attaches the zip.
+# Manual test: Actions → Release → Run workflow
+#   - ref: branch/SHA to build (e.g. PyInstaller) before merge
+#   - release_tag: label for the zip filename (e.g. ci-test, v0.2.0-rc1)
+#   - attach_to_release: optional upload to an existing release with that tag
+
+name: Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build (branch, tag, or SHA). Empty = branch selected below."
+        required: false
+        default: ""
+      release_tag:
+        description: "Version label for the zip filename (ignored when triggered by publishing a release)."
+        required: true
+        default: ci-test
+      attach_to_release:
+        description: "Attach zip to an existing GitHub Release named release_tag (manual runs only)."
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.release.tag_name || inputs.release_tag || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  build-macos-app:
+    name: macOS app (arm64)
+    runs-on: macos-14
+    timeout-minutes: 90
+    env:
+      RELEASE_VERSION: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
+      CHECKOUT_REF: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.ref != '' && inputs.ref || github.ref }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CHECKOUT_REF }}
+          fetch-depth: 0
+
+      - name: Build context
+        run: |
+          echo "event=${{ github.event_name }}"
+          echo "checkout_ref=${CHECKOUT_REF}"
+          echo "release_version=${RELEASE_VERSION}"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install Python build dependencies
+        run: |
+          chmod +x scripts/ci_install_build_deps.sh scripts/build_mac_app.sh
+          ./scripts/ci_install_build_deps.sh
+
+      - name: Build macOS app
+        run: ./scripts/build_mac_app.sh --zip
+
+      - name: List build output
+        run: ls -la dist/
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LTX-WS-Videofentanyl-${{ env.RELEASE_VERSION }}-macos-arm64
+          path: dist/LTX-WS-Videofentanyl-*-macos-arm64.zip
+          if-no-files-found: error
+
+      - name: Attach to GitHub Release
+        if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.attach_to_release)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.release.tag_name || inputs.release_tag }}
+          files: dist/LTX-WS-Videofentanyl-*-macos-arm64.zip
+          fail_on_unmatched_files: true
+          overwrite_files: true

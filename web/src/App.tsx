@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { snapshotFromClip } from "./clipEditor";
 import { applyProgressEvent } from "./progress";
+import SystemStatusBar from "./SystemStatus";
 import type { Clip, Config, ProgressState } from "./types";
 
 const API = "";
@@ -533,6 +534,7 @@ export default function App() {
           <span className="brand-sub">Videofentanyl</span>
         </div>
         <div className="header-status">
+          <SystemStatusBar />
           <button type="button" className="btn-secondary" onClick={startNewProject}>
             New project
           </button>

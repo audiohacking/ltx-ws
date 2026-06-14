@@ -1,0 +1,2 @@
+# Build-time dependencies (PyInstaller macOS app). Not required for normal server usage.
+pyinstaller>=6.10,<7
