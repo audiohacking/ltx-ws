@@ -47,18 +47,60 @@ Everything below is **local-only**: your Mac, Metal / MLX, and optional Hugging 
 | **ffmpeg** | Optional; required on the **client** machine if you use `--autoconcat`. |
 | **Disk / RAM** | Depends on model (bf16 ≫ q8 ≫ q4). Plan tens of GB disk for full bf16 weights; see [ltx-2-mlx](https://github.com/dgrauet/ltx-2-mlx) model table. |
 
-Python packages: see [`requirements.txt`](requirements.txt) (`websockets`, `av`, `Pillow`, `huggingface_hub`). **MLX** packages are installed separately from the ltx-2-mlx monorepo (comments in `requirements.txt`).
+Python packages: see [`requirements.txt`](requirements.txt) (`websockets`, `av`, `Pillow`, `huggingface_hub`, `fastapi`, `uvicorn`). **MLX** packages are installed separately from the ltx-2-mlx monorepo (comments in `requirements.txt`).
+
+Optional: [uv](https://docs.astral.sh/uv/) for fast venv + installs; [Node.js](https://nodejs.org/) 18+ to build the Web UI.
+
+---
+
+## Quick start
+
+From the repository root. If you **already have weights** under `./models/`, the server will use them — nothing is wiped on `git pull` (see [Model weights](#model-weights)).
+
+```bash
+cd ltx-ws
+
+# 1) Python environment — pick uv (recommended) or classic venv (below)
+
+uv venv --python 3.12 --seed
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+
+uv pip install -r requirements.txt
+uv pip install \
+  "ltx-core-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@v0.14.9#subdirectory=packages/ltx-core-mlx" \
+  "ltx-pipelines-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@v0.14.9#subdirectory=packages/ltx-pipelines-mlx"
+
+# 2) Web UI (first time, or after UI changes)
+cd web && npm install && npm run build && cd ..
+
+# 3) Point at weights you already have (list ./models/ and match the folder name)
+ls models/
+python server.py --model ltx-2.3-mlx-q8
+
+# 4) Browser → http://127.0.0.1:8765/   WebSocket → ws://127.0.0.1:8765/ws
+```
+
+CLI client (separate terminal, same venv):
+
+```bash
+source .venv/bin/activate
+python videofentanyl.py --server ws://127.0.0.1:8765/ws --prompt "a fox running through snow"
+```
 
 ---
 
 ## Install
+
+### Option A — `uv` (recommended)
+
+[`uv`](https://docs.astral.sh/uv/) creates the virtualenv and installs packages quickly.
 
 ```bash
 git clone https://github.com/lmangani/ltx-ws.git
 cd ltx-ws
 
 uv venv --python 3.12 --seed
-source .venv/bin/activate   # or: source .venv/bin/activate.fish
+source .venv/bin/activate   # fish: source .venv/bin/activate.fish
 
 uv pip install -r requirements.txt
 uv pip install \
@@ -66,9 +108,41 @@ uv pip install \
   "ltx-pipelines-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@v0.14.9#subdirectory=packages/ltx-pipelines-mlx"
 ```
 
-Use `pip` instead of `uv pip` if you prefer.
+Later sessions — reactivate the same env (your `models/` folder is untouched):
 
-**Gated or private Hub repos:** set [`HF_TOKEN`](https://huggingface.co/docs/huggingface_hub/package_reference/environment_variables) or run `huggingface-cli login`.
+```bash
+cd ltx-ws
+source .venv/bin/activate
+python server.py --model ltx-2.3-mlx-q8
+```
+
+### Option B — `venv` + `pip`
+
+```bash
+git clone https://github.com/lmangani/ltx-ws.git
+cd ltx-ws
+
+python3.12 -m venv .venv
+source .venv/bin/activate   # fish: source .venv/bin/activate.fish
+
+pip install -U pip
+pip install -r requirements.txt
+pip install \
+  "ltx-core-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@v0.14.9#subdirectory=packages/ltx-core-mlx" \
+  "ltx-pipelines-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@v0.14.9#subdirectory=packages/ltx-pipelines-mlx"
+```
+
+### Web UI assets
+
+Build once (or after editing `web/`):
+
+```bash
+cd web && npm install && npm run build && cd ..
+```
+
+### Hugging Face auth
+
+For gated or private Hub repos: set [`HF_TOKEN`](https://huggingface.co/docs/huggingface_hub/package_reference/environment_variables) or run `huggingface-cli login`.
 
 ---
 
@@ -84,8 +158,27 @@ Use `pip` instead of `uv pip` if you prefer.
 
 See [AGENTS.md](AGENTS.md) for the full agent rule: **only ever MLX weights from the ltx-2-mlx ecosystem.**
 
-1. **Hugging Face repo id** — On first `server.py` startup, weights are downloaded under `./models/<org>__<name>/` (unless `--model-dir` or `$VIDEOFENTANYL_MODELS` applies).
-2. **Local directory** — Pass an existing MLX weights directory to `--model` instead of `org/name`.
+### Keeping your `./models/` folder
+
+- Weights live in **`./models/`** at the repo root (or paths you pass to `--model` / `--model-dir`).
+- The directory is **gitignored** so large checkpoints are **not** committed or removed by `git clone` / `git pull` — they stay on your machine between updates.
+- The server **does not delete** `models/`; it only reads weights or downloads missing Hub snapshots into that tree.
+- After pulling new code, reactivate `.venv` and run `server.py` with the same `--model` shorthand you used before.
+
+**If you already have models** (typical layout):
+
+```bash
+ls models/
+# e.g. ltx-2.3-mlx-q8  or  dgrauet__ltx-2.3-mlx-q8
+
+python server.py --model ltx-2.3-mlx-q8
+# or explicit path:
+python server.py --model ./models/ltx-2.3-mlx-q8
+```
+
+**First-time download** — pass a Hugging Face repo id; snapshots go under `./models/<org>__<name>/` (unless `--model-dir` or `$VIDEOFENTANYL_MODELS` applies).
+
+**Local directory** — pass any existing MLX weights directory to `--model` instead of `org/name`.
 
 **Single-folder names (e.g. `./models/ltx-2.3-mlx/`)**
 
@@ -131,11 +224,27 @@ python server.py --model ltx-2.3-mlx --model-dir ./models/ltx-2.3-mlx
 
 ## Run the server
 
+With `.venv` activated:
+
 ```bash
-python server.py
+source .venv/bin/activate
+python server.py --model ltx-2.3-mlx-q8
 ```
 
-Listens on **`ws://0.0.0.0:8765/ws`** by default. Model path and pipeline registry are resolved at startup; the first use of each pipeline (`t2v`/`i2v`/`a2v`/`retake`/`extend`) is lazy-loaded.
+By default the **Web UI is enabled** on the same port:
+
+| Service | URL |
+|---------|-----|
+| Web UI | `http://127.0.0.1:8765/` |
+| WebSocket | `ws://127.0.0.1:8765/ws` |
+
+WebSocket-only (no browser UI):
+
+```bash
+python server.py --no-web-ui --model ltx-2.3-mlx-q8
+```
+
+Model path and pipelines are resolved at startup; the first use of each pipeline (`t2v` / `i2v` / `a2v` / `retake` / `extend`) is lazy-loaded.
 
 Useful variants:
 
@@ -164,9 +273,10 @@ With `--upscale`, `ltx-ws` now runs a true two-stage generate path: stage 1 at h
 
 ## Run the MCP server
 
-After `server.py` is running, launch the MCP adapter:
+After `server.py` is running (with `.venv` activated):
 
 ```bash
+source .venv/bin/activate
 python mcp_server.py --server-url ws://127.0.0.1:8765/ws
 ```
 
@@ -177,44 +287,26 @@ This MCP server exposes:
 
 ## Web UI
 
-A minimal browser client inspired by [FastVideo Dreamverse](https://github.com/hao-ai-lab/FastVideo/tree/main/apps/dreamverse/web): centered video player, editable clip history, and a prompt bar with generation options below.
+Dreamverse-inspired browser client: video player, clip history, prompt bar, and generation options (i2v / a2v uploads, autocontinue chains, duration × clip multiplier).
 
-The Web UI is **embedded in `server.py` by default** — same port for HTTP (UI + API) and WebSocket (`/ws`).
+Embedded in `server.py` by default — no separate process. See [Quick start](#quick-start) for build + run.
 
-**1. Build the frontend** (first time, or after UI changes):
-
-```bash
-cd web && npm install && npm run build && cd ..
-```
-
-**2. Start the server** (Web UI on by default):
+**Development** (hot-reload frontend while `server.py` runs):
 
 ```bash
-python server.py --model dgrauet/ltx-2.3-mlx-q8
-```
-
-Open **http://127.0.0.1:8765/** (or the host/port you bind). Clips persist under `./web_outputs/`.
-
-Disable the browser UI (WebSocket only):
-
-```bash
-python server.py --no-web-ui
-```
-
-**Development** (hot-reload frontend against a running server):
-
-```bash
-python server.py --model dgrauet/ltx-2.3-mlx-q8
+source .venv/bin/activate
+python server.py --model ltx-2.3-mlx-q8
 cd web && npm run dev   # :5299, proxies /api and /ws → :8765
 ```
 
-**Standalone UI** (attach to a WebSocket server elsewhere):
+**Standalone UI** (attach to a remote WebSocket server):
 
 ```bash
+source .venv/bin/activate
 python web_server.py --server-url ws://127.0.0.1:8765/ws
 ```
 
-**Options in the UI:** MLX model (active weights shown when embedded), modes (`generate`, `i2v`, `a2v`, `retake`, `extend`, `ic_lora`), resolution, duration × clip multiplier for autocontinue chains, steps/seed, media uploads, **autocontinue** / **autoconcat**.
+Generated clips persist under `./web_outputs/` (override with `--web-output-dir` on `server.py`).
 
 ### OmniNFT LoRA: how to get/download it
 
@@ -361,14 +453,18 @@ The last line of output is **`BENCHMARK_JSON:{...}`** for scripts. Outputs go un
 ## Repository layout
 
 ```
-server.py                 # WebSocket server (MLX)
+server.py                 # WebSocket + embedded Web UI (default)
 videofentanyl.py          # CLI client
-mcp_server.py             # MCP tool server for ltx-ws
+mcp_server.py             # MCP tool server
+web_ui.py                 # Web UI API / orchestration
+web_server.py             # Standalone Web UI entry point
+web/                      # React frontend (build → web/dist/)
 ltx_mlx_backend.py        # MLX generator + HF snapshot paths
 requirements.txt
 scripts/benchmark_local_generation.py
-models/                   # default HF snapshot dir (gitignored)
-third_party/LTX-2/        # optional submodule: upstream Lightricks LTX-2 reference
+models/                   # local MLX weights (gitignored — kept on disk)
+web_outputs/              # Web UI generated clips (gitignored)
+third_party/LTX-2/        # optional submodule
 ```
 
 ---
@@ -417,6 +513,8 @@ The client implements this flow for `--mode ltx` when `--server` is set.
 | `--chunk-size` | `65536` | Max bytes per WebSocket binary frame. |
 | `--spill-dir` | `fvserver_completed` | Salvage directory on client disconnect. |
 | `--verbose` | off | Extra per-connection logs. |
+| `--web-ui` | on | Serve browser UI + `/api` on the same port (use `--no-web-ui` to disable). |
+| `--web-output-dir` | `./web_outputs` | Directory for Web UI saved clips. |
 
 Default global LoRA is **disabled unless enabled** with `--enable-lora` (or env below).  
 When enabled, LoRA defaults can be configured in `server.py` constants and overridden via env:

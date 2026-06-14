@@ -21,6 +21,8 @@ benchmark_runs/
 fvserver_completed/
 web_outputs/
 web_uploads/
+# Local MLX weights — gitignored so large checkpoints stay on disk across
+# clone/pull; never deleted by the app. Keep your ./models/ folder in the repo.
 models/
 web/node_modules/
 web/dist/
