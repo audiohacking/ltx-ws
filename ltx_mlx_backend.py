@@ -655,15 +655,13 @@ class _ModelProgressStore:
             snap = dict(self._data)
         step = snap.get("step")
         total = snap.get("total")
-        started = snap.get("started_at")
-        if isinstance(step, (int, float)) and isinstance(total, (int, float)) and total > 0:
+        if (
+            snap.get("pct") is None
+            and isinstance(step, (int, float))
+            and isinstance(total, (int, float))
+            and total > 0
+        ):
             snap["pct"] = round(100 * float(step) / float(total), 0)
-        if isinstance(step, (int, float)) and step > 0 and isinstance(started, (int, float)):
-            elapsed = time.time() - float(started)
-            avg = elapsed / float(step)
-            snap["avg_step_s"] = round(avg, 1)
-            if isinstance(total, (int, float)) and total > step:
-                snap["eta_s"] = round(avg * (float(total) - float(step)), 0)
         return snap
 
 
@@ -745,16 +743,29 @@ class LocalVideoGenerator:
 
             def _publish(self, gen: LocalVideoGenerator) -> None:
                 desc = str(self.desc or "")
-                prev = gen._model_progress.snapshot() or {}
-                started = prev.get("started_at")
-                if started is None:
-                    started = time.time()
+                fd = getattr(self, "format_dict", None) or {}
+                n = int(self.n)
+                total = int(self.total) if self.total is not None else None
+                rate = fd.get("rate")
+                tqdm_elapsed = fd.get("elapsed")
+                eta_s: float | None = None
+                avg_step_s: float | None = None
+                if isinstance(rate, (int, float)) and rate > 0:
+                    avg_step_s = round(1.0 / float(rate), 2)
+                    if total is not None:
+                        eta_s = round((total - n) / float(rate), 1)
                 gen._model_progress.set(
                     {
                         "stage": _stage_from_tqdm_desc(desc),
-                        "step": int(self.n),
-                        "total": int(self.total) if self.total is not None else None,
-                        "started_at": started,
+                        "step": n,
+                        "total": total,
+                        "eta_s": eta_s,
+                        "avg_step_s": avg_step_s,
+                        "elapsed_s": (
+                            round(float(tqdm_elapsed), 1)
+                            if isinstance(tqdm_elapsed, (int, float))
+                            else None
+                        ),
                         "label": desc.strip() or None,
                     }
                 )

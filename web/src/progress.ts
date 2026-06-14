@@ -1,5 +1,13 @@
 import type { ModelProgress, ProgressState } from "./types";
 
+/** tqdm-style clock: 54 → "00:54", 125 → "02:05" */
+export function formatMmSs(seconds: number): string {
+  const s = Math.max(0, Math.round(seconds));
+  const mm = Math.floor(s / 60);
+  const ss = s % 60;
+  return `${String(mm).padStart(2, "0")}:${String(ss).padStart(2, "0")}`;
+}
+
 export function progressFromModel(
   mp?: ModelProgress | null,
   elapsed_s?: number,
@@ -13,35 +21,36 @@ export function progressFromModel(
     total: mp.total,
     pct: mp.pct,
     eta_s: mp.eta_s,
-    elapsed_s,
+    elapsed_s: mp.elapsed_s ?? elapsed_s,
   };
 }
 
+/** Match CLI tqdm: ``2/8 [00:18<00:54, 9.11s/it]`` — lead with remaining time. */
 export function formatProgressMessage(
   mp?: ModelProgress | null,
-  elapsed_s?: number,
+  _elapsed_s?: number,
 ): string {
-  if (!mp?.stage && !mp?.step) {
-    return elapsed_s != null ? `Generating… ${elapsed_s}s` : "Generating…";
+  if (!mp?.stage && mp?.step == null) {
+    return "Generating…";
   }
   const parts: string[] = [];
   const stage = mp?.stage || "generating";
   parts.push(stage.charAt(0).toUpperCase() + stage.slice(1));
+
   if (mp?.step != null && mp?.total != null) {
-    parts.push(`step ${mp.step}/${mp.total}`);
+    parts.push(`${mp.step}/${mp.total}`);
   }
-  if (mp?.pct != null) {
+
+  if (mp?.eta_s != null) {
+    parts.push(`${formatMmSs(mp.eta_s)} remaining`);
+  } else if (mp?.pct != null) {
     parts.push(`${mp.pct}%`);
   }
-  if (mp?.eta_s != null) {
-    parts.push(`~${mp.eta_s}s left`);
+
+  if (mp?.avg_step_s != null) {
+    parts.push(`${mp.avg_step_s}s/it`);
   }
-  if (mp?.avg_step_s != null && mp.step != null && mp.total != null) {
-    parts.push(`${mp.avg_step_s}s/step`);
-  }
-  if (elapsed_s != null) {
-    parts.push(`${elapsed_s}s elapsed`);
-  }
+
   return parts.join(" · ");
 }
 
@@ -50,7 +59,7 @@ export function applyProgressEvent(
   msg: Record<string, unknown>,
 ): ProgressState {
   const mp = (msg.model_progress as ModelProgress | undefined) ?? undefined;
-  const elapsed_s =
+  const wall_elapsed =
     typeof msg.elapsed_s === "number" ? msg.elapsed_s : prev?.elapsed_s;
   const phase =
     typeof msg.phase === "string"
@@ -58,7 +67,7 @@ export function applyProgressEvent(
       : mp?.stage ?? prev?.phase ?? "generating";
   return {
     phase,
-    message: formatProgressMessage(mp, elapsed_s),
-    ...progressFromModel(mp, elapsed_s),
+    message: formatProgressMessage(mp, wall_elapsed),
+    ...progressFromModel(mp, wall_elapsed),
   };
 }

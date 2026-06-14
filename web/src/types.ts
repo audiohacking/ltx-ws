@@ -61,6 +61,7 @@ export interface ModelProgress {
   pct?: number;
   eta_s?: number;
   avg_step_s?: number;
+  elapsed_s?: number;
   label?: string;
 }
 
