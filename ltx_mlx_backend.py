@@ -772,11 +772,23 @@ class LocalVideoGenerator:
 
         tqdm_mod.tqdm = _TrackingTqdm
         tqdm_mod.auto.tqdm = _TrackingTqdm
+        samplers_mod: Any | None = None
+        orig_samplers_tqdm: Any = None
+        try:
+            import ltx_pipelines_mlx.utils.samplers as samplers_mod
+
+            orig_samplers_tqdm = getattr(samplers_mod, "tqdm", None)
+            if orig_samplers_tqdm in (orig_tqdm, orig_auto, tqdm_mod.tqdm):
+                samplers_mod.tqdm = _TrackingTqdm
+        except ImportError:
+            pass
         try:
             yield
         finally:
             tqdm_mod.tqdm = orig_tqdm
             tqdm_mod.auto.tqdm = orig_auto
+            if samplers_mod is not None and orig_samplers_tqdm is not None:
+                samplers_mod.tqdm = orig_samplers_tqdm
             self._model_progress.clear()
 
     def _resolve_model_dir(self) -> str:

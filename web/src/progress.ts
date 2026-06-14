@@ -28,12 +28,9 @@ export function progressFromModel(
 /** Match CLI tqdm: ``2/8 [00:18<00:54, 9.11s/it]`` — lead with remaining time. */
 export function formatProgressMessage(
   mp?: ModelProgress | null,
-  elapsed_s?: number,
+  _elapsed_s?: number,
 ): string {
   if (!mp?.stage && mp?.step == null) {
-    if (elapsed_s != null) {
-      return `Generating… ${formatMmSs(elapsed_s)} elapsed`;
-    }
     return "Generating…";
   }
   const parts: string[] = [];
@@ -54,10 +51,6 @@ export function formatProgressMessage(
     parts.push(`${mp.avg_step_s}s/it`);
   }
 
-  if (elapsed_s != null && mp?.eta_s == null) {
-    parts.push(`${formatMmSs(elapsed_s)} elapsed`);
-  }
-
   return parts.join(" · ");
 }
 
@@ -72,9 +65,13 @@ export function applyProgressEvent(
     typeof msg.phase === "string"
       ? msg.phase
       : mp?.stage ?? prev?.phase ?? "generating";
+  const hasStepData = Boolean(mp?.stage || mp?.step != null);
+  const message = hasStepData
+    ? formatProgressMessage(mp, wall_elapsed)
+    : prev?.message ?? formatProgressMessage(mp, wall_elapsed);
   return {
     phase,
-    message: formatProgressMessage(mp, wall_elapsed),
+    message,
     ...progressFromModel(mp, wall_elapsed),
   };
 }
