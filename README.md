@@ -7,6 +7,9 @@
 | [`server.py`](server.py) | WebSocket server: loads [ltx-2-mlx](https://github.com/dgrauet/ltx-2-mlx), runs **T2V/I2V/A2V/retake/extend**, streams **MP4** to clients. |
 | [`videofentanyl.py`](videofentanyl.py) | CLI client: queues jobs, speaks the same JSON + binary protocol (`--mode ltx` + `--server`). |
 | [`mcp_server.py`](mcp_server.py) | MCP server exposing standardized tools for LTX generation (`ltx_generate_video`, `ltx_server_healthcheck`). |
+| [`web_ui.py`](web_ui.py) | Web UI API + static assets; embedded in `server.py` by default (`--web-ui`). |
+| [`web/`](web/) | React frontend — **LTX-WS Videofentanyl** (player, library, multi-clip autocontinue/autoconcat, LoRA picker). |
+| [`web_server.py`](web_server.py) | Optional standalone UI when attaching to a remote WebSocket server. |
 | [`ltx_mlx_backend.py`](ltx_mlx_backend.py) | MLX pipeline adapter, Hugging Face weight resolution, frame/spatial alignment. |
 | [`scripts/benchmark_local_generation.py`](scripts/benchmark_local_generation.py) | Spawns (or attaches to) `server.py`, runs one client job, prints timings + `BENCHMARK_JSON:…`. |
 
@@ -17,7 +20,7 @@ Everything below is **local-only**: your Mac, Metal / MLX, and optional Hugging 
 ## Features
 
 - **Agent-ready docs** — [`AGENTS.md`](AGENTS.md) and [`CLAUDE.md`](CLAUDE.md) document MCP purpose, tools, and continuity (`autocontinue`) usage for AI coding agents.
-- **MLX on Metal** — Inference via [`ltx_pipelines_mlx`](https://github.com/dgrauet/ltx-2-mlx): `TextToVideoPipeline`, `ImageToVideoPipeline`, `AudioToVideoPipeline`, `RetakePipeline`, `ExtendPipeline`.
+- **MLX on Metal** — Inference via [`ltx_pipelines_mlx`](https://github.com/dgrauet/ltx-2-mlx) **v0.14.9** (`DistilledPipeline`, `TI2VidOneStagePipeline` for i2v/autocontinue, `A2VidPipelineTwoStage`, `RetakePipeline`, etc.). Legacy separate `ImageToVideoPipeline` exists only on older ltx-2-mlx installs.
 - **Automatic weight download** — For a Hugging Face repo id (`org/model`), the server calls [`huggingface_hub.snapshot_download`](https://huggingface.co/docs/huggingface_hub/guides/download) on load (equivalent to `huggingface-cli download`). Resumes partial downloads.
 - **Default weights** — [`dgrauet/ltx-2.3-mlx`](https://huggingface.co/dgrauet/ltx-2.3-mlx) (full MLX bf16; very large). Use [`ltx-2.3-mlx-q8`](https://huggingface.co/dgrauet/ltx-2.3-mlx-q8) or [`-q4`](https://huggingface.co/dgrauet/ltx-2.3-mlx-q4) for less RAM/disk.
 - **Weight paths** — `./models/<org>__<name>/` by default, or `--model-dir`, or base directory `$VIDEOFENTANYL_MODELS`.
@@ -25,12 +28,13 @@ Everything below is **local-only**: your Mac, Metal / MLX, and optional Hugging 
 - **Image/audio/video inputs** — Session / generate payloads support image keys plus `audio_input` and `source_video`; client supports `--image`, `--audio`, `--video` (path or `http(s)` URL).
 - **Cross-machine safe media upload** — Client serializes `--image`, `--audio`, and `--video` as payload data, so server and client can run on different hosts without shared filesystem paths.
 - **Operation routing** — `--generation-mode generate|a2v|retake|extend` maps to matching MLX pipelines, including `--retake-start`, `--retake-end`, `--extend-frames`, `--extend-direction`.
-- **Long runs without stalling** — Server emits `generation_keepalive` JSON during inference; client may send `generation_status` and receive `generation_status_ack` (with reserved `model_progress` for future use).
+- **Long runs without stalling** — Server emits `generation_keepalive` JSON during inference (includes **denoising step progress** when available); client may send `generation_status` and receive `generation_status_ack`.
 - **Disconnect safety** — Finished MP4s are copied to `--spill-dir` if the client drops while streaming (`fvserver_completed` by default).
 - **Single-flight generation** — One active MLX job at a time; extra clients wait in a fair queue (`queue_status` / `gpu_assigned`).
 - **Client batching** — Multiple `--prompt`s, `--count`, `--delay`, `--retries`, `--dry-run`, `--verbose`.
 - **Autocontinue / autoconcat** — Chain clips using the last frame of each as the next start image; optional `ffmpeg` stream-copy merge into one file (`--autoconcat`).
-- **Audiocontinue** — `--audiocontinue` auto-enables `--autocontinue --autoconcat --autocompact`, splits one input audio track into clip-length chunks, and feeds each chunk sequentially in `a2v` mode.
+- **Embedded Web UI** — **LTX-WS Videofentanyl** in the browser (`http://<host>:8765/`): prompt bar, clip library, denoising progress (step + ETA), multi-clip **autocontinue** + **autoconcat**, and **LoRA** dropdown (default OmniNFT RL; auto-downloads to `./loras/`).
+- **LoRA** — CLI `--enable-lora` for global defaults, or per-request via Web UI / `lora_specs` in API/MCP. Default artifact: [OmniNFT RL LoRA](https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/loras/LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors) (`DEFAULT_LORA_URL` / `LTX_WS_DEFAULT_LORA`).
 
 ---
 
@@ -44,18 +48,60 @@ Everything below is **local-only**: your Mac, Metal / MLX, and optional Hugging 
 | **ffmpeg** | Optional; required on the **client** machine if you use `--autoconcat`. |
 | **Disk / RAM** | Depends on model (bf16 ≫ q8 ≫ q4). Plan tens of GB disk for full bf16 weights; see [ltx-2-mlx](https://github.com/dgrauet/ltx-2-mlx) model table. |
 
-Python packages: see [`requirements.txt`](requirements.txt) (`websockets`, `av`, `Pillow`, `huggingface_hub`). **MLX** packages are installed separately from the ltx-2-mlx monorepo (comments in `requirements.txt`).
+Python packages: see [`requirements.txt`](requirements.txt) (`websockets`, `av`, `Pillow`, `huggingface_hub`, `fastapi`, `starlette`, `uvicorn`, `python-multipart`, `mcp`). **MLX** packages are installed separately from the ltx-2-mlx monorepo (comments in `requirements.txt`).
+
+Optional: [uv](https://docs.astral.sh/uv/) for fast venv + installs; [Node.js](https://nodejs.org/) 18+ to build the Web UI.
+
+---
+
+## Quick start
+
+From the repository root. If you **already have weights** under `./models/`, the server will use them — nothing is wiped on `git pull` (see [Model weights](#model-weights)).
+
+```bash
+cd ltx-ws
+
+# 1) Python environment — pick uv (recommended) or classic venv (below)
+
+uv venv --python 3.12 --seed
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+
+uv pip install -r requirements.txt
+uv pip install \
+  "ltx-core-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@v0.14.9#subdirectory=packages/ltx-core-mlx" \
+  "ltx-pipelines-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@v0.14.9#subdirectory=packages/ltx-pipelines-mlx"
+
+# 2) Web UI (first time, or after UI changes)
+cd web && npm install && npm run build && cd ..
+
+# 3) Point at weights you already have (list ./models/ and match the folder name)
+ls models/
+python server.py --model ltx-2.3-mlx-q8
+
+# 4) Browser → http://127.0.0.1:8765/   WebSocket → ws://127.0.0.1:8765/ws
+```
+
+CLI client (separate terminal, same venv):
+
+```bash
+source .venv/bin/activate
+python videofentanyl.py --server ws://127.0.0.1:8765/ws --prompt "a fox running through snow"
+```
 
 ---
 
 ## Install
+
+### Option A — `uv` (recommended)
+
+[`uv`](https://docs.astral.sh/uv/) creates the virtualenv and installs packages quickly.
 
 ```bash
 git clone https://github.com/lmangani/ltx-ws.git
 cd ltx-ws
 
 uv venv --python 3.12 --seed
-source .venv/bin/activate   # or: source .venv/bin/activate.fish
+source .venv/bin/activate   # fish: source .venv/bin/activate.fish
 
 uv pip install -r requirements.txt
 uv pip install \
@@ -63,9 +109,41 @@ uv pip install \
   "ltx-pipelines-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@v0.14.9#subdirectory=packages/ltx-pipelines-mlx"
 ```
 
-Use `pip` instead of `uv pip` if you prefer.
+Later sessions — reactivate the same env (your `models/` folder is untouched):
 
-**Gated or private Hub repos:** set [`HF_TOKEN`](https://huggingface.co/docs/huggingface_hub/package_reference/environment_variables) or run `huggingface-cli login`.
+```bash
+cd ltx-ws
+source .venv/bin/activate
+python server.py --model ltx-2.3-mlx-q8
+```
+
+### Option B — `venv` + `pip`
+
+```bash
+git clone https://github.com/lmangani/ltx-ws.git
+cd ltx-ws
+
+python3.12 -m venv .venv
+source .venv/bin/activate   # fish: source .venv/bin/activate.fish
+
+pip install -U pip
+pip install -r requirements.txt
+pip install \
+  "ltx-core-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@v0.14.9#subdirectory=packages/ltx-core-mlx" \
+  "ltx-pipelines-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@v0.14.9#subdirectory=packages/ltx-pipelines-mlx"
+```
+
+### Web UI assets
+
+Build once (or after editing `web/`):
+
+```bash
+cd web && npm install && npm run build && cd ..
+```
+
+### Hugging Face auth
+
+For gated or private Hub repos: set [`HF_TOKEN`](https://huggingface.co/docs/huggingface_hub/package_reference/environment_variables) or run `huggingface-cli login`.
 
 ---
 
@@ -81,8 +159,27 @@ Use `pip` instead of `uv pip` if you prefer.
 
 See [AGENTS.md](AGENTS.md) for the full agent rule: **only ever MLX weights from the ltx-2-mlx ecosystem.**
 
-1. **Hugging Face repo id** — On first `server.py` startup, weights are downloaded under `./models/<org>__<name>/` (unless `--model-dir` or `$VIDEOFENTANYL_MODELS` applies).
-2. **Local directory** — Pass an existing MLX weights directory to `--model` instead of `org/name`.
+### Keeping your `./models/` folder
+
+- Weights live in **`./models/`** at the repo root (or paths you pass to `--model` / `--model-dir`).
+- The directory is **gitignored** so large checkpoints are **not** committed or removed by `git clone` / `git pull` — they stay on your machine between updates.
+- The server **does not delete** `models/`; it only reads weights or downloads missing Hub snapshots into that tree.
+- After pulling new code, reactivate `.venv` and run `server.py` with the same `--model` shorthand you used before.
+
+**If you already have models** (typical layout):
+
+```bash
+ls models/
+# e.g. ltx-2.3-mlx-q8  or  dgrauet__ltx-2.3-mlx-q8
+
+python server.py --model ltx-2.3-mlx-q8
+# or explicit path:
+python server.py --model ./models/ltx-2.3-mlx-q8
+```
+
+**First-time download** — pass a Hugging Face repo id; snapshots go under `./models/<org>__<name>/` (unless `--model-dir` or `$VIDEOFENTANYL_MODELS` applies).
+
+**Local directory** — pass any existing MLX weights directory to `--model` instead of `org/name`.
 
 **Single-folder names (e.g. `./models/ltx-2.3-mlx/`)**
 
@@ -128,11 +225,27 @@ python server.py --model ltx-2.3-mlx --model-dir ./models/ltx-2.3-mlx
 
 ## Run the server
 
+With `.venv` activated:
+
 ```bash
-python server.py
+source .venv/bin/activate
+python server.py --model ltx-2.3-mlx-q8
 ```
 
-Listens on **`ws://0.0.0.0:8765/ws`** by default. Model path and pipeline registry are resolved at startup; the first use of each pipeline (`t2v`/`i2v`/`a2v`/`retake`/`extend`) is lazy-loaded.
+By default the **Web UI is enabled** on the same port:
+
+| Service | URL |
+|---------|-----|
+| Web UI | `http://127.0.0.1:8765/` |
+| WebSocket | `ws://127.0.0.1:8765/ws` |
+
+WebSocket-only (no browser UI):
+
+```bash
+python server.py --no-web-ui --model ltx-2.3-mlx-q8
+```
+
+Model path and pipelines are resolved at startup; the first use of each pipeline (`t2v` / `i2v` / `a2v` / `retake` / `extend`) is lazy-loaded.
 
 Useful variants:
 
@@ -161,9 +274,10 @@ With `--upscale`, `ltx-ws` now runs a true two-stage generate path: stage 1 at h
 
 ## Run the MCP server
 
-After `server.py` is running, launch the MCP adapter:
+After `server.py` is running (with `.venv` activated):
 
 ```bash
+source .venv/bin/activate
 python mcp_server.py --server-url ws://127.0.0.1:8765/ws
 ```
 
@@ -172,21 +286,66 @@ This MCP server exposes:
 - `ltx_generate_video` — run one generation job (supports `generate`, `a2v`, `retake`, `extend`, `ic_lora`) and return output path + timing metadata.
 - `ltx_generate_sequence` — run a prompt list as chained clips with `autocontinue` support (last frame of clip N is fed as initial image to clip N+1), with optional `autoconcat`.
 
-By default, generated files are saved under `./mcp_outputs/` (override with `--output-dir`).
+## Web UI (LTX-WS Videofentanyl)
 
-### OmniNFT LoRA: how to get/download it
+Browser client served from `server.py` by default (`--web-ui`, same port as WebSocket). Title in the header: **LTX-WS Videofentanyl**.
 
-Target file:
+| Feature | Notes |
+|---------|--------|
+| Player + library | Completed clips stay in the library when you start a new generation; select a clip to restore its settings. |
+| Multi-clip | **Clips (× duration)** sets count; autocontinue + autoconcat run automatically for ×N > 1 (same as CLI `--count N --autocontinue --autoconcat`). |
+| Progress | Denoising step counter and ETA during generation (SSE from embedded worker). |
+| LoRA dropdown | Default **OmniNFT RL LoRA** (`DEFAULT_LORA_URL` / `LTX_WS_DEFAULT_LORA`); downloads on first use via `/api/loras/ensure`. **None** disables LoRA for that job. No `--enable-lora` required for UI per-request LoRA. |
+| Modes | generate, i2v, a2v, retake, extend, ic_lora (with uploads as needed). |
+
+Embedded in `server.py` by default — no separate process. See [Quick start](#quick-start) for build + run.
+
+Open from another machine on the LAN using the host IP (server binds `0.0.0.0` by default): `http://<your-mac-ip>:8765/`.
+
+**Development** (hot-reload frontend while `server.py` runs):
+
+```bash
+source .venv/bin/activate
+python server.py --model ltx-2.3-mlx-q8
+cd web && npm run dev   # :5299, proxies /api and /ws → :8765
+```
+
+**Standalone UI** (attach to a remote WebSocket server):
+
+```bash
+source .venv/bin/activate
+python web_server.py --server-url ws://127.0.0.1:8765/ws
+```
+
+Generated clips persist under `./web_outputs/` (override with `--web-output-dir` on `server.py`).
+
+### OmniNFT LoRA (default)
+
+Canonical default URL (also `DEFAULT_LORA_URL` in `server.py`):
+
 - `https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/loras/LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors`
 
-Method 1 (recommended): **no manual download**, let `server.py` fetch/cache it automatically:
+**Web UI:** LoRA dropdown defaults to this preset; first use triggers download/cache under `./loras/`.
+
+**CLI / global server default** (applied to every request when enabled):
 
 ```bash
 python server.py --enable-lora \
   --lora https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/loras/LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors 1.0
 ```
 
-Method 2: download with `huggingface-cli` into a local LoRA folder:
+**Per-request only** (no `--enable-lora`): pass `lora_specs` in `/api/generate`, MCP, or use the Web UI dropdown.
+
+Override default via env (still used for Web UI catalog when set):
+
+```bash
+export LTX_WS_DEFAULT_LORA="https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/loras/LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors"
+export LTX_WS_DEFAULT_LORA_SCALE="1.0"
+```
+
+Other methods (manual download):
+
+**huggingface-cli:**
 
 ```bash
 mkdir -p ./loras/Kijai__LTX2.3_comfy
@@ -198,7 +357,7 @@ python server.py --enable-lora \
   --lora ./loras/Kijai__LTX2.3_comfy/loras/LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors 1.0
 ```
 
-Method 3: direct URL download (`curl`) and load as local file:
+**curl:**
 
 ```bash
 mkdir -p ./loras
@@ -210,7 +369,7 @@ python server.py --enable-lora \
   --lora ./loras/LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors 1.0
 ```
 
-Downloaded LoRAs are cached under `./loras/` by default. To change cache location, set `VIDEOFENTANYL_LORA_DIR=/your/path`.
+Downloaded LoRAs are cached under `./loras/` by default. Override with `VIDEOFENTANYL_LORA_DIR`.
 
 ---
 
@@ -319,14 +478,18 @@ The last line of output is **`BENCHMARK_JSON:{...}`** for scripts. Outputs go un
 ## Repository layout
 
 ```
-server.py                 # WebSocket server (MLX)
+server.py                 # WebSocket + embedded Web UI (default)
 videofentanyl.py          # CLI client
-mcp_server.py             # MCP tool server for ltx-ws
+mcp_server.py             # MCP tool server
+web_ui.py                 # Web UI API / orchestration
+web_server.py             # Standalone Web UI entry point
+web/                      # React frontend (build → web/dist/)
 ltx_mlx_backend.py        # MLX generator + HF snapshot paths
 requirements.txt
 scripts/benchmark_local_generation.py
-models/                   # default HF snapshot dir (gitignored)
-third_party/LTX-2/        # optional submodule: upstream Lightricks LTX-2 reference
+models/                   # local MLX weights (gitignored — kept on disk)
+web_outputs/              # Web UI generated clips (gitignored)
+third_party/LTX-2/        # optional submodule
 ```
 
 ---
@@ -375,6 +538,8 @@ The client implements this flow for `--mode ltx` when `--server` is set.
 | `--chunk-size` | `65536` | Max bytes per WebSocket binary frame. |
 | `--spill-dir` | `fvserver_completed` | Salvage directory on client disconnect. |
 | `--verbose` | off | Extra per-connection logs. |
+| `--web-ui` | on | Serve browser UI + `/api` on the same port (use `--no-web-ui` to disable). |
+| `--web-output-dir` | `./web_outputs` | Directory for Web UI saved clips. |
 
 Default global LoRA is **disabled unless enabled** with `--enable-lora` (or env below).  
 When enabled, LoRA defaults can be configured in `server.py` constants and overridden via env:

@@ -18,6 +18,9 @@ import random
 import re
 import shutil
 import tempfile
+import threading
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -623,11 +626,80 @@ def _invoke_generate_and_save(pipe: Any, **kwargs: Any) -> None:
         call_kwargs["frame_rate"] = float(call_kwargs.pop("fps"))
     elif "fps" in call_kwargs and "fps" not in accepted and "frame_rate" not in accepted:
         call_kwargs.pop("fps", None)
+    if "frame_rate" in call_kwargs and "frame_rate" not in accepted and "fps" in accepted:
+        call_kwargs["fps"] = float(call_kwargs.pop("frame_rate"))
+
+    img = call_kwargs.get("image")
+    if img and "image" not in accepted:
+        for alias in (
+            "image_path",
+            "input_image",
+            "reference_image",
+            "init_image",
+            "first_frame_image",
+            "start_image",
+        ):
+            if alias in accepted:
+                call_kwargs[alias] = call_kwargs.pop("image")
+                break
 
     if not has_varkw:
+        dropped_image = img and "image" not in call_kwargs and not any(
+            k in call_kwargs for k in ("image_path", "input_image", "reference_image", "init_image")
+        )
+        if dropped_image:
+            log.warning(
+                "Pipeline %s.generate_and_save does not accept image= — I2V conditioning disabled",
+                type(pipe).__name__,
+            )
         call_kwargs = {k: v for k, v in call_kwargs.items() if k in accepted}
 
     fn(**call_kwargs)
+
+
+class _ModelProgressStore:
+    """Thread-safe denoising / download progress for WebSocket keepalives."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._data: dict[str, Any] | None = None
+
+    def set(self, data: dict[str, Any]) -> None:
+        with self._lock:
+            self._data = dict(data)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._data = None
+
+    def snapshot(self) -> dict[str, Any] | None:
+        with self._lock:
+            if not self._data:
+                return None
+            snap = dict(self._data)
+        step = snap.get("step")
+        total = snap.get("total")
+        if (
+            snap.get("pct") is None
+            and isinstance(step, (int, float))
+            and isinstance(total, (int, float))
+            and total > 0
+        ):
+            snap["pct"] = round(100 * float(step) / float(total), 0)
+        return snap
+
+
+def _stage_from_tqdm_desc(desc: str) -> str:
+    d = (desc or "").strip().lower()
+    if "denois" in d:
+        return "denoising"
+    if "download" in d:
+        return "downloading"
+    if any(k in d for k in ("encod", "decod", "vae", "latent")):
+        return "encoding"
+    if "upscal" in d:
+        return "upscaling"
+    return "generating"
 
 
 class LocalVideoGenerator:
@@ -668,6 +740,80 @@ class LocalVideoGenerator:
         self._pipes: dict[str, Any] = {}
         self._resolved_default_loras: list[tuple[str, float]] | None = None
         self._lpm_module: Any | None = None
+        self._model_progress = _ModelProgressStore()
+
+    @contextmanager
+    def _track_model_progress(self):
+        """Patch tqdm so denoising step bars update ``model_progress_for_ws``."""
+        try:
+            import tqdm as tqdm_mod
+        except ImportError:
+            yield
+            return
+
+        generator = self
+        orig_tqdm = tqdm_mod.tqdm
+        orig_auto = getattr(tqdm_mod.auto, "tqdm", orig_tqdm)
+
+        class _TrackingTqdm(orig_tqdm):  # type: ignore[misc,valid-type]
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                super().__init__(*args, **kwargs)
+                self._publish(generator)
+
+            def update(self, n: float = 1) -> bool | None:
+                result = super().update(n)
+                self._publish(generator)
+                return result
+
+            def _publish(self, gen: LocalVideoGenerator) -> None:
+                desc = str(self.desc or "")
+                fd = getattr(self, "format_dict", None) or {}
+                n = int(self.n)
+                total = int(self.total) if self.total is not None else None
+                rate = fd.get("rate")
+                tqdm_elapsed = fd.get("elapsed")
+                eta_s: float | None = None
+                avg_step_s: float | None = None
+                if isinstance(rate, (int, float)) and rate > 0:
+                    avg_step_s = round(1.0 / float(rate), 2)
+                    if total is not None:
+                        eta_s = round((total - n) / float(rate), 1)
+                gen._model_progress.set(
+                    {
+                        "stage": _stage_from_tqdm_desc(desc),
+                        "step": n,
+                        "total": total,
+                        "eta_s": eta_s,
+                        "avg_step_s": avg_step_s,
+                        "elapsed_s": (
+                            round(float(tqdm_elapsed), 1)
+                            if isinstance(tqdm_elapsed, (int, float))
+                            else None
+                        ),
+                        "label": desc.strip() or None,
+                    }
+                )
+
+        tqdm_mod.tqdm = _TrackingTqdm
+        tqdm_mod.auto.tqdm = _TrackingTqdm
+        samplers_mod: Any | None = None
+        orig_samplers_tqdm: Any = None
+        try:
+            import ltx_pipelines_mlx.utils.samplers as samplers_mod
+
+            orig_samplers_tqdm = getattr(samplers_mod, "tqdm", None)
+            if orig_samplers_tqdm in (orig_tqdm, orig_auto, tqdm_mod.tqdm):
+                samplers_mod.tqdm = _TrackingTqdm
+        except ImportError:
+            pass
+        try:
+            yield
+        finally:
+            tqdm_mod.tqdm = orig_tqdm
+            tqdm_mod.auto.tqdm = orig_auto
+            if samplers_mod is not None and orig_samplers_tqdm is not None:
+                samplers_mod.tqdm = orig_samplers_tqdm
+            self._model_progress.clear()
 
     def _resolve_model_dir(self) -> str:
         return resolve_mlx_weights_directory(self.model, self.model_dir)
@@ -695,6 +841,9 @@ class LocalVideoGenerator:
                 generate_cls = upscale_cls
                 log.info("Using TI2VidTwoStagesPipeline for --upscale generate jobs")
 
+        legacy_t2v_cls = getattr(lpm, "TextToVideoPipeline", None)
+        legacy_i2v_cls = getattr(lpm, "ImageToVideoPipeline", None)
+
         a2v_cls = getattr(lpm, "A2VidPipelineTwoStage", None)
         if a2v_cls is None:
             a2v_cls = getattr(lpm, "AudioToVideoPipeline", None)
@@ -703,9 +852,24 @@ class LocalVideoGenerator:
         extend_cls = retake_cls if retake_cls is not None else getattr(lpm, "ExtendPipeline", None)
 
         self._pipe_classes: dict[str, Any] = {}
-        if generate_cls is not None:
+        if legacy_t2v_cls is not None:
+            self._pipe_classes["t2v"] = legacy_t2v_cls
+        elif generate_cls is not None:
             self._pipe_classes["t2v"] = generate_cls
-            self._pipe_classes["i2v"] = generate_cls
+        if legacy_i2v_cls is not None:
+            self._pipe_classes["i2v"] = legacy_i2v_cls
+            log.info("Using ImageToVideoPipeline for i2v / autocontinue conditioning")
+        else:
+            one_stage_i2v_cls = getattr(lpm, "TI2VidOneStagePipeline", None)
+            if one_stage_i2v_cls is not None:
+                self._pipe_classes["i2v"] = one_stage_i2v_cls
+                log.info(
+                    "Using TI2VidOneStagePipeline for i2v / autocontinue conditioning"
+                )
+            elif generate_cls is not None:
+                self._pipe_classes["i2v"] = generate_cls
+        if generate_cls is not None:
+            self._pipe_classes["gen"] = generate_cls
         if a2v_cls is not None:
             self._pipe_classes["a2v"] = a2v_cls
         if retake_cls is not None:
@@ -784,7 +948,7 @@ class LocalVideoGenerator:
         log.info("Resolved %d default LoRA(s) for global use", len(resolved))
 
     def model_progress_for_ws(self) -> dict[str, Any] | None:
-        return None
+        return self._model_progress.snapshot()
 
     def default_lora_count(self) -> int:
         if self._resolved_default_loras is not None:
@@ -1093,147 +1257,174 @@ class LocalVideoGenerator:
                 )
 
             try:
-                common_gen_kwargs = dict(
-                    prompt=req.prompt,
-                    output_path=out_path,
-                    height=height,
-                    width=width,
-                    num_frames=nf,
-                    fps=float(self.fps),
-                    seed=seed,
-                    num_steps=steps,
-                    lora_paths=resolved_loras,
-                )
-                if mode == "a2v":
-                    pipe = self._get_pipe("a2v")
-                    _invoke_generate_and_save(
-                        pipe,
-                        **common_gen_kwargs,
-                        audio_path=tmp_audio,
-                        image=tmp_image,
-                    )
-                elif mode == "retake":
-                    if not tmp_video:
-                        raise RuntimeError("retake mode requires source video input")
-                    start_frame = int(req.retake_start if req.retake_start is not None else 1)
-                    end_frame = int(req.retake_end if req.retake_end is not None else start_frame)
-                    pipe = self._get_pipe("retake")
-                    if hasattr(pipe, "generate_and_save"):
-                        _invoke_generate_and_save(
-                            pipe,
-                            **common_gen_kwargs,
-                            video_path=tmp_video,
-                            start_frame=start_frame,
-                            end_frame=end_frame,
-                        )
-                    else:
-                        _invoke_retake_and_save(
-                            pipe,
-                            default_fps=float(self.fps),
-                            prompt=req.prompt,
-                            output_path=out_path,
-                            video_path=tmp_video,
-                            start_frame=start_frame,
-                            end_frame=end_frame,
-                            seed=seed,
-                            num_steps=steps,
-                            lora_paths=resolved_loras,
-                            fps=float(self.fps),
-                        )
-                elif mode == "extend":
-                    if not tmp_video:
-                        raise RuntimeError("extend mode requires source video input")
-                    ext_frames = int(req.extend_frames if req.extend_frames is not None else 2)
-                    direction = (req.extend_direction or "after").strip().lower()
-                    pipe = self._get_pipe("extend")
-                    if hasattr(pipe, "generate_and_save"):
-                        _invoke_generate_and_save(
-                            pipe,
-                            **common_gen_kwargs,
-                            video_path=tmp_video,
-                            extend_frames=ext_frames,
-                            direction=direction,
-                        )
-                    else:
-                        _invoke_extend_and_save(
-                            pipe,
-                            default_fps=float(self.fps),
-                            prompt=req.prompt,
-                            output_path=out_path,
-                            video_path=tmp_video,
-                            extend_frames=ext_frames,
-                            direction=direction,
-                            seed=seed,
-                            num_steps=steps,
-                            lora_paths=resolved_loras,
-                            fps=float(self.fps),
-                        )
-                elif mode == "ic_lora":
-                    if not resolved_loras:
-                        raise RuntimeError("ic_lora mode requires at least one LoRA spec")
-                    if not vc_items:
-                        raise RuntimeError("ic_lora mode requires video_conditioning entries")
-                    pipe = self._get_pipe(
-                        "ic_lora",
-                        pipe_kwargs={
-                            "lora_paths": [(str(p), float(s)) for p, s in resolved_loras],
-                        },
-                    )
-                    _invoke_generate_and_save(
-                        pipe,
+                with self._track_model_progress():
+                    common_gen_kwargs = dict(
                         prompt=req.prompt,
                         output_path=out_path,
-                        video_conditioning=[(str(p), float(s)) for p, s in vc_items],
                         height=height,
                         width=width,
                         num_frames=nf,
-                        fps=float(self.fps),
+                        frame_rate=float(self.fps),
                         seed=seed,
                         num_steps=steps,
+                        lora_paths=resolved_loras,
                     )
-                else:
-                    pipe = self._get_pipe("t2v")
-                    if self.upscale and "spatial_upscaler" in self._pipe_classes:
-                        base_h, base_w = self._calculate_stage1_dimensions(height, width)
-                        lowres_out_path = os.path.join(tmpdir, "output_lowres.mp4")
-                        log.info(
-                            "Legacy two-stage upscale enabled: stage1=%sx%s -> stage2=%sx%s",
-                            base_h,
-                            base_w,
-                            height,
-                            width,
+                    if mode == "a2v":
+                        pipe = self._get_pipe("a2v")
+                        _invoke_generate_and_save(
+                            pipe,
+                            **common_gen_kwargs,
+                            audio_path=tmp_audio,
+                            image=tmp_image,
+                        )
+                    elif mode == "retake":
+                        if not tmp_video:
+                            raise RuntimeError("retake mode requires source video input")
+                        start_frame = int(req.retake_start if req.retake_start is not None else 1)
+                        end_frame = int(req.retake_end if req.retake_end is not None else start_frame)
+                        pipe = self._get_pipe("retake")
+                        if hasattr(pipe, "generate_and_save"):
+                            _invoke_generate_and_save(
+                                pipe,
+                                **common_gen_kwargs,
+                                video_path=tmp_video,
+                                start_frame=start_frame,
+                                end_frame=end_frame,
+                            )
+                        else:
+                            _invoke_retake_and_save(
+                                pipe,
+                                default_fps=float(self.fps),
+                                prompt=req.prompt,
+                                output_path=out_path,
+                                video_path=tmp_video,
+                                start_frame=start_frame,
+                                end_frame=end_frame,
+                                seed=seed,
+                                num_steps=steps,
+                                lora_paths=resolved_loras,
+                                fps=float(self.fps),
+                            )
+                    elif mode == "extend":
+                        if not tmp_video:
+                            raise RuntimeError("extend mode requires source video input")
+                        ext_frames = int(req.extend_frames if req.extend_frames is not None else 2)
+                        direction = (req.extend_direction or "after").strip().lower()
+                        pipe = self._get_pipe("extend")
+                        if hasattr(pipe, "generate_and_save"):
+                            _invoke_generate_and_save(
+                                pipe,
+                                **common_gen_kwargs,
+                                video_path=tmp_video,
+                                extend_frames=ext_frames,
+                                direction=direction,
+                            )
+                        else:
+                            _invoke_extend_and_save(
+                                pipe,
+                                default_fps=float(self.fps),
+                                prompt=req.prompt,
+                                output_path=out_path,
+                                video_path=tmp_video,
+                                extend_frames=ext_frames,
+                                direction=direction,
+                                seed=seed,
+                                num_steps=steps,
+                                lora_paths=resolved_loras,
+                                fps=float(self.fps),
+                            )
+                    elif mode == "ic_lora":
+                        if not resolved_loras:
+                            raise RuntimeError("ic_lora mode requires at least one LoRA spec")
+                        if not vc_items:
+                            raise RuntimeError("ic_lora mode requires video_conditioning entries")
+                        pipe = self._get_pipe(
+                            "ic_lora",
+                            pipe_kwargs={
+                                "lora_paths": [(str(p), float(s)) for p, s in resolved_loras],
+                            },
                         )
                         _invoke_generate_and_save(
                             pipe,
                             prompt=req.prompt,
-                            output_path=lowres_out_path,
-                            height=base_h,
-                            width=base_w,
+                            output_path=out_path,
+                            video_conditioning=[(str(p), float(s)) for p, s in vc_items],
+                            height=height,
+                            width=width,
                             num_frames=nf,
                             fps=float(self.fps),
                             seed=seed,
                             num_steps=steps,
-                            lora_paths=resolved_loras,
                         )
-                        upscaled = self._run_spatial_upscaler_stage(
-                            prompt=req.prompt,
-                            source_video_path=lowres_out_path,
-                            output_path=out_path,
-                            height=height,
-                            width=width,
-                            num_frames=nf,
-                            seed=seed,
-                            num_steps=steps,
-                            lora_paths=resolved_loras,
-                        )
-                        if not upscaled:
-                            shutil.copy2(lowres_out_path, out_path)
-                    else:
+                    elif tmp_image:
+                        try:
+                            from PIL import Image as PILImage
+
+                            with PILImage.open(tmp_image) as im:
+                                log.info(
+                                    "I2V conditioning image: %s (%dx%d) → generation %dx%d",
+                                    tmp_image,
+                                    im.size[0],
+                                    im.size[1],
+                                    width,
+                                    height,
+                                )
+                        except Exception:
+                            log.info(
+                                "I2V conditioning image: %s → generation %dx%d",
+                                tmp_image,
+                                width,
+                                height,
+                            )
+                        # Separate i2v instance (88e6872): do not reuse the t2v pipe cache entry.
+                        pipe = self._get_pipe("i2v")
                         _invoke_generate_and_save(
                             pipe,
                             **common_gen_kwargs,
                             image=tmp_image,
                         )
+                    else:
+                        pipe = self._get_pipe("t2v")
+                        if self.upscale and "spatial_upscaler" in self._pipe_classes:
+                            base_h, base_w = self._calculate_stage1_dimensions(height, width)
+                            lowres_out_path = os.path.join(tmpdir, "output_lowres.mp4")
+                            log.info(
+                                "Legacy two-stage upscale enabled: stage1=%sx%s -> stage2=%sx%s",
+                                base_h,
+                                base_w,
+                                height,
+                                width,
+                            )
+                            _invoke_generate_and_save(
+                                pipe,
+                                prompt=req.prompt,
+                                output_path=lowres_out_path,
+                                height=base_h,
+                                width=base_w,
+                                num_frames=nf,
+                                fps=float(self.fps),
+                                seed=seed,
+                                num_steps=steps,
+                                lora_paths=resolved_loras,
+                            )
+                            upscaled = self._run_spatial_upscaler_stage(
+                                prompt=req.prompt,
+                                source_video_path=lowres_out_path,
+                                output_path=out_path,
+                                height=height,
+                                width=width,
+                                num_frames=nf,
+                                seed=seed,
+                                num_steps=steps,
+                                lora_paths=resolved_loras,
+                            )
+                            if not upscaled:
+                                shutil.copy2(lowres_out_path, out_path)
+                        else:
+                            _invoke_generate_and_save(
+                                pipe,
+                                **common_gen_kwargs,
+                            )
             except BaseException:
                 self._salvage_mp4_to_spill(tmpdir, out_path, req.job_id, req.prompt, "ENCODE_FAIL")
                 raise

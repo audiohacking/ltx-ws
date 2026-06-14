@@ -1,12 +1,25 @@
+# ltx-ws — Python dependencies
+# Python 3.11+ recommended. MLX inference requires macOS + Apple Silicon.
+
+# server.py, videofentanyl.py, ltx_mlx_backend.py
 websockets>=12.0
 av>=12.0
 Pillow>=10.0
 huggingface_hub>=0.20.0
+
+# Web UI (server.py --web-ui default, web_server.py)
+fastapi>=0.115.0
+starlette>=0.37.0
+uvicorn[standard]>=0.32.0
+python-multipart>=0.0.12
+
+# mcp_server.py
 mcp>=1.0.0
 
-# MLX LTX-2.3 (Apple Silicon) — ltx-2-mlx v0.14.9 (PyPI TBD):
+# MLX LTX-2.3 (Apple Silicon) — ltx-2-mlx v0.14.9 (not on PyPI; install after the lines above):
 #   uv pip install \
 #     "ltx-core-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@v0.14.9#subdirectory=packages/ltx-core-mlx" \
 #     "ltx-pipelines-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@v0.14.9#subdirectory=packages/ltx-pipelines-mlx"
 #
+# Tag must match ltx_mlx_backend.LTX2_MLX_GIT_TAG (v0.14.9).
 # Upstream: https://github.com/dgrauet/ltx-2-mlx

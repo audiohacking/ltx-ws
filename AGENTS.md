@@ -8,12 +8,15 @@ Read this file before calling MCP tools or advising users on generation strategy
 
 | Piece | Role |
 |-------|------|
-| `server.py` | Local LTX-2.3 inference (MLX on Apple Silicon). One job at a time; streams MP4 over WebSocket. |
+| `server.py` | Local LTX-2.3 inference (MLX on Apple Silicon). One job at a time; streams MP4 over WebSocket. Embeds Web UI by default. |
 | `videofentanyl.py` | CLI + protocol client (`--server ws://…/ws`). Implements session handshake, generation, and **autocontinue** frame chaining. |
+| `web_ui.py` + `web/` | **LTX-WS Videofentanyl** browser UI: library, multi-clip autocontinue/autoconcat, LoRA picker, SSE progress. |
 | `mcp_server.py` | MCP adapter exposing the same capabilities as tools for Cursor, Claude, etc. |
 
 **Default endpoint:** `ws://127.0.0.1:8765/ws`  
-**Default MCP outputs:** `./mcp_outputs/` (override with `mcp_server.py --output-dir`)
+**Default Web UI:** `http://127.0.0.1:8765/` (same host/port; use machine IP when remote)  
+**Default MCP outputs:** `./mcp_outputs/` (override with `mcp_server.py --output-dir`)  
+**Web UI outputs:** `./web_outputs/` (override with `server.py --web-output-dir`)
 
 This stack does **not** run cloud GPT prompt expansion. Prompts you send are what the model sees (`enhancement_enabled=false` in MCP). Your job is to write strong, model-ready prompts—especially for chained sequences.
 
@@ -97,6 +100,18 @@ python videofentanyl.py --server ws://127.0.0.1:8765/ws \
 ```
 
 MCP `ltx_generate_sequence` is the programmatic equivalent of that workflow.
+
+### Web UI (LTX-WS Videofentanyl)
+
+For directors who prefer a browser over MCP/CLI:
+
+1. `python server.py` (Web UI on by default; build `web/` once: `cd web && npm run build`).
+2. Open `http://<host>:8765/` — header shows **LTX-WS Videofentanyl**.
+3. Set **Clips (× duration)** for segment count; ×N > 1 forces **autocontinue + autoconcat** (matches CLI `--count N --autocontinue --autoconcat`).
+4. **LoRA** dropdown defaults to **OmniNFT RL** (`DEFAULT_LORA_URL`); auto-downloads via `/api/loras/ensure`. Choose **None** to disable LoRA for one job.
+5. Library retains prior generations; merged autoconcat output appears as a single **MERGED** clip.
+
+Embedded mode runs multi-clip chains **in-process** (same MLX generator as the server)—do not route Web UI autocontinue through a separate WebSocket loopback.
 
 ---
 
@@ -202,6 +217,7 @@ Deliver **`merged_output_path`** to the director when `autoconcat=true`.
 |-------------|------|----------|
 | “Make a short test” / one shot | `ltx_generate_video` | optional `num_frames: 49` or `97` |
 | Story, ad, reel, scene, “longer video” | `ltx_generate_sequence` | `autocontinue: true`, `autoconcat: true`, `num_frames: 121` |
+| Same, but browser / non-technical user | Web UI | ×N clips, LoRA dropdown, watch library + merged output |
 | Storyboard with distinct shots (hard cuts) | `ltx_generate_sequence` | `autocontinue: false` (or separate prompts as separate projects) |
 | Music video from one track | CLI `audiocontinue` or manual a2v sequence | MCP: `mode: a2v` + sequence (advanced) |
 | Fix a section of existing footage | `ltx_generate_video` | `mode: retake` + `video` |
@@ -280,6 +296,13 @@ Structure prompts as a **timeline**, not duplicate full scene descriptions.
 | `ic_lora` | Reference-video conditioning + LoRA | `prompt`, `lora_specs`, `video_conditioning` |
 
 For most **director narrative** work, stay on `mode: generate` with **autocontinue sequences**.
+
+### LoRA (OmniNFT default)
+
+- **Default artifact:** `https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/loras/LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors` (`DEFAULT_LORA_URL` in `server.py`).
+- **Web UI:** dropdown applies per-request `lora_specs` (no `--enable-lora` required).
+- **MCP / API:** `lora_specs: [["<url or path>", 1.0]]` on `ltx_generate_video` or `ltx_generate_sequence`.
+- **Global server default:** `python server.py --enable-lora --lora <url> 1.0` or `LTX_WS_ENABLE_LORA=1` + `LTX_WS_DEFAULT_LORA`.
 
 ---
 
@@ -371,14 +394,15 @@ Three ~5s segments, chained and merged:
 ## Minimal local setup (for user troubleshooting)
 
 ```bash
-# 1. Inference server
+# 1. Inference server (+ Web UI)
 python server.py
 
-# 2. MCP adapter
+# 2. MCP adapter (optional)
 python mcp_server.py --server-url ws://127.0.0.1:8765/ws
 
 # 3. Agent calls
 #    ltx_server_healthcheck → ltx_generate_sequence (preferred) or ltx_generate_video
+#    Or direct users to http://127.0.0.1:8765/ for LTX-WS Videofentanyl
 ```
 
 ---
@@ -392,5 +416,6 @@ python mcp_server.py --server-url ws://127.0.0.1:8765/ws
 5. **Prompt clip 1 to establish; clips 2+ to continue** with motion and detail, not full re-description.
 6. **Match aspect ratio** to platform; use `image` only for clip 1 when doing I2V chains.
 7. **Models:** **only MLX** weights for ltx-2-mlx (`dgrauet/ltx-2.3-mlx*`) — never standard `Lightricks/LTX-2.3` checkpoints.
+8. **Web UI** for human directors; **MCP sequence** for programmatic agents—both support autocontinue/autoconcat and per-request LoRA.
 
 `mcp_server.py` reuses `videofentanyl.py` session/protocol code—behavior matches CLI `--autocontinue` / `--autoconcat`.
