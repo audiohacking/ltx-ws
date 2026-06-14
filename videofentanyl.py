@@ -1441,7 +1441,6 @@ def extract_last_frame(video_path: Path) -> Optional[dict]:
         last = None
         with av.open(str(video_path)) as container:
             stream = container.streams.video[0]
-            stream.codec_context.skip_frame = "NONREF"   # skip non-reference frames for speed
             for frame in container.decode(stream):
                 last = frame
         if last is None:

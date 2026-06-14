@@ -790,7 +790,15 @@ async def _execute_run_embedded(state: AppState, run_id: str) -> None:
 
     run = state.runs[run_id]
     run.status = RunStatus.RUNNING.value
-    await state.emit(run_id, {"type": "run_started", "run_id": run_id})
+    await state.emit(
+        run_id,
+        {
+            "type": "run_started",
+            "run_id": run_id,
+            "autoconcat": run.autoconcat,
+            "clip_count": len(run.prompts),
+        },
+    )
 
     jobs: list[Job] = []
     gen_body = _RUN_BODIES.get(run_id, {})
@@ -811,7 +819,15 @@ async def _execute_run_embedded(state: AppState, run_id: str) -> None:
         clip_id = run.clip_ids[i]
         clip = state.clips[clip_id]
         clip.status = RunStatus.RUNNING.value
-        await state.emit(run_id, {"type": "clip_started", "clip_id": clip_id, "index": i})
+        await state.emit(
+            run_id,
+            {
+                "type": "clip_started",
+                "clip_id": clip_id,
+                "index": i,
+                "total_clips": len(prompts),
+            },
+        )
 
         body = dict(gen_body)
         body["prompt"] = prompt
@@ -864,6 +880,9 @@ async def _execute_run_embedded(state: AppState, run_id: str) -> None:
                     "clip_id": clip_id,
                     "video_url": clip.video_url,
                     "bytes": clip.bytes,
+                    "index": i,
+                    "total_clips": len(prompts),
+                    "autoconcat": run.autoconcat,
                 },
             )
         else:
@@ -906,7 +925,15 @@ async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
 
     run = state.runs[run_id]
     run.status = RunStatus.RUNNING.value
-    await state.emit(run_id, {"type": "run_started", "run_id": run_id})
+    await state.emit(
+        run_id,
+        {
+            "type": "run_started",
+            "run_id": run_id,
+            "autoconcat": run.autoconcat,
+            "clip_count": len(run.prompts),
+        },
+    )
 
     _set_server_override(state.server_url)
     jobs: list[Job] = []
@@ -928,7 +955,15 @@ async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
         clip_id = run.clip_ids[i]
         clip = state.clips[clip_id]
         clip.status = RunStatus.RUNNING.value
-        await state.emit(run_id, {"type": "clip_started", "clip_id": clip_id, "index": i})
+        await state.emit(
+            run_id,
+            {
+                "type": "clip_started",
+                "clip_id": clip_id,
+                "index": i,
+                "total_clips": len(prompts),
+            },
+        )
 
         body = dict(gen_body)
         body["prompt"] = prompt
@@ -984,6 +1019,9 @@ async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
                     "clip_id": clip_id,
                     "video_url": clip.video_url,
                     "bytes": clip.bytes,
+                    "index": i,
+                    "total_clips": len(prompts),
+                    "autoconcat": run.autoconcat,
                 },
             )
         else:

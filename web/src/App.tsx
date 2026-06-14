@@ -225,6 +225,7 @@ export default function App() {
 
   async function subscribeRun(runId: string, runChainId: string) {
     let closed = false;
+    let autoconcatRun = false;
     const es = new EventSource(`${API}/api/runs/${runId}/events`);
 
     const finishRun = async () => {
@@ -265,9 +266,23 @@ export default function App() {
     es.onmessage = (ev) => {
       const msg = JSON.parse(ev.data);
       if (msg.type === "run_started") {
-        setProgress({ phase: "queued", message: "Generation queued…" });
+        autoconcatRun = Boolean(msg.autoconcat);
+        setProgress({
+          phase: "queued",
+          message: autoconcatRun
+            ? `Generating ${msg.clip_count ?? "?"} clips (autoconcat)…`
+            : "Generation queued…",
+        });
       } else if (msg.type === "clip_started") {
-        setProgress({ phase: "running", message: "Starting clip…" });
+        const idx = typeof msg.index === "number" ? msg.index + 1 : "?";
+        const total = msg.total_clips ?? "?";
+        setProgress({
+          phase: "running",
+          message:
+            autoconcatRun && total !== "?"
+              ? `Generating clip ${idx}/${total}…`
+              : "Starting clip…",
+        });
       } else if (msg.type === "generation_progress") {
         setProgress((prev) => applyProgressEvent(prev, msg));
       } else if (msg.type === "protocol") {
@@ -279,29 +294,41 @@ export default function App() {
           kb: msg.kb,
         });
       } else if (msg.type === "clip_done") {
-        setProgress({ phase: "clip_done", message: "Clip saved" });
-        if (msg.clip_id && msg.video_url) {
-          setSelectedClipId(msg.clip_id as string);
-          setClips((prev) => {
-            const others = prev.filter((c) => c.id !== msg.clip_id);
-            const existing = prev.find((c) => c.id === msg.clip_id);
-            return [
-              ...others,
-              {
-                ...(existing ?? {}),
-                id: msg.clip_id as string,
-                video_url: msg.video_url as string,
-                chain_id: runChainId,
-                status: "done",
-                label: existing?.label ?? "CURRENT",
-                prompt: existing?.prompt ?? "",
-                filename: existing?.filename ?? "",
-                clip_index: existing?.clip_index ?? 0,
-                mode: existing?.mode ?? "generate",
-                created_at: existing?.created_at ?? new Date().toISOString(),
-              } as Clip,
-            ];
+        const idx = typeof msg.index === "number" ? msg.index + 1 : "?";
+        const total = msg.total_clips ?? "?";
+        if (autoconcatRun) {
+          setProgress({
+            phase: "clip_done",
+            message:
+              total !== "?"
+                ? `Clip ${idx}/${total} done — ${idx === total ? "merging…" : "continuing…"}`
+                : "Clip saved — continuing…",
           });
+        } else {
+          setProgress({ phase: "clip_done", message: "Clip saved" });
+          if (msg.clip_id && msg.video_url) {
+            setSelectedClipId(msg.clip_id as string);
+            setClips((prev) => {
+              const others = prev.filter((c) => c.id !== msg.clip_id);
+              const existing = prev.find((c) => c.id === msg.clip_id);
+              return [
+                ...others,
+                {
+                  ...(existing ?? {}),
+                  id: msg.clip_id as string,
+                  video_url: msg.video_url as string,
+                  chain_id: runChainId,
+                  status: "done",
+                  label: existing?.label ?? "CURRENT",
+                  prompt: existing?.prompt ?? "",
+                  filename: existing?.filename ?? "",
+                  clip_index: existing?.clip_index ?? 0,
+                  mode: existing?.mode ?? "generate",
+                  created_at: existing?.created_at ?? new Date().toISOString(),
+                } as Clip,
+              ];
+            });
+          }
         }
       } else if (msg.type === "merged") {
         setProgress({ phase: "merged", message: "Clips merged" });

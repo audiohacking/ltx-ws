@@ -1314,6 +1314,15 @@ class LocalVideoGenerator:
                             seed=seed,
                             num_steps=steps,
                         )
+                    elif tmp_image:
+                        # Autocontinue / i2v: must use the i2v pipeline (not t2v + image kwarg).
+                        log.info("I2V pipeline (conditioning image present)")
+                        pipe = self._get_pipe("i2v")
+                        _invoke_generate_and_save(
+                            pipe,
+                            **common_gen_kwargs,
+                            image=tmp_image,
+                        )
                     else:
                         pipe = self._get_pipe("t2v")
                         if self.upscale and "spatial_upscaler" in self._pipe_classes:
@@ -1355,7 +1364,6 @@ class LocalVideoGenerator:
                             _invoke_generate_and_save(
                                 pipe,
                                 **common_gen_kwargs,
-                                image=tmp_image,
                             )
             except BaseException:
                 self._salvage_mp4_to_spill(tmpdir, out_path, req.job_id, req.prompt, "ENCODE_FAIL")
