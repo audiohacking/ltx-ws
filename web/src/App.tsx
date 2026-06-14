@@ -261,7 +261,6 @@ export default function App() {
   }
 
   const needsImageUpload = mode === "i2v";
-  const needsAudioUpload = mode === "a2v";
   const isA2v = mode === "a2v";
   const needsVideoUpload = mode === "retake" || mode === "extend";
   const showStartImageOptional = mode === "generate";
