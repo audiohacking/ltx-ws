@@ -529,8 +529,8 @@ export default function App() {
     <div className="app">
       <header className="header">
         <div className="brand">
-          <span className="brand-mark">LTX</span>
-          <span className="brand-sub">local WebSocket</span>
+          <span className="brand-mark">LTX-WS</span>
+          <span className="brand-sub">Videofentanyl</span>
         </div>
         <div className="header-status">
           <button type="button" className="btn-secondary" onClick={startNewProject}>
