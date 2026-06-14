@@ -19,6 +19,21 @@ async function fetchClips(chainId?: string): Promise<Clip[]> {
   return data.clips as Clip[];
 }
 
+/** Merge server clip lists into local state (by id); used when refreshing one chain. */
+function mergeClips(prev: Clip[], incoming: Clip[]): Clip[] {
+  const byId = new Map(prev.map((c) => [c.id, c]));
+  for (const c of incoming) {
+    byId.set(c.id, c);
+  }
+  return Array.from(byId.values());
+}
+
+/** Replace all clips for one chain (e.g. after autoconcat removes fragments). */
+function replaceChainClips(prev: Clip[], chainId: string, chainClips: Clip[]): Clip[] {
+  const rest = prev.filter((c) => c.chain_id !== chainId);
+  return [...rest, ...chainClips];
+}
+
 function formatBytes(n?: number) {
   if (!n) return "";
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
@@ -235,9 +250,9 @@ export default function App() {
       setBusy(false);
       setProgress(null);
       setChainId(runChainId);
-      const all = await fetchClips(runChainId);
-      setClips(all);
-      setSelectedClipId(pickPlaybackClip(all, runChainId));
+      const chainClips = await fetchClips(runChainId);
+      setClips((prev) => replaceChainClips(prev, runChainId, chainClips));
+      setSelectedClipId(pickPlaybackClip(chainClips, runChainId));
     };
 
     const setFromProtocol = (e: Record<string, unknown>) => {
@@ -357,9 +372,9 @@ export default function App() {
             ];
           });
         }
-        fetchClips(runChainId).then((all) => {
-          setClips(all);
-          setSelectedClipId(pickPlaybackClip(all, runChainId) ?? clipId ?? null);
+        fetchClips(runChainId).then((chainClips) => {
+          setClips((prev) => replaceChainClips(prev, runChainId, chainClips));
+          setSelectedClipId(pickPlaybackClip(chainClips, runChainId) ?? clipId ?? null);
         });
       } else if (msg.type === "run_complete" || msg.type === "run_done") {
         finishRun();
@@ -432,8 +447,8 @@ export default function App() {
       setPrompt("");
       setProgress({ phase: "queued", message: "Queued — starting…" });
       subscribeRun(data.run_id, data.chain_id);
-      const all = await fetchClips(data.chain_id);
-      setClips(all);
+      const chainClips = await fetchClips(data.chain_id);
+      setClips((prev) => mergeClips(prev, chainClips));
     } catch (e) {
       setError(String(e));
       setBusy(false);
