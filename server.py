@@ -415,6 +415,42 @@ def _resolve_video_conditioning_specs(msg: dict, session: dict) -> list[tuple[di
 
 
 
+class WsProtocolAdapter:
+    """
+    Wrap a Starlette WebSocket so RequestHandler can use the same send/recv
+    interface as the ``websockets`` library.
+    """
+
+    def __init__(self, websocket: Any, remote_address: Any = None) -> None:
+        self._ws = websocket
+        self.remote_address = remote_address or getattr(websocket, "client", ("?",))
+
+    async def send(self, data: str | bytes) -> None:
+        if isinstance(data, bytes):
+            await self._ws.send_bytes(data)
+        else:
+            await self._ws.send_text(data)
+
+    async def recv(self) -> str | bytes:
+        msg = await self._ws.receive()
+        if msg.get("type") == "websocket.disconnect":
+            raise websockets.exceptions.ConnectionClosed(
+                msg.get("code", 1000), ""
+            )
+        if msg.get("bytes") is not None:
+            return msg["bytes"]
+        return msg.get("text", "")
+
+    def __aiter__(self) -> WsProtocolAdapter:
+        return self
+
+    async def __anext__(self) -> str | bytes:
+        try:
+            return await self.recv()
+        except websockets.exceptions.ConnectionClosed:
+            raise StopAsyncIteration from None
+
+
 # ── Single-flight generation queue (in-memory, self-cleaning) ───────────────────
 
 class GenerationScheduler:
@@ -859,6 +895,10 @@ class VideoServer:
         self.spill_dir    = spill_dir
         self.scheduler   = GenerationScheduler()
 
+    async def handle_ws_connection(self, ws: Any) -> None:
+        """Handle one WebSocket client (websockets or WsProtocolAdapter)."""
+        await self._handle_client(ws)
+
     # ── per-connection callback ───────────────────────────────────────────────
 
     async def _handle_client(self, ws) -> None:
@@ -882,7 +922,10 @@ class VideoServer:
 
     # ── start ────────────────────────────────────────────────────────────────
 
-    async def serve(self) -> None:
+    async def serve(self, web_state: Any | None = None) -> None:
+        if web_state is not None:
+            await self._serve_with_web_ui(web_state)
+            return
         url = f"ws://{self.host}:{self.port}/ws"
         async with websockets.serve(
             self._handle_client,
@@ -894,7 +937,26 @@ class VideoServer:
             close_timeout=5,
         ):
             log.info("WebSocket server listening on %s", url)
-            await asyncio.Future()  # run until interrupted
+            await asyncio.Future()
+
+    async def _serve_with_web_ui(self, web_state: Any) -> None:
+        from web_ui import build_combined_application, build_server_urls, run_uvicorn
+
+        ws_url, http_url = build_server_urls(self.host, self.port)
+        web_state.server_url = ws_url
+        web_state.http_url = http_url
+
+        video_server = self
+
+        async def starlette_ws_handler(websocket: Any) -> None:
+            await websocket.accept()
+            adapter = WsProtocolAdapter(websocket, websocket.client)
+            await video_server.handle_ws_connection(adapter)
+
+        app = build_combined_application(starlette_ws_handler, web_state)
+        log.info("Web UI       : %s", http_url)
+        log.info("WebSocket    : %s", ws_url)
+        await run_uvicorn(app, self.host, self.port)
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
@@ -1076,6 +1138,28 @@ examples:
         "--verbose", "-v", action="store_true",
         help="verbose per-connection logging",
     )
+
+    ui = p.add_argument_group("web ui")
+    ui.add_argument(
+        "--web-ui",
+        dest="web_ui",
+        action="store_true",
+        default=True,
+        help="serve embedded Web UI + API on the same port (default: on)",
+    )
+    ui.add_argument(
+        "--no-web-ui",
+        dest="web_ui",
+        action="store_false",
+        help="WebSocket only (no browser UI)",
+    )
+    ui.add_argument(
+        "--web-output-dir",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="directory for Web UI generated clips (default: ./web_outputs)",
+    )
     return p
 
 
@@ -1143,6 +1227,16 @@ def main() -> None:
         print(f"  RAM pick : {model_auto_note}")
     print(f"  Runtime  : Apple Silicon / MLX")
     print(f"  Endpoint : ws://{args.host}:{args.port}/ws")
+    if args.web_ui:
+        from web_ui import build_server_urls, resolve_web_dist
+
+        _, http_url = build_server_urls(args.host, args.port)
+        print(f"  Web UI   : {http_url}")
+        if not resolve_web_dist().is_dir():
+            print(
+                "  [warn] web/dist missing — build UI: cd web && npm install && npm run build",
+                flush=True,
+            )
     print(f"  Video    : {args.num_frames} frames @ "
           f"{args.height}×{args.width}  {args.fps} fps")
     print(f"  Denoise  : {args.infer_steps} steps  (use --infer-steps to tune)")
@@ -1196,8 +1290,41 @@ def main() -> None:
         chunk_size  = args.chunk_size,
         spill_dir   = spill_dir,
     )
+
+    web_state = None
+    if args.web_ui:
+        from web_ui import (
+            AppState,
+            DEFAULT_OUTPUT_DIR,
+            DEFAULT_UPLOAD_DIR,
+            build_server_urls,
+        )
+
+        ws_url, http_url = build_server_urls(args.host, args.port)
+        out_dir = (
+            args.web_output_dir.expanduser().resolve()
+            if args.web_output_dir
+            else DEFAULT_OUTPUT_DIR.resolve()
+        )
+        web_state = AppState(
+            server_url=ws_url,
+            http_url=http_url,
+            output_dir=out_dir,
+            upload_dir=DEFAULT_UPLOAD_DIR.resolve(),
+            preferred_model=args.model,
+            embedded=True,
+            active_model=args.model,
+            runtime_defaults={
+                "num_frames": args.num_frames,
+                "width": args.width,
+                "height": args.height,
+                "num_steps": args.infer_steps,
+                "fps": args.fps,
+            },
+        )
+
     try:
-        asyncio.run(server.serve())
+        asyncio.run(server.serve(web_state))
     except KeyboardInterrupt:
         print("\n\nServer stopped.")
 

@@ -1,0 +1,872 @@
+"""
+web_ui.py — WebUI API, static assets, and generation orchestration for ltx-ws.
+
+Used by server.py (--web-ui) and optionally by web_server.py (standalone).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import subprocess
+import sys
+import time
+import uuid
+from contextlib import asynccontextmanager
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
+from enum import Enum
+from pathlib import Path
+from typing import Any, AsyncIterator, Callable, Optional
+
+REPO_ROOT = Path(__file__).resolve().parent
+
+KNOWN_MODELS = [
+    {"id": "auto", "label": "Auto (RAM-based)", "repo": "auto"},
+    {"id": "dgrauet/ltx-2.3-mlx", "label": "MLX bf16 (full quality)", "repo": "dgrauet/ltx-2.3-mlx"},
+    {"id": "dgrauet/ltx-2.3-mlx-q8", "label": "MLX int8 (balanced)", "repo": "dgrauet/ltx-2.3-mlx-q8"},
+    {"id": "dgrauet/ltx-2.3-mlx-q4", "label": "MLX int4 (smallest)", "repo": "dgrauet/ltx-2.3-mlx-q4"},
+]
+
+RESOLUTION_PRESETS = [
+    {"id": "704x480", "width": 704, "height": 480, "label": "704 × 480"},
+    {"id": "1024x576", "width": 1024, "height": 576, "label": "1024 × 576 (16:9)"},
+    {"id": "576x1024", "width": 576, "height": 1024, "label": "576 × 1024 (9:16)"},
+    {"id": "1280x720", "width": 1280, "height": 720, "label": "1280 × 720 (HD)"},
+]
+
+DURATION_PRESETS = [
+    {"id": "2s", "seconds": 2.0, "label": "~2 seconds"},
+    {"id": "4s", "seconds": 4.0, "label": "~4 seconds"},
+    {"id": "5s", "seconds": 5.0, "label": "~5 seconds"},
+]
+
+GENERATION_MODES = [
+    {"id": "generate", "label": "Text to video"},
+    {"id": "i2v", "label": "Image to video (i2v)"},
+    {"id": "a2v", "label": "Audio to video (a2v)"},
+    {"id": "retake", "label": "Retake (edit region)"},
+    {"id": "extend", "label": "Extend video"},
+    {"id": "ic_lora", "label": "IC LoRA conditioning"},
+]
+
+CLIP_MULTIPLIER_MAX = 10
+DEFAULT_OUTPUT_DIR = REPO_ROOT / "web_outputs"
+DEFAULT_UPLOAD_DIR = REPO_ROOT / "web_uploads"
+INDEX_FILE = "index.json"
+FPS = 24
+
+_RUN_BODIES: dict[str, dict[str, Any]] = {}
+
+
+def resolve_web_dist() -> Path:
+    return REPO_ROOT / "web" / "dist"
+
+
+def public_host(bind_host: str) -> str:
+    if bind_host in ("0.0.0.0", "::", ""):
+        return "127.0.0.1"
+    return bind_host
+
+
+def build_server_urls(bind_host: str, port: int) -> tuple[str, str]:
+    host = public_host(bind_host)
+    ws_url = f"ws://{host}:{port}/ws"
+    http_url = f"http://{host}:{port}/"
+    return ws_url, http_url
+
+
+def snap_frames(raw: int) -> int:
+    k = max(0, round((int(raw) - 1) / 8))
+    return 8 * k + 1
+
+
+def duration_to_frames(seconds: float) -> int:
+    return snap_frames(int(seconds * FPS))
+
+
+def scan_local_models() -> list[dict[str, str]]:
+    found: list[dict[str, str]] = []
+    models_dir = REPO_ROOT / "models"
+    if not models_dir.is_dir():
+        return found
+    for child in sorted(models_dir.iterdir()):
+        if child.is_dir():
+            found.append(
+                {
+                    "id": str(child),
+                    "label": f"Local: {child.name}",
+                    "repo": str(child),
+                }
+            )
+    return found
+
+
+class RunStatus(str, Enum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    DONE = "done"
+    FAILED = "failed"
+
+
+@dataclass
+class ClipRecord:
+    id: str
+    prompt: str
+    label: str
+    video_url: str
+    filename: str
+    chain_id: str
+    clip_index: int
+    mode: str
+    status: str
+    created_at: str
+    elapsed_s: Optional[float] = None
+    bytes: Optional[int] = None
+    error: Optional[str] = None
+    num_frames: Optional[int] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    seed: Optional[int] = None
+
+
+@dataclass
+class RunRecord:
+    id: str
+    status: str
+    prompts: list[str]
+    chain_id: str
+    clip_ids: list[str] = field(default_factory=list)
+    created_at: str = ""
+    error: Optional[str] = None
+    autocontinue: bool = False
+    autoconcat: bool = False
+    merged_url: Optional[str] = None
+
+
+class AppState:
+    def __init__(
+        self,
+        server_url: str,
+        output_dir: Path,
+        upload_dir: Path,
+        preferred_model: str,
+        *,
+        embedded: bool = False,
+        http_url: str = "",
+        active_model: str = "",
+        runtime_defaults: dict[str, Any] | None = None,
+        server_process: Optional[subprocess.Popen] = None,
+    ):
+        self.server_url = server_url
+        self.http_url = http_url
+        self.output_dir = output_dir
+        self.upload_dir = upload_dir
+        self.preferred_model = preferred_model
+        self.active_model = active_model or preferred_model
+        self.embedded = embedded
+        self.runtime_defaults = runtime_defaults or {}
+        self.server_process = server_process
+        self.runs: dict[str, RunRecord] = {}
+        self.clips: dict[str, ClipRecord] = {}
+        self.event_queues: dict[str, asyncio.Queue[dict[str, Any]]] = {}
+        self._pending: asyncio.Queue[str] = asyncio.Queue()
+
+    def load_index(self) -> None:
+        path = self.output_dir / INDEX_FILE
+        if not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            for c in data.get("clips", []):
+                self.clips[c["id"]] = ClipRecord(**c)
+            for r in data.get("runs", []):
+                self.runs[r["id"]] = RunRecord(**r)
+        except (json.JSONDecodeError, TypeError, KeyError):
+            pass
+
+    def save_index(self) -> None:
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        path = self.output_dir / INDEX_FILE
+        data = {
+            "clips": [asdict(c) for c in self.clips.values()],
+            "runs": [asdict(r) for r in self.runs.values()],
+        }
+        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    def clip_url(self, filename: str) -> str:
+        return f"/api/videos/{filename}"
+
+    async def emit(self, run_id: str, event: dict[str, Any]) -> None:
+        q = self.event_queues.get(run_id)
+        if q:
+            await q.put(event)
+
+
+def _ensure_web_deps() -> None:
+    import importlib
+    import subprocess
+
+    for pkg, mod in (
+        ("fastapi", "fastapi"),
+        ("uvicorn", "uvicorn"),
+        ("python-multipart", "multipart"),
+        ("starlette", "starlette"),
+    ):
+        try:
+            __import__(mod)
+        except ImportError:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", pkg, "-q"],
+                stdout=subprocess.DEVNULL,
+            )
+            importlib.invalidate_caches()
+
+
+def _import_videofentanyl():
+    from videofentanyl import (
+        GenerationParams,
+        Job,
+        JobStatus,
+        VideoSession,
+        extract_last_frame,
+        load_image_payload,
+        load_media_payload,
+        sanitize_filename,
+        try_autoconcat_clips,
+    )
+    return (
+        GenerationParams,
+        Job,
+        JobStatus,
+        VideoSession,
+        extract_last_frame,
+        load_image_payload,
+        load_media_payload,
+        sanitize_filename,
+        try_autoconcat_clips,
+    )
+
+
+class ProgressVideoSession:
+    """VideoSession wrapper that forwards protocol events to the WebUI."""
+
+    def __init__(self, job, mode: str, verbose: bool, on_event: Any, VideoSession):
+        self._session = VideoSession(job, mode=mode, verbose=verbose)
+        self._on_event = on_event
+        self.job = job
+
+    async def run(self, idle_timeout: float | None) -> bool:
+        orig_json = self._session._handle_json
+        orig_binary = self._session._handle_binary
+
+        async def wrapped_json(raw: str) -> None:
+            try:
+                msg = json.loads(raw)
+                await self._on_event({"type": "protocol", "event": msg})
+            except json.JSONDecodeError:
+                pass
+            await orig_json(raw)
+
+        def wrapped_binary(data: bytes) -> None:
+            orig_binary(data)
+            kb = sum(len(c) for c in self._session._chunks) / 1024
+            asyncio.create_task(
+                self._on_event(
+                    {
+                        "type": "download_progress",
+                        "chunks": len(self._session._chunks),
+                        "kb": round(kb, 1),
+                    }
+                )
+            )
+
+        self._session._handle_json = wrapped_json
+        self._session._handle_binary = wrapped_binary
+        return await self._session.run(idle_timeout)
+
+
+def _set_server_override(url: str) -> None:
+    import videofentanyl as vf
+
+    vf._SERVER_OVERRIDE = url
+
+
+async def healthcheck_ws(url: str) -> bool:
+    import websockets
+
+    try:
+        async with websockets.connect(
+            url,
+            open_timeout=3.0,
+            close_timeout=2.0,
+            max_size=1024,
+        ) as ws:
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "session_init_v2",
+                        "preset_id": "simple_custom_prompt",
+                        "curated_prompts": [],
+                        "single_clip_mode": True,
+                    }
+                )
+            )
+            return True
+    except Exception:
+        return False
+
+
+def _api_mode(mode: str) -> str:
+    m = (mode or "generate").strip().lower()
+    if m == "i2v":
+        return "generate"
+    return m
+
+
+def _build_params_from_request(body: dict[str, Any]) -> Any:
+    (
+        GenerationParams,
+        *_,
+    ) = _import_videofentanyl()
+    ui_mode = (body.get("mode") or "generate").strip().lower()
+    mode = _api_mode(ui_mode)
+    image_path = body.get("image_path")
+    audio_path = body.get("audio_path")
+    video_path = body.get("video_path")
+    load_image_payload, load_media_payload = _import_videofentanyl()[5:7]
+
+    image_payload = load_image_payload(image_path) if image_path else None
+    audio_payload = load_media_payload(audio_path, kind="audio") if audio_path else None
+    video_payload = load_media_payload(video_path, kind="video") if video_path else None
+
+    lora_specs: list[tuple[str, float]] = []
+    for item in body.get("lora_specs") or []:
+        if isinstance(item, list) and len(item) == 2:
+            lora_specs.append((str(item[0]), float(item[1])))
+
+    video_conditioning_specs: list[tuple[dict, float]] = []
+    for item in body.get("video_conditioning") or []:
+        if isinstance(item, list) and len(item) == 2:
+            payload = load_media_payload(str(item[0]).strip(), kind="video")
+            video_conditioning_specs.append((payload, float(item[1])))
+
+    duration_s = body.get("duration_seconds")
+    num_frames = body.get("num_frames")
+    if duration_s is not None:
+        num_frames = duration_to_frames(float(duration_s))
+    elif num_frames is not None:
+        num_frames = snap_frames(int(num_frames))
+
+    return GenerationParams(
+        prompt=str(body.get("prompt") or "").strip(),
+        preset_id="simple_custom_prompt",
+        enhancement_enabled=False,
+        single_clip_mode=True,
+        initial_image=image_payload,
+        seed=body.get("seed"),
+        num_frames=num_frames,
+        height=body.get("height"),
+        width=body.get("width"),
+        num_steps=body.get("num_steps"),
+        generation_mode=mode,
+        audio_input=audio_payload,
+        source_video=video_payload,
+        retake_start=body.get("retake_start"),
+        retake_end=body.get("retake_end"),
+        extend_frames=body.get("extend_frames"),
+        extend_direction=body.get("extend_direction"),
+        lora_specs=lora_specs,
+        video_conditioning_specs=video_conditioning_specs,
+    )
+
+
+async def _execute_run(state: AppState, run_id: str) -> None:
+    (
+        _GenerationParams,
+        Job,
+        JobStatus,
+        VideoSession,
+        extract_last_frame,
+        _load_image,
+        _load_media,
+        sanitize_filename,
+        try_autoconcat_clips,
+    ) = _import_videofentanyl()
+
+    run = state.runs[run_id]
+    run.status = RunStatus.RUNNING.value
+    await state.emit(run_id, {"type": "run_started", "run_id": run_id})
+
+    _set_server_override(state.server_url)
+    jobs: list[Job] = []
+    gen_body = _RUN_BODIES.get(run_id, {})
+    prompts = run.prompts
+    autocontinue = run.autocontinue
+    prefix = sanitize_filename(prompts[0]) or "clip"
+
+    continue_from = gen_body.get("continue_from")
+    initial_image = None
+    if continue_from:
+        parent = state.clips.get(continue_from)
+        if parent and parent.filename:
+            parent_path = state.output_dir / parent.filename
+            if parent_path.exists():
+                initial_image = extract_last_frame(parent_path)
+
+    for i, prompt in enumerate(prompts):
+        clip_id = run.clip_ids[i]
+        clip = state.clips[clip_id]
+        clip.status = RunStatus.RUNNING.value
+        await state.emit(run_id, {"type": "clip_started", "clip_id": clip_id, "index": i})
+
+        body = dict(gen_body)
+        body["prompt"] = prompt
+        params = _build_params_from_request(body)
+        if i == 0 and initial_image:
+            params.initial_image = initial_image
+            params.seed = int(time.time_ns() % (2**31 - 1)) or 1
+        elif i > 0 and autocontinue:
+            prev_clip = state.clips[run.clip_ids[i - 1]]
+            prev_path = state.output_dir / prev_clip.filename
+            if prev_path.exists():
+                frame = extract_last_frame(prev_path)
+                if frame:
+                    params.initial_image = frame
+                    params.seed = int(time.time_ns() % (2**31 - 1)) or 1
+
+        out_name = clip.filename
+        job = Job(
+            id=i + 1,
+            params=params,
+            output_path=state.output_dir / out_name,
+            max_attempts=1,
+        )
+        jobs.append(job)
+
+        async def on_event(event: dict[str, Any], _clip_id: str = clip_id) -> None:
+            event["clip_id"] = _clip_id
+            await state.emit(run_id, event)
+
+        session = ProgressVideoSession(
+            job, "ltx", False, on_event, VideoSession
+        )
+        ok = await session.run(idle_timeout=None)
+
+        if ok:
+            clip.status = RunStatus.DONE.value
+            clip.elapsed_s = round(job.elapsed, 2)
+            clip.bytes = job.file_bytes
+            clip.video_url = state.clip_url(out_name)
+            for c in state.clips.values():
+                if c.chain_id == run.chain_id and c.label == "CURRENT":
+                    c.label = "EDIT"
+            clip.label = "CURRENT"
+            await state.emit(
+                run_id,
+                {
+                    "type": "clip_done",
+                    "clip_id": clip_id,
+                    "video_url": clip.video_url,
+                    "bytes": clip.bytes,
+                },
+            )
+        else:
+            clip.status = RunStatus.FAILED.value
+            clip.error = job.error or "Generation failed"
+            run.status = RunStatus.FAILED.value
+            run.error = clip.error
+            state.save_index()
+            await state.emit(
+                run_id,
+                {"type": "clip_failed", "clip_id": clip_id, "error": clip.error},
+            )
+            return
+
+    if run.autoconcat and len(jobs) >= 2:
+        try_autoconcat_clips(jobs, prefix, "mp4", verbose=False)
+        merged = sorted(state.output_dir.glob(f"{prefix}_merged_*.mp4"))
+        if merged:
+            run.merged_url = state.clip_url(merged[-1].name)
+            await state.emit(run_id, {"type": "merged", "video_url": run.merged_url})
+
+    run.status = RunStatus.DONE.value
+    state.save_index()
+    await state.emit(run_id, {"type": "run_done", "run_id": run_id})
+
+
+async def _worker_loop(state: AppState) -> None:
+    while True:
+        run_id = await state._pending.get()
+        try:
+            await _execute_run(state, run_id)
+        except Exception as exc:
+            run = state.runs.get(run_id)
+            if run:
+                run.status = RunStatus.FAILED.value
+                run.error = str(exc)
+                state.save_index()
+                await state.emit(run_id, {"type": "error", "message": str(exc)})
+        finally:
+            await state.emit(run_id, {"type": "run_complete", "run_id": run_id})
+
+
+def create_app(state: AppState, mount_static: bool = True) -> Any:
+    _ensure_web_deps()
+    from fastapi import FastAPI, File, HTTPException, UploadFile
+    from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.responses import FileResponse, StreamingResponse
+    from fastapi.staticfiles import StaticFiles
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        state.output_dir.mkdir(parents=True, exist_ok=True)
+        state.upload_dir.mkdir(parents=True, exist_ok=True)
+        state.load_index()
+        asyncio.create_task(_worker_loop(state))
+        yield
+        if state.server_process:
+            state.server_process.terminate()
+
+    app = FastAPI(title="ltx-ws WebUI", lifespan=lifespan)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    def _defaults() -> dict[str, Any]:
+        if state.runtime_defaults:
+            return dict(state.runtime_defaults)
+        return {
+            "num_frames": duration_to_frames(5.0),
+            "width": 704,
+            "height": 480,
+            "num_steps": 8,
+            "fps": FPS,
+        }
+
+    async def _is_connected() -> bool:
+        if state.embedded:
+            return True
+        return await healthcheck_ws(state.server_url)
+
+    @app.get("/api/health")
+    async def api_health():
+        ok = await _is_connected()
+        return {"ok": ok, "server_url": state.server_url, "web_url": state.http_url}
+
+    @app.get("/api/config")
+    async def api_config():
+        local = scan_local_models()
+        models = KNOWN_MODELS + local
+        ok = await _is_connected()
+        model_note = (
+            "MLX weights only (dgrauet/ltx-2.3-mlx*). "
+            "Restart server.py with --model when changing model."
+        )
+        if state.embedded:
+            model_note = (
+                f"Active model: {state.active_model}. "
+                "Restart server.py with --model <repo> to change weights."
+            )
+        return {
+            "server_connected": ok,
+            "embedded": state.embedded,
+            "server_url": state.server_url,
+            "web_url": state.http_url,
+            "active_model": state.active_model,
+            "preferred_model": state.preferred_model,
+            "models": models,
+            "resolution_presets": RESOLUTION_PRESETS,
+            "duration_presets": DURATION_PRESETS,
+            "generation_modes": GENERATION_MODES,
+            "clip_multiplier_max": CLIP_MULTIPLIER_MAX,
+            "defaults": _defaults(),
+            "model_note": model_note,
+        }
+
+    @app.post("/api/config/model")
+    async def set_model(body: dict[str, Any]):
+        model = str(body.get("model") or "auto").strip()
+        state.preferred_model = model
+        if state.embedded:
+            return {
+                "preferred_model": state.preferred_model,
+                "active_model": state.active_model,
+                "server_restarted": False,
+                "server_connected": True,
+                "note": "Restart server.py with --model to load different weights.",
+            }
+        spawned = False
+        if state.server_process:
+            state.server_process.terminate()
+            state.server_process = None
+        if body.get("restart_server"):
+            cmd = [
+                sys.executable,
+                str(REPO_ROOT / "server.py"),
+                "--model",
+                model,
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "8765",
+            ]
+            state.server_process = subprocess.Popen(
+                cmd,
+                cwd=str(REPO_ROOT),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            spawned = True
+            for _ in range(60):
+                await asyncio.sleep(2)
+                if await healthcheck_ws(state.server_url):
+                    break
+        return {
+            "preferred_model": state.preferred_model,
+            "server_restarted": spawned,
+            "server_connected": await _is_connected(),
+        }
+
+    @app.get("/api/clips")
+    async def list_clips(chain_id: Optional[str] = None):
+        clips = list(state.clips.values())
+        if chain_id:
+            clips = [c for c in clips if c.chain_id == chain_id]
+        clips.sort(key=lambda c: c.created_at)
+        return {"clips": [asdict(c) for c in clips]}
+
+    @app.get("/api/runs/{run_id}")
+    async def get_run(run_id: str):
+        run = state.runs.get(run_id)
+        if not run:
+            raise HTTPException(404, "Run not found")
+        return asdict(run)
+
+    @app.post("/api/generate")
+    async def generate(body: dict[str, Any]):
+        prompt = str(body.get("prompt") or "").strip()
+        prompts = body.get("prompts") or []
+        if prompt:
+            prompts = [prompt] + [p for p in prompts if p.strip()]
+        prompts = [p.strip() for p in prompts if p and str(p).strip()]
+        if not prompts:
+            raise HTTPException(400, "prompt is required")
+
+        ui_mode = (body.get("mode") or "generate").strip().lower()
+        continue_from = body.get("continue_from")
+        clip_count = int(body.get("clip_count") or 1)
+        clip_count = max(1, min(CLIP_MULTIPLIER_MAX, clip_count))
+
+        if ui_mode == "i2v" and not body.get("image_path") and not continue_from:
+            raise HTTPException(400, "i2v mode requires an image upload")
+        if ui_mode == "a2v" and not body.get("audio_path"):
+            raise HTTPException(400, "a2v mode requires an audio upload")
+        api_mode = _api_mode(ui_mode)
+        if api_mode in ("retake", "extend") and not body.get("video_path"):
+            raise HTTPException(400, f"{ui_mode} mode requires video")
+        if ui_mode == "ic_lora":
+            if not body.get("lora_specs"):
+                raise HTTPException(400, "ic_lora requires lora_specs")
+            if not body.get("video_conditioning"):
+                raise HTTPException(400, "ic_lora requires video_conditioning")
+
+        if clip_count > 1 and len(prompts) == 1:
+            prompts = [prompts[0]] * clip_count
+
+        mode = ui_mode
+        run_id = str(uuid.uuid4())
+        chain_id = body.get("chain_id") or str(uuid.uuid4())
+        autocontinue = bool(body.get("autocontinue", False)) or clip_count > 1
+        autoconcat = bool(body.get("autoconcat", False))
+
+        existing = [c for c in state.clips.values() if c.chain_id == chain_id]
+        base_index = len(existing)
+
+        clip_ids: list[str] = []
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        from videofentanyl import sanitize_filename as _sanitize
+
+        for i, p in enumerate(prompts):
+            clip_id = str(uuid.uuid4())
+            slug = _sanitize(p) or "clip"
+            filename = f"web_{slug}_{ts}_{i}.mp4"
+            label = (
+                "ORIGINAL"
+                if base_index == 0 and i == 0 and not continue_from
+                else "CURRENT"
+            )
+            clip = ClipRecord(
+                id=clip_id,
+                prompt=p,
+                label=label,
+                video_url="",
+                filename=filename,
+                chain_id=chain_id,
+                clip_index=base_index + i,
+                mode=mode,
+                status=RunStatus.QUEUED.value,
+                created_at=datetime.now().isoformat(),
+                num_frames=body.get("num_frames") or duration_to_frames(
+                    float(body.get("duration_seconds") or 5.0)
+                ),
+                width=body.get("width"),
+                height=body.get("height"),
+                seed=body.get("seed"),
+            )
+            state.clips[clip_id] = clip
+            clip_ids.append(clip_id)
+
+        run = RunRecord(
+            id=run_id,
+            status=RunStatus.QUEUED.value,
+            prompts=prompts,
+            chain_id=chain_id,
+            clip_ids=clip_ids,
+            created_at=datetime.now().isoformat(),
+            autocontinue=autocontinue or (continue_from is not None),
+            autoconcat=autoconcat,
+        )
+        state.runs[run_id] = run
+        _RUN_BODIES[run_id] = body
+        state.save_index()
+
+        state.event_queues[run_id] = asyncio.Queue()
+        await state._pending.put(run_id)
+
+        return {"run_id": run_id, "chain_id": chain_id, "clip_ids": clip_ids}
+
+    @app.get("/api/runs/{run_id}/events")
+    async def run_events(run_id: str):
+        if run_id not in state.runs:
+            raise HTTPException(404, "Run not found")
+        if run_id not in state.event_queues:
+            state.event_queues[run_id] = asyncio.Queue()
+
+        async def stream() -> AsyncIterator[str]:
+            q = state.event_queues[run_id]
+            run = state.runs[run_id]
+            if run.status in (RunStatus.DONE.value, RunStatus.FAILED.value):
+                yield f"data: {json.dumps({'type': 'run_complete', 'run_id': run_id})}\n\n"
+                return
+            while True:
+                try:
+                    event = await asyncio.wait_for(q.get(), timeout=120.0)
+                    yield f"data: {json.dumps(event)}\n\n"
+                    if event.get("type") in ("run_complete", "run_done", "error"):
+                        if event.get("type") == "run_complete":
+                            break
+                except asyncio.TimeoutError:
+                    yield f"data: {json.dumps({'type': 'ping'})}\n\n"
+
+        return StreamingResponse(stream(), media_type="text/event-stream")
+
+    @app.post("/api/upload")
+    async def upload(file: UploadFile = File(...), kind: str = "image"):
+        ext = Path(file.filename or "upload.bin").suffix or ".bin"
+        uid = str(uuid.uuid4())
+        dest = state.upload_dir / f"{uid}{ext}"
+        content = await file.read()
+        dest.write_bytes(content)
+        return {"path": str(dest), "filename": file.filename, "kind": kind}
+
+    @app.get("/api/videos/{filename}")
+    async def serve_video(filename: str):
+        path = state.output_dir / filename
+        if not path.is_file():
+            raise HTTPException(404, "Video not found")
+        return FileResponse(path, media_type="video/mp4", filename=filename)
+
+    if mount_static and resolve_web_dist().is_dir():
+        app.mount("/", StaticFiles(directory=str(resolve_web_dist()), html=True), name="static")
+
+    return app
+
+
+def build_combined_application(
+    ws_handler: Callable[..., Any],
+    state: AppState,
+) -> Any:
+    """Starlette app: WebSocket /ws + FastAPI HTTP (API + static UI)."""
+    _ensure_web_deps()
+    from starlette.applications import Starlette
+    from starlette.routing import Mount, WebSocketRoute
+
+    fastapi_app = create_app(state, mount_static=True)
+
+    async def ws_endpoint(websocket):
+        await ws_handler(websocket)
+
+    return Starlette(
+        routes=[
+            WebSocketRoute("/ws", ws_endpoint),
+            Mount("/", app=fastapi_app),
+        ]
+    )
+
+
+async def run_uvicorn(app: Any, host: str, port: int) -> None:
+    _ensure_web_deps()
+    import uvicorn
+
+    config = uvicorn.Config(app, host=host, port=port, log_level="info")
+    server = uvicorn.Server(config)
+    await server.serve()
+
+
+def run_standalone() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="ltx-ws WebUI (standalone)")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=5299)
+    parser.add_argument(
+        "--server-url",
+        default=os.environ.get(
+            "LTX_WS_URL", build_server_urls("127.0.0.1", 8765)[0]
+        ),
+    )
+    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--upload-dir", type=Path, default=DEFAULT_UPLOAD_DIR)
+    parser.add_argument(
+        "--model",
+        default=os.environ.get("LTX_WS_MODEL", "auto"),
+    )
+    parser.add_argument("--spawn-server", action="store_true")
+    args = parser.parse_args()
+
+    server_proc = None
+    if args.spawn_server:
+        server_proc = subprocess.Popen(
+            [
+                sys.executable,
+                str(REPO_ROOT / "server.py"),
+                "--model",
+                args.model,
+                "--web-ui",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "8765",
+            ],
+            cwd=str(REPO_ROOT),
+        )
+
+    ws_url = args.server_url
+    http_url = f"http://{public_host(args.host)}:{args.port}/"
+    state = AppState(
+        server_url=ws_url,
+        output_dir=args.output_dir.resolve(),
+        upload_dir=args.upload_dir.resolve(),
+        preferred_model=args.model,
+        http_url=http_url,
+        server_process=server_proc,
+    )
+    app = create_app(state)
+    import uvicorn
+
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")

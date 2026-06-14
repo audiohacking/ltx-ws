@@ -7,6 +7,9 @@
 | [`server.py`](server.py) | WebSocket server: loads [ltx-2-mlx](https://github.com/dgrauet/ltx-2-mlx), runs **T2V/I2V/A2V/retake/extend**, streams **MP4** to clients. |
 | [`videofentanyl.py`](videofentanyl.py) | CLI client: queues jobs, speaks the same JSON + binary protocol (`--mode ltx` + `--server`). |
 | [`mcp_server.py`](mcp_server.py) | MCP server exposing standardized tools for LTX generation (`ltx_generate_video`, `ltx_server_healthcheck`). |
+| [`web_ui.py`](web_ui.py) | Web UI API + static assets; embedded in `server.py` by default (`--web-ui`). |
+| [`web/`](web/) | Minimal React frontend (Dreamverse-inspired). |
+| [`web_server.py`](web_server.py) | Optional standalone UI when attaching to a remote WebSocket server. |
 | [`ltx_mlx_backend.py`](ltx_mlx_backend.py) | MLX pipeline adapter, Hugging Face weight resolution, frame/spatial alignment. |
 | [`scripts/benchmark_local_generation.py`](scripts/benchmark_local_generation.py) | Spawns (or attaches to) `server.py`, runs one client job, prints timings + `BENCHMARK_JSON:…`. |
 
@@ -172,7 +175,46 @@ This MCP server exposes:
 - `ltx_generate_video` — run one generation job (supports `generate`, `a2v`, `retake`, `extend`, `ic_lora`) and return output path + timing metadata.
 - `ltx_generate_sequence` — run a prompt list as chained clips with `autocontinue` support (last frame of clip N is fed as initial image to clip N+1), with optional `autoconcat`.
 
-By default, generated files are saved under `./mcp_outputs/` (override with `--output-dir`).
+## Web UI
+
+A minimal browser client inspired by [FastVideo Dreamverse](https://github.com/hao-ai-lab/FastVideo/tree/main/apps/dreamverse/web): centered video player, editable clip history, and a prompt bar with generation options below.
+
+The Web UI is **embedded in `server.py` by default** — same port for HTTP (UI + API) and WebSocket (`/ws`).
+
+**1. Build the frontend** (first time, or after UI changes):
+
+```bash
+cd web && npm install && npm run build && cd ..
+```
+
+**2. Start the server** (Web UI on by default):
+
+```bash
+python server.py --model dgrauet/ltx-2.3-mlx-q8
+```
+
+Open **http://127.0.0.1:8765/** (or the host/port you bind). Clips persist under `./web_outputs/`.
+
+Disable the browser UI (WebSocket only):
+
+```bash
+python server.py --no-web-ui
+```
+
+**Development** (hot-reload frontend against a running server):
+
+```bash
+python server.py --model dgrauet/ltx-2.3-mlx-q8
+cd web && npm run dev   # :5299, proxies /api and /ws → :8765
+```
+
+**Standalone UI** (attach to a WebSocket server elsewhere):
+
+```bash
+python web_server.py --server-url ws://127.0.0.1:8765/ws
+```
+
+**Options in the UI:** MLX model (active weights shown when embedded), modes (`generate`, `i2v`, `a2v`, `retake`, `extend`, `ic_lora`), resolution, duration × clip multiplier for autocontinue chains, steps/seed, media uploads, **autocontinue** / **autoconcat**.
 
 ### OmniNFT LoRA: how to get/download it
 

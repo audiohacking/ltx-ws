@@ -19,4 +19,8 @@ build/
 # Runtime / local outputs (do not commit)
 benchmark_runs/
 fvserver_completed/
+web_outputs/
+web_uploads/
 models/
+web/node_modules/
+web/dist/

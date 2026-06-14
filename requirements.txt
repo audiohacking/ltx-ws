@@ -3,6 +3,9 @@ av>=12.0
 Pillow>=10.0
 huggingface_hub>=0.20.0
 mcp>=1.0.0
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-multipart>=0.0.12
 
 # MLX LTX-2.3 (Apple Silicon) — ltx-2-mlx v0.14.9 (PyPI TBD):
 #   uv pip install \
