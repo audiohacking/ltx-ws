@@ -775,20 +775,8 @@ async def _finish_autoconcat(
 
 
 async def _execute_run(state: AppState, run_id: str) -> None:
-    run = state.runs.get(run_id)
-    # Multi-clip autocontinue must match CLI: one VideoSession/WS job per clip
-    # (videofentanyl --count N --autocontinue --autoconcat).
-    multi_autocontinue = bool(run and run.autocontinue and len(run.prompts) > 1)
     if state.embedded and state.video_server is not None:
-        if multi_autocontinue:
-            log.info(
-                "Web UI: run %s — %d-clip autocontinue via WS (videofentanyl-equivalent)",
-                run_id,
-                len(run.prompts),
-            )
-            await _execute_run_via_ws(state, run_id)
-        else:
-            await _execute_run_embedded(state, run_id)
+        await _execute_run_embedded(state, run_id)
         return
     await _execute_run_via_ws(state, run_id)
 

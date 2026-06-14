@@ -7,9 +7,9 @@ fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
 python-multipart>=0.0.12
 
-# MLX LTX-2.3 (Apple Silicon) — ltx-2-mlx v0.14.9 (PyPI TBD):
+# MLX LTX-2.3 (Apple Silicon) — ltx-2-mlx v0.8.3 (PyPI TBD):
 #   uv pip install \
-#     "ltx-core-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@v0.14.9#subdirectory=packages/ltx-core-mlx" \
-#     "ltx-pipelines-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@v0.14.9#subdirectory=packages/ltx-pipelines-mlx"
+#     "ltx-core-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@v0.8.3#subdirectory=packages/ltx-core-mlx" \
+#     "ltx-pipelines-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@v0.8.3#subdirectory=packages/ltx-pipelines-mlx"
 #
 # Upstream: https://github.com/dgrauet/ltx-2-mlx
