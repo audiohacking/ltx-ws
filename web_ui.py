@@ -193,6 +193,7 @@ class RunRecord:
     autocontinue: bool = False
     autoconcat: bool = False
     merged_url: Optional[str] = None
+    merged_clip_id: Optional[str] = None
 
 
 class AppState:
@@ -247,7 +248,9 @@ class AppState:
                     **{k: v for k, v in c.items() if k in ClipRecord.__dataclass_fields__}
                 )
             for r in data.get("runs", []):
-                self.runs[r["id"]] = RunRecord(**r)
+                self.runs[r["id"]] = RunRecord(
+                    **{k: v for k, v in r.items() if k in RunRecord.__dataclass_fields__}
+                )
         except (json.JSONDecodeError, TypeError, KeyError):
             pass
 
@@ -733,12 +736,12 @@ async def _finish_autoconcat(
         default=-1,
     )
     for c in state.clips.values():
-        if c.chain_id == run.chain_id and c.label == "CURRENT":
+        if c.chain_id == run.chain_id and c.label in ("CURRENT", "MERGED"):
             c.label = "EDIT"
     state.clips[merged_id] = ClipRecord(
         id=merged_id,
         prompt=f"{prompts[0]} (×{len(jobs)} merged)",
-        label="CURRENT",
+        label="MERGED",
         video_url=run.merged_url,
         filename=merged_name,
         chain_id=run.chain_id,
@@ -749,6 +752,9 @@ async def _finish_autoconcat(
         bytes=merged_path.stat().st_size,
         **_clip_settings_from_body(gen_body),
     )
+    run.merged_clip_id = merged_id
+    run.clip_ids = [merged_id]
+    state.save_index()
     await state.emit(
         run_id,
         {
@@ -756,6 +762,7 @@ async def _finish_autoconcat(
             "video_url": run.merged_url,
             "clip_id": merged_id,
             "filename": merged_name,
+            "chain_id": run.chain_id,
         },
     )
 
@@ -877,7 +884,10 @@ async def _execute_run_embedded(state: AppState, run_id: str) -> None:
 
     run.status = RunStatus.DONE.value
     state.save_index()
-    await state.emit(run_id, {"type": "run_done", "run_id": run_id})
+    await state.emit(
+        run_id,
+        {"type": "run_done", "run_id": run_id, "chain_id": run.chain_id},
+    )
 
 
 async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
@@ -994,7 +1004,10 @@ async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
 
     run.status = RunStatus.DONE.value
     state.save_index()
-    await state.emit(run_id, {"type": "run_done", "run_id": run_id})
+    await state.emit(
+        run_id,
+        {"type": "run_done", "run_id": run_id, "chain_id": run.chain_id},
+    )
 
 
 async def _worker_loop(state: AppState) -> None:
@@ -1010,7 +1023,14 @@ async def _worker_loop(state: AppState) -> None:
                 state.save_index()
                 await state.emit(run_id, {"type": "error", "message": str(exc)})
         finally:
-            await state.emit(run_id, {"type": "run_complete", "run_id": run_id})
+            await state.emit(
+                run_id,
+                {
+                    "type": "run_complete",
+                    "run_id": run_id,
+                    "chain_id": state.runs.get(run_id).chain_id if state.runs.get(run_id) else None,
+                },
+            )
 
 
 def create_app(
@@ -1296,14 +1316,34 @@ def create_app(
             q = state.event_queues[run_id]
             run = state.runs[run_id]
             if run.status in (RunStatus.DONE.value, RunStatus.FAILED.value):
-                yield f"data: {json.dumps({'type': 'run_complete', 'run_id': run_id})}\n\n"
+                if run.status == RunStatus.DONE.value and run.merged_clip_id:
+                    merged = state.clips.get(run.merged_clip_id)
+                    if merged and merged.video_url:
+                        yield f"data: {json.dumps({
+                            'type': 'merged',
+                            'video_url': merged.video_url,
+                            'clip_id': merged.id,
+                            'filename': merged.filename,
+                            'chain_id': merged.chain_id,
+                        })}\n\n"
+                elif run.status == RunStatus.DONE.value:
+                    for clip_id in run.clip_ids:
+                        clip = state.clips.get(clip_id)
+                        if clip and clip.status == RunStatus.DONE.value and clip.video_url:
+                            yield f"data: {json.dumps({
+                                'type': 'clip_done',
+                                'clip_id': clip.id,
+                                'video_url': clip.video_url,
+                                'bytes': clip.bytes,
+                            })}\n\n"
+                yield f"data: {json.dumps({'type': 'run_complete', 'run_id': run_id, 'chain_id': run.chain_id})}\n\n"
                 return
             while True:
                 try:
                     event = await asyncio.wait_for(q.get(), timeout=120.0)
                     yield f"data: {json.dumps(event)}\n\n"
                     if event.get("type") in ("run_complete", "run_done", "error"):
-                        if event.get("type") == "run_complete":
+                        if event.get("type") in ("run_complete", "run_done"):
                             break
                 except asyncio.TimeoutError:
                     yield f"data: {json.dumps({'type': 'ping'})}\n\n"

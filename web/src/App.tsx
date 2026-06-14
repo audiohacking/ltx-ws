@@ -31,6 +31,16 @@ function formatDuration(frames?: number, fps = 24) {
   return `${s.toFixed(1)}s`;
 }
 
+function pickPlaybackClip(clips: Clip[], chainId: string): string | null {
+  const chain = clips.filter(
+    (c) => c.chain_id === chainId && c.status === "done" && c.video_url,
+  );
+  const merged = chain.find((c) => c.label === "MERGED");
+  const current = chain.find((c) => c.label === "CURRENT");
+  const latest = [...chain].sort((a, b) => b.clip_index - a.clip_index)[0];
+  return merged?.id ?? current?.id ?? latest?.id ?? null;
+}
+
 export default function App() {
   const [config, setConfig] = useState<Config | null>(null);
   const [clips, setClips] = useState<Clip[]>([]);
@@ -213,8 +223,22 @@ export default function App() {
     );
   }
 
-  async function subscribeRun(runId: string) {
+  async function subscribeRun(runId: string, runChainId: string) {
+    let closed = false;
     const es = new EventSource(`${API}/api/runs/${runId}/events`);
+
+    const finishRun = async () => {
+      if (closed) return;
+      closed = true;
+      es.close();
+      setBusy(false);
+      setProgress(null);
+      setChainId(runChainId);
+      const all = await fetchClips(runChainId);
+      setClips(all);
+      setSelectedClipId(pickPlaybackClip(all, runChainId));
+    };
+
     const setFromProtocol = (e: Record<string, unknown>) => {
       if (e.type === "queue_status") {
         setProgress({
@@ -256,27 +280,62 @@ export default function App() {
         });
       } else if (msg.type === "clip_done") {
         setProgress({ phase: "clip_done", message: "Clip saved" });
-        if (msg.clip_id) setSelectedClipId(msg.clip_id as string);
+        if (msg.clip_id && msg.video_url) {
+          setSelectedClipId(msg.clip_id as string);
+          setClips((prev) => {
+            const others = prev.filter((c) => c.id !== msg.clip_id);
+            const existing = prev.find((c) => c.id === msg.clip_id);
+            return [
+              ...others,
+              {
+                ...(existing ?? {}),
+                id: msg.clip_id as string,
+                video_url: msg.video_url as string,
+                chain_id: runChainId,
+                status: "done",
+                label: existing?.label ?? "CURRENT",
+                prompt: existing?.prompt ?? "",
+                filename: existing?.filename ?? "",
+                clip_index: existing?.clip_index ?? 0,
+                mode: existing?.mode ?? "generate",
+                created_at: existing?.created_at ?? new Date().toISOString(),
+              } as Clip,
+            ];
+          });
+        }
       } else if (msg.type === "merged") {
         setProgress({ phase: "merged", message: "Clips merged" });
-        if (msg.clip_id) setSelectedClipId(msg.clip_id as string);
-        fetchClips(chainId ?? undefined).then(setClips);
-      } else if (msg.type === "run_complete" || msg.type === "run_done") {
-        es.close();
-        setBusy(false);
-        setProgress(null);
-        fetchClips(chainId ?? undefined).then((all) => {
+        const clipId = msg.clip_id as string | undefined;
+        const videoUrl = msg.video_url as string | undefined;
+        if (clipId && videoUrl) {
+          setSelectedClipId(clipId);
+          setClips((prev) => {
+            const chainPrompt =
+              prev.find((c) => c.chain_id === runChainId)?.prompt ?? "Merged clip";
+            const others = prev.filter((c) => c.chain_id !== runChainId);
+            return [
+              ...others,
+              {
+                id: clipId,
+                video_url: videoUrl,
+                filename: (msg.filename as string) ?? "",
+                chain_id: runChainId,
+                label: "MERGED",
+                status: "done",
+                prompt: chainPrompt,
+                clip_index: 0,
+                mode: mode,
+                created_at: new Date().toISOString(),
+              } as Clip,
+            ];
+          });
+        }
+        fetchClips(runChainId).then((all) => {
           setClips(all);
-          if (chainId) {
-            const merged = all.find(
-              (c) => c.chain_id === chainId && c.label === "MERGED",
-            );
-            const current = all.find(
-              (c) => c.chain_id === chainId && c.label === "CURRENT",
-            );
-            setSelectedClipId(merged?.id ?? current?.id ?? null);
-          }
+          setSelectedClipId(pickPlaybackClip(all, runChainId) ?? clipId ?? null);
         });
+      } else if (msg.type === "run_complete" || msg.type === "run_done") {
+        finishRun();
       } else if (msg.type === "error" || msg.type === "clip_failed") {
         setError(msg.error || msg.message || "Failed");
         es.close();
@@ -284,6 +343,8 @@ export default function App() {
       }
     };
     es.onerror = () => {
+      if (closed) return;
+      closed = true;
       es.close();
       setBusy(false);
       setProgress(null);
@@ -343,7 +404,7 @@ export default function App() {
       setSelectedClipId(null);
       setPrompt("");
       setProgress({ phase: "queued", message: "Queued — starting…" });
-      subscribeRun(data.run_id);
+      subscribeRun(data.run_id, data.chain_id);
       const all = await fetchClips(data.chain_id);
       setClips(all);
     } catch (e) {
