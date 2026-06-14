@@ -142,6 +142,10 @@ def _ensure_lora_downloaded(spec: str) -> dict[str, Any]:
 _RUN_BODIES: dict[str, dict[str, Any]] = {}
 
 
+def resolve_web_dist() -> Path:
+    return REPO_ROOT / "web" / "dist"
+
+
 def _upload_extension(kind: str, filename: str | None) -> str:
     """Pick a safe suffix for an uploaded file."""
     ext = Path(filename or "").suffix.lower()
