@@ -114,7 +114,7 @@ DEFAULT_WIDTH          = 704   # MLX LTX default width; must be multiple of 32
 DEFAULT_FPS            = 24
 DEFAULT_INFER_STEPS    = 8     # distilled one-stage default in ltx-2-mlx
 DEFAULT_CHUNK_SIZE     = 64 * 1024  # 64 KB per WebSocket binary message
-GENERATION_KEEPALIVE_INTERVAL_S = 15.0
+GENERATION_KEEPALIVE_INTERVAL_S = 1.0
 
 # LTX2 frame requirement: num_frames must satisfy (frames - 1) % 8 == 0
 # e.g. 25, 33, 41, 49, 57, 65, 73, 81, 89, 97, 105, 113, 121, 129

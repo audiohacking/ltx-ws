@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { applyProgressEvent } from "./progress";
 import type { Clip, Config, ProgressState } from "./types";
 
 const API = "";
@@ -153,30 +154,39 @@ export default function App() {
 
   async function subscribeRun(runId: string) {
     const es = new EventSource(`${API}/api/runs/${runId}/events`);
+    const setFromProtocol = (e: Record<string, unknown>) => {
+      if (e.type === "queue_status") {
+        setProgress({
+          phase: "queued",
+          message: `Queue position ${e.position ?? "?"}`,
+        });
+      } else if (
+        e.type === "generation_keepalive" ||
+        e.type === "generation_status_ack"
+      ) {
+        setProgress((prev) => applyProgressEvent(prev, e));
+      } else if (e.type === "gpu_assigned") {
+        setProgress({ phase: "generating", message: "GPU assigned — starting…" });
+      } else if (e.type === "ltx2_segment_start") {
+        setProgress((prev) => ({
+          phase: "generating",
+          message: "Denoising…",
+          ...prev,
+        }));
+      } else if (e.type === "error") {
+        setError(String(e.message || "Generation error"));
+      }
+    };
     es.onmessage = (ev) => {
       const msg = JSON.parse(ev.data);
       if (msg.type === "run_started") {
         setProgress({ phase: "queued", message: "Generation queued…" });
       } else if (msg.type === "clip_started") {
-        setProgress({ phase: "running", message: "Generating clip…" });
+        setProgress({ phase: "running", message: "Starting clip…" });
+      } else if (msg.type === "generation_progress") {
+        setProgress((prev) => applyProgressEvent(prev, msg));
       } else if (msg.type === "protocol") {
-        const e = msg.event;
-        if (e.type === "queue_status") {
-          setProgress({
-            phase: "queued",
-            message: `Queue position ${e.position ?? "?"}`,
-          });
-        } else if (e.type === "gpu_assigned") {
-          setProgress({ phase: "generating", message: "Generating…" });
-        } else if (e.type === "generation_keepalive") {
-          setProgress({
-            phase: "generating",
-            message: `Generating ${e.elapsed_s ?? "?"}s`,
-            elapsed_s: e.elapsed_s,
-          });
-        } else if (e.type === "error") {
-          setError(e.message || "Generation error");
-        }
+        setFromProtocol(msg.event as Record<string, unknown>);
       } else if (msg.type === "download_progress") {
         setProgress({
           phase: "downloading",
@@ -341,7 +351,14 @@ export default function App() {
             {busy && (
               <div className="progress-overlay">
                 <div className="progress-bar">
-                  <div className="progress-pulse" />
+                  {progress?.pct != null ? (
+                    <div
+                      className="progress-fill"
+                      style={{ width: `${Math.min(100, progress.pct)}%` }}
+                    />
+                  ) : (
+                    <div className="progress-pulse" />
+                  )}
                 </div>
                 <span>{progress?.message ?? "Working…"}</span>
               </div>

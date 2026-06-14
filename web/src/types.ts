@@ -54,9 +54,24 @@ export interface Clip {
   seed?: number;
 }
 
+export interface ModelProgress {
+  stage?: string;
+  step?: number;
+  total?: number;
+  pct?: number;
+  eta_s?: number;
+  avg_step_s?: number;
+  label?: string;
+}
+
 export interface ProgressState {
   phase: string;
   message: string;
   elapsed_s?: number;
   kb?: number;
+  stage?: string;
+  step?: number;
+  total?: number;
+  pct?: number;
+  eta_s?: number;
 }

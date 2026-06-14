@@ -61,6 +61,7 @@ DEFAULT_OUTPUT_DIR = REPO_ROOT / "web_outputs"
 DEFAULT_UPLOAD_DIR = REPO_ROOT / "web_uploads"
 INDEX_FILE = "index.json"
 FPS = 24
+PROGRESS_KEEPALIVE_INTERVAL_S = 1.0
 
 _RUN_BODIES: dict[str, dict[str, Any]] = {}
 
@@ -438,6 +439,55 @@ async def _emit_protocol(on_event: Any, payload: dict[str, Any]) -> None:
     await on_event({"type": "protocol", "event": payload})
 
 
+def _model_progress_payload(video_server: Any) -> dict[str, Any]:
+    mp = video_server.generator.model_progress_for_ws()
+    return {"model_progress": mp} if mp else {}
+
+
+async def _emit_generation_progress(
+    video_server: Any,
+    on_event: Any,
+    t_start: float,
+    generation_id: str,
+) -> None:
+    elapsed_s = round(time.time() - t_start, 1)
+    extra = _model_progress_payload(video_server)
+    mp = extra.get("model_progress")
+    payload: dict[str, Any] = {
+        "type": "generation_progress",
+        "elapsed_s": elapsed_s,
+        "phase": mp.get("stage", "generating") if mp else "generating",
+        "generation_id": generation_id,
+        **extra,
+    }
+    await on_event(payload)
+    await _emit_protocol(
+        on_event,
+        {
+            "type": "generation_keepalive",
+            "elapsed_s": elapsed_s,
+            "phase": payload["phase"],
+            "generation_id": generation_id,
+            **extra,
+        },
+    )
+
+
+async def _generation_progress_loop(
+    video_server: Any,
+    on_event: Any,
+    t_start: float,
+    generation_id: str,
+    stop: asyncio.Event,
+) -> None:
+    while not stop.is_set():
+        await _emit_generation_progress(video_server, on_event, t_start, generation_id)
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=PROGRESS_KEEPALIVE_INTERVAL_S)
+        except asyncio.TimeoutError:
+            continue
+
+
 async def _run_clip_inprocess(
     video_server: Any,
     job: Any,
@@ -482,29 +532,41 @@ async def _run_clip_inprocess(
                 },
             )
 
-            video_path = await vs.generator.generate(
-                prompt=params.prompt,
-                image_data=params.initial_image,
-                audio_data=params.audio_input,
-                source_video_data=params.source_video,
-                seed=int(params.seed or 1024),
-                num_frames=params.num_frames,
-                height=params.height,
-                width=params.width,
-                mode=params.generation_mode,
-                num_steps=params.num_steps,
-                retake_start=params.retake_start,
-                retake_end=params.retake_end,
-                extend_frames=params.extend_frames,
-                extend_direction=params.extend_direction or "after",
-                lora_specs=list(params.lora_specs) if params.lora_specs else None,
-                video_conditioning_specs=(
-                    list(params.video_conditioning_specs)
-                    if params.video_conditioning_specs
-                    else None
-                ),
-                job_id=generation_id,
+            progress_stop = asyncio.Event()
+            progress_task = asyncio.create_task(
+                _generation_progress_loop(vs, on_event, t0, generation_id, progress_stop)
             )
+            try:
+                video_path = await vs.generator.generate(
+                    prompt=params.prompt,
+                    image_data=params.initial_image,
+                    audio_data=params.audio_input,
+                    source_video_data=params.source_video,
+                    seed=int(params.seed or 1024),
+                    num_frames=params.num_frames,
+                    height=params.height,
+                    width=params.width,
+                    mode=params.generation_mode,
+                    num_steps=params.num_steps,
+                    retake_start=params.retake_start,
+                    retake_end=params.retake_end,
+                    extend_frames=params.extend_frames,
+                    extend_direction=params.extend_direction or "after",
+                    lora_specs=list(params.lora_specs) if params.lora_specs else None,
+                    video_conditioning_specs=(
+                        list(params.video_conditioning_specs)
+                        if params.video_conditioning_specs
+                        else None
+                    ),
+                    job_id=generation_id,
+                )
+            finally:
+                progress_stop.set()
+                progress_task.cancel()
+                try:
+                    await progress_task
+                except asyncio.CancelledError:
+                    pass
 
             job.output_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(video_path, job.output_path)

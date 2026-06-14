@@ -135,6 +135,13 @@ body {
   animation: pulse-slide 1.5s ease-in-out infinite;
 }
 
+.progress-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 2px;
+  transition: width 0.35s ease;
+}
+
 @keyframes pulse-slide {
   0% { transform: translateX(-100%); }
   100% { transform: translateX(350%); }
