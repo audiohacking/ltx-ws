@@ -86,7 +86,7 @@ export default function App() {
   const [extendFrames, setExtendFrames] = useState(2);
   const [extendDirection, setExtendDirection] = useState("after");
   const [showOptions, setShowOptions] = useState(true);
-  const [loraPresetId, setLoraPresetId] = useState("none");
+  const [loraPresetId, setLoraPresetId] = useState("default");
   const [loraStatus, setLoraStatus] = useState<string | null>(null);
 
   const imageRef = useRef<HTMLInputElement>(null);
@@ -241,6 +241,7 @@ export default function App() {
     setPrompt("");
     setClipMultiplier(1);
     setError(null);
+    setLoraPresetId(config?.default_lora_preset_id ?? "default");
   }
 
   const needsImageUpload = mode === "i2v";

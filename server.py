@@ -103,10 +103,11 @@ MODEL_MLX_Q4         = "dgrauet/ltx-2.3-mlx-q4"
 RAM_GB_BF16_MIN      = 64.0
 RAM_GB_Q8_MIN        = 32.0
 RAM_GB_Q4_MIN        = 16.0
-DEFAULT_GLOBAL_LORA_PATH = (
+DEFAULT_LORA_URL = (
     "https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/loras/"
     "LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors"
 )
+DEFAULT_GLOBAL_LORA_PATH = DEFAULT_LORA_URL
 DEFAULT_GLOBAL_LORA_SCALE = 1.0
 DEFAULT_NUM_FRAMES     = 97    # ~4 s @ 24 fps; LTX requires (8k+1) frames: 9, 17, 25, … 97, 105, …
 DEFAULT_HEIGHT         = 480

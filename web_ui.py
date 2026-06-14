@@ -73,6 +73,7 @@ def _lora_catalog() -> tuple[list[dict[str, Any]], str]:
     from server import (
         DEFAULT_GLOBAL_LORA_PATH,
         DEFAULT_GLOBAL_LORA_SCALE,
+        DEFAULT_LORA_URL,
         ENV_DEFAULT_LORA,
         ENV_DEFAULT_LORA_SCALE,
         _default_loras_from_env,
@@ -101,6 +102,8 @@ def _lora_catalog() -> tuple[list[dict[str, Any]], str]:
             default_id = id_
 
     default_path = os.environ.get(ENV_DEFAULT_LORA, DEFAULT_GLOBAL_LORA_PATH).strip()
+    if not default_path:
+        default_path = DEFAULT_LORA_URL
     scale_raw = os.environ.get(ENV_DEFAULT_LORA_SCALE, str(DEFAULT_GLOBAL_LORA_SCALE)).strip()
     try:
         default_scale = float(scale_raw)
@@ -108,9 +111,14 @@ def _lora_catalog() -> tuple[list[dict[str, Any]], str]:
         default_scale = DEFAULT_GLOBAL_LORA_SCALE
 
     if default_path:
+        label = (
+            "OmniNFT RL LoRA (default)"
+            if default_path == DEFAULT_LORA_URL
+            else f"Default — {_label_for_spec(default_path)}"
+        )
         _add(
             "default",
-            f"Default — {_label_for_spec(default_path)}",
+            label,
             default_path,
             default_scale,
             is_default=True,
