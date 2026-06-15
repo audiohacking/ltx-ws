@@ -93,23 +93,28 @@ def duration_to_frames(seconds: float) -> int:
     return snap_frames(int(seconds * FPS))
 
 
-def _duration_preset(preset_id: str, seconds: float, *, test: bool = False) -> dict[str, Any]:
-    nf = duration_to_frames(seconds)
-    suffix = " (test)" if test else ""
+def _duration_preset(preset_id: str, seconds: float, num_frames: int) -> dict[str, Any]:
+    """One UI duration option with explicit 8k+1 frame count (LTX VAE temporal compression)."""
+    nf = int(num_frames)
     return {
         "id": preset_id,
         "seconds": float(seconds),
         "num_frames": nf,
-        "label": f"~{seconds:g} seconds{suffix} ({nf} frames @ {FPS} fps)",
+        "label": f"~{seconds:g} s ({nf} frames @ {FPS} fps)",
     }
 
 
+# 8k+1 frame counts @ 24 fps (see ltx-2-mlx / AGENTS.md frame reference).
 DURATION_PRESETS = [
-    _duration_preset("2s", 2.0),
-    _duration_preset("4s", 4.0),
-    _duration_preset("5s", 5.0),
-    _duration_preset("8s", 8.0, test=True),
-    _duration_preset("10s", 10.0, test=True),
+    _duration_preset("2s", 2.0, 49),
+    _duration_preset("4s", 4.0, 97),
+    _duration_preset("5s", 5.0, 121),
+    _duration_preset("6s", 6.0, 145),
+    _duration_preset("8s", 8.0, 193),
+    _duration_preset("10s", 10.0, 241),
+    _duration_preset("15s", 15.0, 361),
+    _duration_preset("20s", 20.0, 481),
+    _duration_preset("24s", 24.0, 577),
 ]
 
 

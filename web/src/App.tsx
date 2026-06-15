@@ -1316,9 +1316,7 @@ export default function App() {
                   >
                     {config.duration_presets.map((d) => (
                       <option key={d.id} value={d.id} title={d.label}>
-                        {d.label.includes("(test)")
-                          ? `~${d.seconds}s*`
-                          : `~${d.seconds}s`}
+                        {`~${d.seconds}s`}
                       </option>
                     ))}
                   </select>
