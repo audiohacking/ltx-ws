@@ -6,7 +6,7 @@
 
 ## Features
 
-- **Agent-ready docs** — [`AGENTS.md`](AGENTS.md) and [`CLAUDE.md`](CLAUDE.md) document MCP purpose, tools, and continuity (`autocontinue`) usage for AI coding agents.
+- **Agent-ready docs** — [`DIRECTOR.md`](DIRECTOR.md) (Assistant Director: prompt gold + pipeline), [`AGENTS.md`](AGENTS.md) (MCP/tools), [`CLAUDE.md`](CLAUDE.md)
 - **MLX on Metal** — Inference via [`ltx_pipelines_mlx`](https://github.com/dgrauet/ltx-2-mlx) **v0.14.9** (`DistilledPipeline`, `TI2VidOneStagePipeline` for i2v/autocontinue, `A2VidPipelineTwoStage`, `RetakePipeline`, etc.). Legacy separate `ImageToVideoPipeline` exists only on older ltx-2-mlx installs.
 - **Automatic weight download** — For a Hugging Face repo id (`org/model`), the server calls [`huggingface_hub.snapshot_download`](https://huggingface.co/docs/huggingface_hub/guides/download) on load (equivalent to `huggingface-cli download`). Resumes partial downloads.
 - **Default weights** — [`dgrauet/ltx-2.3-mlx`](https://huggingface.co/dgrauet/ltx-2.3-mlx) (full MLX bf16; very large). Use [`ltx-2.3-mlx-q8`](https://huggingface.co/dgrauet/ltx-2.3-mlx-q8) or [`-q4`](https://huggingface.co/dgrauet/ltx-2.3-mlx-q4) for less RAM/disk.

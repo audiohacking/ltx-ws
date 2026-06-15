@@ -2,7 +2,9 @@
 
 Canonical guide for AI agents using **ltx-ws** to generate video for directors, editors, and creative workflows.
 
-Read this file before calling MCP tools or advising users on generation strategy.
+**Read [`DIRECTOR.md`](DIRECTOR.md) first** when the user provides a prompt or asks for video—you act as **Assistant Director** (interview, gold prompts, shot plan, then generate).
+
+Read **this file** for MCP tools, MLX weights, and pipeline mechanics before calling generation APIs.
 
 ## What this stack does
 
@@ -18,7 +20,7 @@ Read this file before calling MCP tools or advising users on generation strategy
 **Default MCP outputs:** `./mcp_outputs/` (override with `mcp_server.py --output-dir`)  
 **Web UI outputs:** `./web_outputs/` (override with `server.py --web-output-dir`)
 
-This stack does **not** run cloud GPT prompt expansion. Prompts you send are what the model sees (`enhancement_enabled=false` in MCP). Your job is to write strong, model-ready prompts—especially for chained sequences.
+This stack does **not** run cloud GPT prompt expansion. Prompts you send are what the model sees (`enhancement_enabled=false` in MCP). **Transform user ideas via [`DIRECTOR.md`](DIRECTOR.md)** before submission—especially for chained sequences.
 
 ---
 
@@ -230,16 +232,17 @@ Deliver **`merged_output_path`** to the director when `autoconcat=true`.
 
 ## Prompt engineering for LTX-2.3
 
+**Canonical prompt guide:** [`DIRECTOR.md`](DIRECTOR.md) — LTX-2.3 principles, rewrite workflow, autocontinue segment prompts, i2v/a2v, portrait, and anti-patterns.
+
 The local server uses **LTX-2.3** via **ltx-2-mlx**. There is no automatic GPT rewrite in MCP—prompt quality directly affects output.
 
-### General principles
+### Quick reference (see DIRECTOR.md for full detail)
 
-- **Be visually specific:** subject, environment, lighting, time of day, lens feel (wide / close / low angle).
-- **Describe motion:** “slow push in”, “tracking left”, “drone descends”, “subject walks toward camera”.
-- **One dominant action per ~5s segment**—avoid cramming multiple scene changes into one clip.
-- **Name materials and light:** “wet asphalt reflections”, “golden hour backlight”, “neon signage”, “soft overcast diffusion”.
-- **Avoid negation-heavy prompts** unless you have a clear creative reason; prefer what *should* appear.
-- **Match aspect ratio to delivery** (vertical social vs landscape cinematic) via `height` / `width`.
+- **Be visually specific** and **direct the scene** (blocking, left/right, foreground/background).
+- **Describe motion with verbs**; avoid static photo captions—especially for i2v.
+- **One dominant action per ~5s segment**; chain with establish + continue prompts (`autocontinue: true`).
+- **Match aspect ratio** to delivery (native portrait: `height: 1024`, `width: 576`).
+- **Describe audio** explicitly in a2v mode.
 
 ### Aspect ratio presets (height × width, snapped to 32px)
 
@@ -253,6 +256,8 @@ The local server uses **LTX-2.3** via **ltx-2-mlx**. There is no automatic GPT r
 When using a **start image**, match output orientation to the image.
 
 ### Chained sequences (`autocontinue: true`)
+
+Full establish/continue rules, examples, and mistakes: **`DIRECTOR.md` § Extending prompts for longer videos**.
 
 Structure prompts as a **timeline**, not duplicate full scene descriptions.
 
