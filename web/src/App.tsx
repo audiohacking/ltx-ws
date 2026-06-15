@@ -381,6 +381,7 @@ export default function App() {
     let closed = false;
     let autoconcatRun = false;
     let audiocontinueRun = false;
+    let streamFinalOnly = false;
     const es = new EventSource(`${API}/api/runs/${runId}/events`);
 
     const finishRun = async () => {
@@ -423,13 +424,18 @@ export default function App() {
       if (msg.type === "run_started") {
         autoconcatRun = Boolean(msg.autoconcat);
         audiocontinueRun = Boolean(msg.audiocontinue);
+        const clipCount = Number(msg.clip_count ?? 0);
+        streamFinalOnly =
+          autoconcatRun || (Boolean(msg.autocontinue) && clipCount > 1);
         setProgress({
           phase: "queued",
           message: audiocontinueRun
             ? `Music video: ${msg.clip_count ?? "?"} clips (audiocontinue)…`
             : autoconcatRun
               ? `Generating ${msg.clip_count ?? "?"} clips (autoconcat)…`
-              : "Generation queued…",
+              : streamFinalOnly
+                ? `Generating ${msg.clip_count ?? "?"} clips (autocontinue)…`
+                : "Generation queued…",
         });
       } else if (msg.type === "clip_started") {
         const idx = typeof msg.index === "number" ? msg.index + 1 : "?";
@@ -456,18 +462,17 @@ export default function App() {
       } else if (msg.type === "clip_done") {
         const idx = typeof msg.index === "number" ? msg.index + 1 : "?";
         const total = msg.total_clips ?? "?";
-        if (autoconcatRun) {
+        if (streamFinalOnly) {
           setProgress({
             phase: "clip_done",
             message:
               total !== "?"
-                ? `Clip ${idx}/${total} done — ${idx === total ? "merging…" : "continuing…"}`
+                ? autoconcatRun
+                  ? `Clip ${idx}/${total} done — ${idx === total ? "merging…" : "continuing…"}`
+                  : `Clip ${idx}/${total} done — continuing…`
                 : "Clip saved — continuing…",
           });
-          // Do not fetch fragment MP4s during autoconcat — serve_video deletes after
-          // stream and ffmpeg needs every fragment on disk until merge completes.
-        } else {
-          setProgress({ phase: "clip_done", message: "Clip saved" });
+          // Autoconcat: video arrives on `merged`. Autocontinue: only the last clip has video_url.
           if (msg.clip_id && msg.video_url) {
             const clipId = msg.clip_id as string;
             const serverUrl = msg.video_url as string;
@@ -494,6 +499,34 @@ export default function App() {
             });
             cacheClipVideoLocally(clipId, serverUrl);
           }
+        } else if (msg.clip_id && msg.video_url) {
+          setProgress({ phase: "clip_done", message: "Clip saved" });
+          const clipId = msg.clip_id as string;
+          const serverUrl = msg.video_url as string;
+          setSelectedClipId(clipId);
+          setClips((prev) => {
+            const others = prev.filter((c) => c.id !== clipId);
+            const existing = prev.find((c) => c.id === clipId);
+            return [
+              ...others,
+              {
+                ...(existing ?? {}),
+                id: clipId,
+                video_url: serverUrl,
+                chain_id: runChainId,
+                status: "done",
+                label: existing?.label ?? "CURRENT",
+                prompt: existing?.prompt ?? "",
+                filename: existing?.filename ?? "",
+                clip_index: existing?.clip_index ?? 0,
+                mode: existing?.mode ?? "generate",
+                created_at: existing?.created_at ?? new Date().toISOString(),
+              } as Clip,
+            ];
+          });
+          cacheClipVideoLocally(clipId, serverUrl);
+        } else {
+          setProgress({ phase: "clip_done", message: "Clip saved" });
         }
       } else if (msg.type === "merged") {
         setProgress({ phase: "merged", message: "Clips merged" });

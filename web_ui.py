@@ -350,10 +350,51 @@ def _cleanup_run_uploads(state: AppState, gen_body: dict[str, Any]) -> None:
         _delete_upload_paths(paths)
 
 
-def _is_output_protected_for_autoconcat(state: AppState, filename: str) -> bool:
-    """Fragment MP4s must stay on disk until ffmpeg autoconcat finishes."""
+def _chain_clip_count(run: RunRecord) -> int:
+    return len(run.prompts) or len(run.clip_ids)
+
+
+def _should_stream_clip_video(run: RunRecord, clip_index: int, total_clips: int) -> bool:
+    """Whether the client should receive/stream this clip's MP4 during a chain run."""
+    if total_clips <= 1:
+        return True
+    if run.autoconcat:
+        return False
+    if run.autocontinue:
+        return clip_index == total_clips - 1
+    return True
+
+
+def _build_clip_done_event(
+    run: RunRecord,
+    clip_id: str,
+    clip: ClipRecord,
+    index: int,
+    total_clips: int,
+) -> dict[str, Any]:
+    event: dict[str, Any] = {
+        "type": "clip_done",
+        "clip_id": clip_id,
+        "index": index,
+        "total_clips": total_clips,
+        "autoconcat": run.autoconcat,
+        "autocontinue": run.autocontinue,
+    }
+    if _should_stream_clip_video(run, index, total_clips):
+        event["video_url"] = clip.video_url
+        event["bytes"] = clip.bytes
+    return event
+
+
+def _is_chain_fragment_protected(state: AppState, filename: str) -> bool:
+    """Keep fragment MP4s on disk while a multi-clip chain run is in progress."""
     for run in state.runs.values():
-        if run.status != RunStatus.RUNNING.value or not run.autoconcat:
+        if run.status != RunStatus.RUNNING.value:
+            continue
+        total = _chain_clip_count(run)
+        if total <= 1:
+            continue
+        if not (run.autoconcat or run.autocontinue):
             continue
         for clip_id in run.clip_ids:
             clip = state.clips.get(clip_id)
@@ -1126,6 +1167,7 @@ async def _execute_run_embedded(state: AppState, run_id: str) -> None:
             "run_id": run_id,
             "autoconcat": run.autoconcat,
             "audiocontinue": run.audiocontinue,
+            "autocontinue": run.autocontinue,
             "clip_count": len(run.prompts),
         },
     )
@@ -1133,6 +1175,7 @@ async def _execute_run_embedded(state: AppState, run_id: str) -> None:
     jobs: list[Job] = []
     gen_body = _RUN_BODIES.get(run_id, {})
     prompts = run.prompts
+    total_clips = len(prompts)
     autocontinue = run.autocontinue
     prefix = sanitize_filename(prompts[0]) or "clip"
 
@@ -1218,22 +1261,18 @@ async def _execute_run_embedded(state: AppState, run_id: str) -> None:
                 clip.status = RunStatus.DONE.value
                 clip.elapsed_s = round(job.elapsed, 2)
                 clip.bytes = job.file_bytes
-                clip.video_url = state.clip_url(out_name)
+                clip.video_url = (
+                    state.clip_url(out_name)
+                    if _should_stream_clip_video(run, i, total_clips)
+                    else ""
+                )
                 for c in state.clips.values():
                     if c.chain_id == run.chain_id and c.label == "CURRENT":
                         c.label = "EDIT"
                 clip.label = "CURRENT"
                 await state.emit(
                     run_id,
-                    {
-                        "type": "clip_done",
-                        "clip_id": clip_id,
-                        "video_url": clip.video_url,
-                        "bytes": clip.bytes,
-                        "index": i,
-                        "total_clips": len(prompts),
-                        "autoconcat": run.autoconcat,
-                    },
+                    _build_clip_done_event(run, clip_id, clip, i, total_clips),
                 )
             else:
                 clip.status = RunStatus.FAILED.value
@@ -1285,6 +1324,7 @@ async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
             "run_id": run_id,
             "autoconcat": run.autoconcat,
             "audiocontinue": run.audiocontinue,
+            "autocontinue": run.autocontinue,
             "clip_count": len(run.prompts),
         },
     )
@@ -1293,6 +1333,7 @@ async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
     jobs: list[Job] = []
     gen_body = _RUN_BODIES.get(run_id, {})
     prompts = run.prompts
+    total_clips = len(prompts)
     autocontinue = run.autocontinue
     prefix = sanitize_filename(prompts[0]) or "clip"
 
@@ -1381,22 +1422,18 @@ async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
                 clip.status = RunStatus.DONE.value
                 clip.elapsed_s = round(job.elapsed, 2)
                 clip.bytes = job.file_bytes
-                clip.video_url = state.clip_url(out_name)
+                clip.video_url = (
+                    state.clip_url(out_name)
+                    if _should_stream_clip_video(run, i, total_clips)
+                    else ""
+                )
                 for c in state.clips.values():
                     if c.chain_id == run.chain_id and c.label == "CURRENT":
                         c.label = "EDIT"
                 clip.label = "CURRENT"
                 await state.emit(
                     run_id,
-                    {
-                        "type": "clip_done",
-                        "clip_id": clip_id,
-                        "video_url": clip.video_url,
-                        "bytes": clip.bytes,
-                        "index": i,
-                        "total_clips": len(prompts),
-                        "autoconcat": run.autoconcat,
-                    },
+                    _build_clip_done_event(run, clip_id, clip, i, total_clips),
                 )
             else:
                 clip.status = RunStatus.FAILED.value
@@ -1828,14 +1865,14 @@ def create_app(
             raise HTTPException(404, "Video not found")
 
         def _unlink_after_stream() -> None:
-            if _is_output_protected_for_autoconcat(state, filename):
+            if _is_chain_fragment_protected(state, filename):
                 return
             try:
                 path.unlink(missing_ok=True)
             except OSError as exc:
                 log.warning("Could not delete streamed video %s: %s", path, exc)
 
-        delete_after_stream = not _is_output_protected_for_autoconcat(state, filename)
+        delete_after_stream = not _is_chain_fragment_protected(state, filename)
         return FileResponse(
             path,
             media_type="video/mp4",
