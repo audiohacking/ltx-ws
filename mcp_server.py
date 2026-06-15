@@ -488,7 +488,17 @@ async def ltx_generate_sequence(
                         kind="video",
                     )
                     if nxt.extend_frames is None:
-                        nxt.extend_frames = extend_frames or 2
+                        from videofentanyl import (
+                            extend_latent_frames_for_video,
+                            resolve_extend_latent_frames,
+                        )
+
+                        probed = extend_latent_frames_for_video(job.output_path)
+                        if probed is not None:
+                            nxt.extend_frames = probed
+                        else:
+                            nf = nxt.num_frames if nxt.num_frames is not None else jobs[idx].params.num_frames
+                            nxt.extend_frames = resolve_extend_latent_frames(num_frames=nf)
                     if not nxt.extend_direction:
                         nxt.extend_direction = extend_direction or "after"
                     nxt.seed = int(time.time_ns() % (2**31 - 1)) or 1

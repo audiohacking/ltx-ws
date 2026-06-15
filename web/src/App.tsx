@@ -985,12 +985,15 @@ export default function App() {
 
     const isChainEdit = editingChain && autocontinue;
 
+    const durationPreset = config?.duration_presets.find((d) => d.id === durationId);
+
     const body: Record<string, unknown> = {
       prompt: prompt.trim(),
       mode,
       width: resolution.width,
       height: resolution.height,
       duration_seconds: durationSeconds,
+      num_frames: durationPreset?.num_frames,
       clip_count: clipMultiplier,
       num_steps: numSteps,
       autocontinue: autocontinue || isMultiClip || audiocontinue,

@@ -978,12 +978,18 @@ class GenerationQueue:
                             kind="video",
                         )
                         if nxt.extend_frames is None:
-                            nf = nxt.num_frames if nxt.num_frames is not None else job.params.num_frames
-                            if nf is not None:
-                                nf = max(9, int(nf))
-                                nxt.extend_frames = max(2, (nf - 1) // 8 + 1)
+                            probed = extend_latent_frames_for_video(job.output_path)
+                            if probed is not None:
+                                nxt.extend_frames = probed
                             else:
-                                nxt.extend_frames = job.params.extend_frames or 2
+                                nf = (
+                                    nxt.num_frames
+                                    if nxt.num_frames is not None
+                                    else job.params.num_frames
+                                )
+                                nxt.extend_frames = resolve_extend_latent_frames(
+                                    num_frames=nf,
+                                )
                         if not nxt.extend_direction:
                             nxt.extend_direction = job.params.extend_direction or "after"
                         nxt.seed = int(time.time_ns() % (2**31 - 1)) or 1
@@ -1052,6 +1058,9 @@ def try_finalize_native_extend_chain(
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     merged = out_dir / f"{file_prefix}_merged_{ts}.{ext}"
 
+    first_frames = count_video_frames(done[0].output_path) if len(done) > 1 else None
+    final_frames = count_video_frames(final.output_path)
+
     try:
         shutil.copy2(final.output_path, merged)
     except OSError as exc:
@@ -1068,13 +1077,33 @@ def try_finalize_native_extend_chain(
             print(f"  [native_extend] warning: could not remove {j.output_path}: {exc}")
 
     kb = merged.stat().st_size / 1024
+    merged_frames = count_video_frames(merged)
+    frame_note = ""
+    if first_frames is not None and final_frames is not None:
+        frame_note = (
+            f"  ({first_frames}f source → {final_frames}f extended"
+            f"{f', {merged_frames}f merged' if merged_frames else ''})"
+        )
+    elif final_frames is not None:
+        frame_note = f"  ({final_frames} frames)"
     if verbose:
         print(
             f"\n  [native_extend] finalized {len(done)} segment(s) → {merged}  ({kb:.0f} KB)"
+            f"{frame_note}"
         )
     else:
         print(
             f"\n  [native_extend] finalized chain → {merged}  ({kb:.0f} KB)"
+            f"{frame_note}"
+        )
+    if (
+        first_frames is not None
+        and final_frames is not None
+        and final_frames <= first_frames
+    ):
+        print(
+            "  [native_extend] warning: extended clip is not longer than the source — "
+            "check duration preset (5s = 121 frames @ 24fps) and extend_frames."
         )
     print(f"  [native_extend] removed {removed} fragment file(s).")
 
@@ -1524,6 +1553,81 @@ def split_audio_for_jobs(
             "Increase source audio length, reduce --count, or reduce clip duration."
         )
     return segs[:required_segments], temp_dir
+
+
+def snap_ltx_pixel_frames(raw: int) -> int:
+    """Snap to LTX temporal constraint: frame counts must be 8k+1."""
+    k = max(0, round((int(raw) - 1) / 8))
+    return 8 * k + 1
+
+
+def segment_pixel_frames_from_request(
+    num_frames: int | None,
+    duration_seconds: float | None = None,
+    *,
+    fps: float = 24.0,
+) -> int:
+    """One chain segment's pixel frame count (matches Web UI duration presets)."""
+    if duration_seconds is not None:
+        return snap_ltx_pixel_frames(int(float(duration_seconds) * fps))
+    if num_frames is not None:
+        return snap_ltx_pixel_frames(int(num_frames))
+    return snap_ltx_pixel_frames(int(5.0 * fps))
+
+
+def extend_latent_frames_for_pixel_frames(pixel_frames: int) -> int:
+    """
+    Latent frames to add so ``extend_from_video`` grows a clip by ~one segment.
+
+    ltx-2-mlx extend adds ``extend_frames`` latent tokens; each latent token is
+    ~8 pixel frames. For an 8k+1 source, ``(pixel_frames - 1) // 8 + 1`` matches
+    the source latent depth and roughly doubles duration when used as extend_frames.
+    """
+    nf = snap_ltx_pixel_frames(max(9, int(pixel_frames)))
+    return max(2, (nf - 1) // 8 + 1)
+
+
+def count_video_frames(video_path: Path | str) -> int | None:
+    """Return decoded video frame count, or None if probing fails."""
+    try:
+        import av
+    except ImportError:
+        return None
+    try:
+        with av.open(str(video_path)) as container:
+            stream = container.streams.video[0]
+            if stream.frames and int(stream.frames) > 0:
+                return int(stream.frames)
+            count = 0
+            for _ in container.decode(stream):
+                count += 1
+            return count if count > 0 else None
+    except Exception:
+        return None
+
+
+def extend_latent_frames_for_video(video_path: Path | str) -> int | None:
+    """Derive native_extend ``extend_frames`` from an on-disk MP4."""
+    count = count_video_frames(video_path)
+    if count is None:
+        return None
+    return extend_latent_frames_for_pixel_frames(count)
+
+
+def resolve_extend_latent_frames(
+    *,
+    video_path: Path | str | None = None,
+    num_frames: int | None = None,
+    duration_seconds: float | None = None,
+    fps: float = 24.0,
+) -> int:
+    """Best-effort extend_frames for native_extend chaining."""
+    if video_path is not None:
+        probed = extend_latent_frames_for_video(video_path)
+        if probed is not None:
+            return probed
+    pixel = segment_pixel_frames_from_request(num_frames, duration_seconds, fps=fps)
+    return extend_latent_frames_for_pixel_frames(pixel)
 
 
 def extract_last_frame(video_path: Path) -> Optional[dict]:

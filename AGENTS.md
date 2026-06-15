@@ -192,7 +192,7 @@ If `ok=false`, tell the user to start `python server.py` or fix `--server-url`.
 **Autocontinue behavior (critical):**
 
 - **`chain_method: autocontinue`** (default): after each successful clip, extract the **last full frame** and inject as `initial_image` on the next job.
-- **`chain_method: native_extend`**: clip 1 is `generate`/i2v; clips 2+ run **`mode: extend`** with the prior clip MP4 as `source_video` (ltx-2-mlx `RetakePipeline.extend_from_video`, dev model + CFG; **same `num_steps` as clip 1**). Each extend output **includes prior footage**; with `autoconcat` the **last extend** is promoted as merged (not ffmpeg-concat of overlapping segments). Incompatible with `audiocontinue`.
+- **`chain_method: native_extend`**: clip 1 is `generate`/i2v; clips 2+ run **`mode: extend`** with the prior clip MP4 as `source_video` (ltx-2-mlx `RetakePipeline.extend_from_video`, dev model + CFG; **same `num_steps` as clip 1**, cfg=3.0, stg=0.0 unless overridden). Each extend output **includes prior footage**; with `autoconcat` the **last extend** is promoted as merged (not ffmpeg-concat of overlapping segments). Incompatible with `audiocontinue`.
 - Each chained segment gets a **new seed** on the client path.
 - If chaining fails, the sequence aborts—do not silently continue.
 

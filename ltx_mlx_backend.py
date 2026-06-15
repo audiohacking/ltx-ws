@@ -35,8 +35,9 @@ LTX2_MLX_GIT_TAG = "v0.14.9"
 
 CHAIN_METHOD_AUTOCONTINUE = "autocontinue"
 CHAIN_METHOD_NATIVE_EXTEND = "native_extend"
+# ltx-2-mlx extend/retake: RetakePipeline + dev transformer + CFG (see docs/PIPELINES.md).
 RETAKE_EXTEND_DEFAULT_CFG = 3.0
-RETAKE_EXTEND_DEFAULT_STG = 1.0
+RETAKE_EXTEND_DEFAULT_STG = 0.0
 VALID_CHAIN_METHODS = frozenset({CHAIN_METHOD_AUTOCONTINUE, CHAIN_METHOD_NATIVE_EXTEND})
 
 PIPE_PROFILE_DISTILLED = "distilled"
@@ -1557,7 +1558,7 @@ class LocalVideoGenerator:
                 "image=%s end_image=%s audio=%s video=%s retake=%s-%s extend=%s/%s vcond=%s loras=%s "
                 "model_path=%s",
                 mode,
-                profile,
+                profile if mode not in ("extend", "retake") else "dev+CFG",
                 "yes" if req.enhance_prompt else "no",
                 seed,
                 requested_seed,
@@ -1647,6 +1648,16 @@ class LocalVideoGenerator:
                         pipe = self._get_pipe("retake")
                         last_pipe = pipe
                         retake_steps = steps
+                        retake_cfg = float(
+                            req.cfg_scale
+                            if req.cfg_scale is not None
+                            else RETAKE_EXTEND_DEFAULT_CFG
+                        )
+                        retake_stg = float(
+                            req.stg_scale
+                            if req.stg_scale is not None
+                            else RETAKE_EXTEND_DEFAULT_STG
+                        )
                         retake_kwargs = dict(
                             prompt=effective_prompt,
                             output_path=out_path,
@@ -1655,16 +1666,8 @@ class LocalVideoGenerator:
                             end_frame=end_frame,
                             seed=seed,
                             num_steps=retake_steps,
-                            cfg_scale=float(
-                                req.cfg_scale
-                                if req.cfg_scale is not None
-                                else RETAKE_EXTEND_DEFAULT_CFG
-                            ),
-                            stg_scale=float(
-                                req.stg_scale
-                                if req.stg_scale is not None
-                                else RETAKE_EXTEND_DEFAULT_STG
-                            ),
+                            cfg_scale=retake_cfg,
+                            stg_scale=retake_stg,
                             lora_paths=resolved_loras,
                             fps=float(self.fps),
                         )
@@ -1675,10 +1678,12 @@ class LocalVideoGenerator:
                                 "update ltx-2-mlx"
                             )
                         log.info(
-                            "Retake via retake_from_video (frames %s-%s, steps=%s)",
+                            "Retake via retake_from_video (frames %s-%s, steps=%s, cfg=%.1f, stg=%.1f)",
                             start_frame,
                             end_frame,
                             retake_steps,
+                            retake_cfg,
+                            retake_stg,
                         )
                         _invoke_retake_and_save(
                             pipe,
@@ -1693,6 +1698,16 @@ class LocalVideoGenerator:
                         pipe = self._get_pipe("extend")
                         last_pipe = pipe
                         extend_steps = steps
+                        extend_cfg = float(
+                            req.cfg_scale
+                            if req.cfg_scale is not None
+                            else RETAKE_EXTEND_DEFAULT_CFG
+                        )
+                        extend_stg = float(
+                            req.stg_scale
+                            if req.stg_scale is not None
+                            else RETAKE_EXTEND_DEFAULT_STG
+                        )
                         extend_kwargs = dict(
                             prompt=effective_prompt,
                             output_path=out_path,
@@ -1701,16 +1716,8 @@ class LocalVideoGenerator:
                             direction=direction,
                             seed=seed,
                             num_steps=extend_steps,
-                            cfg_scale=float(
-                                req.cfg_scale
-                                if req.cfg_scale is not None
-                                else RETAKE_EXTEND_DEFAULT_CFG
-                            ),
-                            stg_scale=float(
-                                req.stg_scale
-                                if req.stg_scale is not None
-                                else RETAKE_EXTEND_DEFAULT_STG
-                            ),
+                            cfg_scale=extend_cfg,
+                            stg_scale=extend_stg,
                             lora_paths=resolved_loras,
                             fps=float(self.fps),
                         )
@@ -1721,16 +1728,41 @@ class LocalVideoGenerator:
                                 "update ltx-2-mlx"
                             )
                         log.info(
-                            "Extend via extend_from_video (extend_frames=%s, direction=%s, steps=%s)",
+                            "Extend via extend_from_video "
+                            "(extend_frames=%s, direction=%s, steps=%s, cfg=%.1f, stg=%.1f)",
                             ext_frames,
                             direction,
                             extend_steps,
+                            extend_cfg,
+                            extend_stg,
                         )
                         _invoke_extend_and_save(
                             pipe,
                             default_fps=float(self.fps),
                             **extend_kwargs,
                         )
+                        try:
+                            from videofentanyl import count_video_frames
+
+                            src_frames = count_video_frames(tmp_video) if tmp_video else None
+                            out_frames = count_video_frames(out_path)
+                            if src_frames is not None and out_frames is not None:
+                                log.info(
+                                    "Extend output: %d frames (source %d, +%d, ~%.2fs @ %.1f fps)",
+                                    out_frames,
+                                    src_frames,
+                                    out_frames - src_frames,
+                                    max(0.0, (out_frames - 1) / float(self.fps)),
+                                    float(self.fps),
+                                )
+                                if out_frames <= src_frames:
+                                    log.warning(
+                                        "Extend did not lengthen the video — verify duration "
+                                        "(5s = 121 frames) and extend_frames=%s",
+                                        ext_frames,
+                                    )
+                        except Exception:
+                            pass
                     elif mode == "keyframe":
                         if not tmp_image or not tmp_end_image:
                             raise RuntimeError("keyframe mode requires start and end images")

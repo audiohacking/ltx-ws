@@ -318,15 +318,21 @@ def bind_all_http_hint(port: int, bind_host: str = "0.0.0.0") -> str:
     return f"http://{public_host(bind_host)}:{port}/"
 
 
-def num_frames_to_extend_latent(num_frames: int | None, *, duration_seconds: float | None = None) -> int:
-    """
-    Latent frame count for native_extend segments so each extension ≈ one clip duration.
+def num_frames_to_extend_latent(
+    num_frames: int | None,
+    *,
+    duration_seconds: float | None = None,
+    video_path: Path | str | None = None,
+) -> int:
+    """Latent frame count for native_extend (~one segment of new footage)."""
+    from videofentanyl import resolve_extend_latent_frames
 
-    LTX uses 8k+1 pixel frames; extend API counts latent frames (~(frames-1)//8 + 1).
-    """
-    nf = int(num_frames) if num_frames is not None else duration_to_frames(float(duration_seconds or 5.0))
-    nf = snap_frames(nf)
-    return max(2, (nf - 1) // 8 + 1)
+    return resolve_extend_latent_frames(
+        video_path=video_path,
+        num_frames=num_frames,
+        duration_seconds=duration_seconds,
+        fps=float(FPS),
+    )
 
 
 def _clip_settings_from_body(body: dict[str, Any]) -> dict[str, Any]:
@@ -1379,13 +1385,21 @@ def _apply_chain_continuation(
                     params.extend_frames = num_frames_to_extend_latent(
                         gen_body.get("num_frames"),
                         duration_seconds=gen_body.get("duration_seconds"),
+                        video_path=prev_path,
                     )
                 params.extend_direction = str(gen_body.get("extend_direction") or "after")
                 params.seed = int(time.time_ns() % (2**31 - 1)) or 1
+                from videofentanyl import count_video_frames
+
+                src_frames = count_video_frames(prev_path)
+                seg_frames = duration_to_frames(float(gen_body.get("duration_seconds") or 5.0))
                 log.info(
-                    "Web UI: native_extend clip %d ← video %s (extend_frames=%s)",
+                    "Web UI: native_extend clip %d ← video %s "
+                    "(source=%sf, segment=%sf, extend_frames=%s)",
                     i + 1,
                     prev_filename,
+                    src_frames if src_frames is not None else "?",
+                    seg_frames,
                     params.extend_frames,
                 )
             else:
@@ -2373,12 +2387,17 @@ def create_app(
 
         state.event_queues[run_id] = asyncio.Queue()
         await state._pending.put(run_id)
+        seg_frames = duration_to_frames(float(body.get("duration_seconds") or 5.0))
         log.info(
-            "Web UI: queued run %s  chain=%s  clips=%d  mode=%s  audiocontinue=%s",
+            "Web UI: queued run %s  chain=%s  clips=%d  mode=%s  chain_method=%s  "
+            "duration=%ss (%d frames)  audiocontinue=%s",
             run_id,
             chain_id,
             len(clip_ids),
             mode,
+            chain_method,
+            body.get("duration_seconds", 5.0),
+            seg_frames,
             audiocontinue,
         )
 
