@@ -377,6 +377,22 @@ def _local_lora_cache_dir() -> Path:
     return (REPO_ROOT / "loras").resolve()
 
 
+def _normalize_lora_spec(spec: str) -> str:
+    """Normalize common Hugging Face URL variants to resolve/download form."""
+    raw = (spec or "").strip()
+    if not raw or not raw.startswith(("http://", "https://")):
+        return raw
+    parsed = urlparse(raw)
+    host = parsed.netloc.lower()
+    if host in ("hf.co", "www.hf.co"):
+        raw = f"https://huggingface.co{parsed.path}"
+        if parsed.query:
+            raw += f"?{parsed.query}"
+    if "huggingface.co" in raw and "/blob/" in raw:
+        raw = raw.replace("/blob/", "/resolve/", 1)
+    return raw
+
+
 def _pick_safetensors_file(root: Path) -> Path | None:
     candidates = sorted(root.rglob("*.safetensors"))
     if not candidates:
@@ -390,7 +406,7 @@ def _pick_safetensors_file(root: Path) -> Path | None:
 
 def _lora_cached_path(spec: str) -> Path | None:
     """Return local path when spec is already on disk; None if download may be needed."""
-    raw = (spec or "").strip()
+    raw = _normalize_lora_spec(spec)
     if not raw:
         return None
 
@@ -432,7 +448,7 @@ def _resolve_lora_path(spec: str) -> tuple[str, str | None]:
     Resolve LoRA spec to a local safetensors path.
     Returns (path, cleanup_temp_path_or_none).
     """
-    raw = (spec or "").strip()
+    raw = _normalize_lora_spec(spec)
     if not raw:
         raise ValueError("Empty LoRA spec")
 

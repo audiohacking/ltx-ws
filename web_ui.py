@@ -227,11 +227,22 @@ def _lora_catalog(output_dir: Path | None = None) -> tuple[list[dict[str, Any]],
 
 
 def _ensure_lora_downloaded(spec: str) -> dict[str, Any]:
-    from ltx_mlx_backend import _lora_cached_path, _resolve_lora_path
+    from ltx_mlx_backend import _lora_cached_path, _normalize_lora_spec, _resolve_lora_path
 
-    cached = _lora_cached_path(spec) is not None
-    path, _ = _resolve_lora_path(spec)
-    return {"ok": True, "spec": spec, "path": path, "cached": cached}
+    normalized = _normalize_lora_spec(spec)
+    cached_path = _lora_cached_path(normalized)
+    if cached_path is not None:
+        return {
+            "ok": True,
+            "spec": normalized,
+            "path": str(cached_path),
+            "cached": True,
+        }
+    path, _ = _resolve_lora_path(normalized)
+    return {"ok": True, "spec": normalized, "path": path, "cached": False}
+
+
+_lora_ensure_locks: dict[str, asyncio.Lock] = {}
 
 
 _RUN_BODIES: dict[str, dict[str, Any]] = {}
@@ -2160,7 +2171,9 @@ def create_app(
 
     @app.post("/api/loras/custom")
     async def add_custom_lora(body: dict[str, Any]):
-        spec = str(body.get("spec") or body.get("url") or "").strip()
+        from ltx_mlx_backend import _normalize_lora_spec
+
+        spec = _normalize_lora_spec(str(body.get("spec") or body.get("url") or "").strip())
         if not spec:
             raise HTTPException(400, "spec or url is required")
         if not (
@@ -2231,14 +2244,24 @@ def create_app(
 
     @app.post("/api/loras/ensure")
     async def ensure_lora(body: dict[str, Any]):
-        spec = str(body.get("spec") or "").strip()
+        from ltx_mlx_backend import _normalize_lora_spec
+
+        spec = _normalize_lora_spec(str(body.get("spec") or "").strip())
         if not spec:
             raise HTTPException(400, "spec is required")
+        log.info("LoRA ensure requested: %s", spec[:160])
+        lock = _lora_ensure_locks.setdefault(spec, asyncio.Lock())
         try:
-            result = _ensure_lora_downloaded(spec)
+            async with lock:
+                result = await asyncio.to_thread(_ensure_lora_downloaded, spec)
         except Exception as exc:
             log.warning("LoRA ensure failed for %s: %s", spec, exc)
             raise HTTPException(500, f"LoRA download failed: {exc}") from exc
+        log.info(
+            "LoRA ensure complete: %s (cached=%s)",
+            spec[:160],
+            result.get("cached"),
+        )
         return result
 
     @app.post("/api/config/model")

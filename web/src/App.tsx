@@ -6,7 +6,30 @@ import type { Clip, Config, LoraPreset, ProgressState } from "./types";
 const API = "";
 const MODEL_PREF_KEY = "ltx-ws-preferred-model";
 const LORA_SEL_KEY = "ltx-ws-lora-preset-ids";
+const LORA_ENSURED_KEY = "ltx-ws-lora-ensured-specs";
 const BLOB_VIDEO_PREFIX = "blob:";
+
+function readEnsuredLoraSpecs(): Set<string> {
+  try {
+    const raw = sessionStorage.getItem(LORA_ENSURED_KEY);
+    if (!raw) return new Set();
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return new Set();
+    return new Set(parsed.map(String).filter(Boolean));
+  } catch {
+    return new Set();
+  }
+}
+
+function persistEnsuredLoraSpec(spec: string) {
+  const next = readEnsuredLoraSpecs();
+  next.add(spec);
+  try {
+    sessionStorage.setItem(LORA_ENSURED_KEY, JSON.stringify([...next]));
+  } catch {
+    /* ignore quota / private mode */
+  }
+}
 
 type LoraActivity =
   | { phase: "idle" }
@@ -279,8 +302,9 @@ export default function App() {
   const endImageRef = useRef<HTMLInputElement>(null);
   const audioRef = useRef<HTMLInputElement>(null);
   const videoRef = useRef<HTMLInputElement>(null);
-  const ensuredLoraSpecsRef = useRef<Set<string>>(new Set());
+  const ensuredLoraSpecsRef = useRef<Set<string>>(readEnsuredLoraSpecs());
   const loraPresetsRef = useRef<LoraPreset[]>([]);
+  const ensurePromisesRef = useRef<Map<string, Promise<void>>>(new Map());
 
   const libraryClips = useMemo(() => {
     return clips
@@ -313,7 +337,9 @@ export default function App() {
   const ensureLoraPresets = useCallback(async (
     presetIds: string[],
     presetsOverride?: LoraPreset[],
+    options?: { interactive?: boolean },
   ) => {
+    const interactive = options?.interactive ?? true;
     const presets = presetsOverride ?? loraPresetsRef.current;
     const selected = presetIds
       .map((id) => presets.find((p) => p.id === id))
@@ -325,53 +351,77 @@ export default function App() {
 
     const pending = selected.filter((p) => !ensuredLoraSpecsRef.current.has(p.spec));
     if (!pending.length) {
-      setLoraActivity({
-        phase: "ready",
-        message: `${selected.length} LoRA(s) ready`,
-      });
+      setLoraActivity(
+        interactive
+          ? { phase: "ready", message: `${selected.length} LoRA(s) ready` }
+          : { phase: "idle" },
+      );
       return;
     }
 
-    setLoraBusy(true);
+    if (interactive) {
+      setLoraBusy(true);
+    }
     try {
       for (let i = 0; i < pending.length; i++) {
         const preset = pending[i];
-        setLoraActivity({
-          phase: "working",
-          label: preset.label,
-          index: i + 1,
-          total: pending.length,
-          downloading: true,
-        });
-        const r = await fetch(`${API}/api/loras/ensure`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ spec: preset.spec }),
-        });
-        if (!r.ok) {
-          const err = await r.json().catch(() => ({}));
-          throw new Error(err.detail || `LoRA download failed: ${preset.label}`);
+        const existing = ensurePromisesRef.current.get(preset.spec);
+        if (existing) {
+          await existing;
+          continue;
         }
-        const data = (await r.json()) as { cached?: boolean };
-        ensuredLoraSpecsRef.current.add(preset.spec);
-        if (data.cached) {
-          setLoraActivity({
-            phase: "working",
-            label: preset.label,
-            index: i + 1,
-            total: pending.length,
-            downloading: false,
+
+        const ensureOne = (async () => {
+          if (interactive) {
+            setLoraActivity({
+              phase: "working",
+              label: preset.label,
+              index: i + 1,
+              total: pending.length,
+              downloading: true,
+            });
+          }
+          const r = await fetch(`${API}/api/loras/ensure`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ spec: preset.spec }),
           });
+          if (!r.ok) {
+            const err = await r.json().catch(() => ({}));
+            throw new Error(err.detail || `LoRA download failed: ${preset.label}`);
+          }
+          const data = (await r.json()) as { cached?: boolean };
+          ensuredLoraSpecsRef.current.add(preset.spec);
+          persistEnsuredLoraSpec(preset.spec);
+          if (interactive) {
+            setLoraActivity({
+              phase: "working",
+              label: preset.label,
+              index: i + 1,
+              total: pending.length,
+              downloading: !data.cached,
+            });
+          }
+        })();
+
+        ensurePromisesRef.current.set(preset.spec, ensureOne);
+        try {
+          await ensureOne;
+        } finally {
+          ensurePromisesRef.current.delete(preset.spec);
         }
       }
-      setLoraActivity({
-        phase: "ready",
-        message: `${selected.length} LoRA(s) ready`,
-      });
+      setLoraActivity(
+        interactive
+          ? { phase: "ready", message: `${selected.length} LoRA(s) ready` }
+          : { phase: "idle" },
+      );
     } catch (e) {
       setLoraActivity({ phase: "error", message: String(e) });
     } finally {
-      setLoraBusy(false);
+      if (interactive) {
+        setLoraBusy(false);
+      }
     }
   }, []);
 
@@ -410,7 +460,7 @@ export default function App() {
       }
       setLoraPresetIds(loraIds);
       if (loraIds.length) {
-        void ensureLoraPresets(loraIds, cfg.lora_presets);
+        void ensureLoraPresets(loraIds, cfg.lora_presets, { interactive: false });
       } else {
         setLoraActivity({ phase: "idle" });
       }
@@ -446,7 +496,7 @@ export default function App() {
           ? [...prev.filter((id) => id !== presetId), presetId]
           : prev.filter((id) => id !== presetId);
         void persistLoraSelection(next);
-        void ensureLoraPresets(next);
+        void ensureLoraPresets(next, undefined, { interactive: true });
         return next;
       });
     },
@@ -457,13 +507,6 @@ export default function App() {
     const spec = customLoraUrl.trim();
     if (!spec || addingCustomLora) return;
     setAddingCustomLora(true);
-    setLoraActivity({
-      phase: "working",
-      label: customLoraLabel.trim() || "Custom LoRA",
-      index: 1,
-      total: 1,
-      downloading: true,
-    });
     try {
       const r = await fetch(`${API}/api/loras/custom`, {
         method: "POST",
@@ -497,7 +540,7 @@ export default function App() {
       setCustomLoraLabel("");
       setCustomLoraScale("1.0");
       if (data.id) {
-        await ensureLoraPresets([data.id], nextPresets);
+        await ensureLoraPresets([data.id], nextPresets, { interactive: true });
       }
     } catch (e) {
       setLoraActivity({ phase: "error", message: String(e) });
