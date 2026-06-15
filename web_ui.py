@@ -12,6 +12,7 @@ import logging
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -272,10 +273,25 @@ async def _save_upload_file(
     return {"path": str(dest), "filename": filename, "kind": kind}
 
 
+def local_hostname() -> str:
+    """Resolve this machine's hostname for startup log hints."""
+    try:
+        fqdn = socket.getfqdn().strip()
+        if fqdn and fqdn not in ("localhost", "localhost.localdomain"):
+            return fqdn
+    except OSError:
+        pass
+    try:
+        return socket.gethostname().strip() or "localhost"
+    except OSError:
+        return "localhost"
+
+
 def public_host(bind_host: str) -> str:
-    if bind_host in ("0.0.0.0", "::", ""):
-        return "127.0.0.1"
-    return bind_host
+    host = (bind_host or "").strip()
+    if host in ("0.0.0.0", "::", "[::]"):
+        return local_hostname()
+    return host
 
 
 def urls_from_request(request: Any) -> tuple[str, str]:
@@ -301,8 +317,8 @@ def build_server_urls(bind_host: str, port: int) -> tuple[str, str]:
     return ws_url, http_url
 
 
-def bind_all_http_hint(port: int) -> str:
-    return f"http://<this-host>:{port}/"
+def bind_all_http_hint(port: int, bind_host: str = "0.0.0.0") -> str:
+    return f"http://{public_host(bind_host)}:{port}/"
 
 
 def num_frames_to_extend_latent(num_frames: int | None, *, duration_seconds: float | None = None) -> int:

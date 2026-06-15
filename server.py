@@ -1046,6 +1046,10 @@ class VideoServer:
         except (NotImplementedError, RuntimeError):
             pass
         url = f"ws://{self.host}:{self.port}/ws"
+        if self.host in ("0.0.0.0", "::", "[::]"):
+            from web_ui import build_server_urls
+
+            url, _ = build_server_urls(self.host, self.port)
         async with websockets.serve(
             self._handle_client,
             self.host,
@@ -1059,10 +1063,10 @@ class VideoServer:
             await asyncio.Future()
 
     async def _serve_with_web_ui(self, web_state: Any) -> None:
-        from web_ui import build_combined_application, bind_all_http_hint, run_uvicorn
+        from web_ui import build_combined_application, build_server_urls, run_uvicorn
 
         web_state.video_server = self
-        http_hint = bind_all_http_hint(self.port)
+        ws_url, http_url = build_server_urls(self.host, self.port)
 
         video_server = self
 
@@ -1075,8 +1079,8 @@ class VideoServer:
             await video_server.handle_ws_connection(adapter)
 
         app = build_combined_application(starlette_ws_handler, web_state)
-        log.info("Web UI       : %s  (use your machine IP/hostname in the browser)", http_hint)
-        log.info("WebSocket    : ws://<this-host>:%s/ws", self.port)
+        log.info("Web UI       : %s", http_url)
+        log.info("WebSocket    : %s", ws_url)
         await run_uvicorn(app, self.host, self.port)
 
 
@@ -1347,11 +1351,12 @@ def main() -> None:
     if model_auto_note:
         print(f"  RAM pick : {model_auto_note}")
     print(f"  Runtime  : Apple Silicon / MLX")
-    print(f"  Endpoint : ws://{args.host}:{args.port}/ws")
-    if args.web_ui:
-        from web_ui import bind_all_http_hint, resolve_web_dist
+    from web_ui import build_server_urls, resolve_web_dist
 
-        print(f"  Web UI   : {bind_all_http_hint(args.port)}  (same host in browser)")
+    ws_url, http_url = build_server_urls(args.host, args.port)
+    print(f"  Endpoint : {ws_url}")
+    if args.web_ui:
+        print(f"  Web UI   : {http_url}")
         if not resolve_web_dist().is_dir():
             print(
                 "  [warn] web/dist missing — build UI: cd web && npm install && npm run build",
