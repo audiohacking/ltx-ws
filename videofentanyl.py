@@ -199,6 +199,11 @@ def _ws_headers(mode: str) -> dict:
 
 # ── Data models ────────────────────────────────────────────────────────────────
 
+CHAIN_METHOD_AUTOCONTINUE = "autocontinue"
+CHAIN_METHOD_NATIVE_EXTEND = "native_extend"
+VALID_CHAIN_METHODS = frozenset({CHAIN_METHOD_AUTOCONTINUE, CHAIN_METHOD_NATIVE_EXTEND})
+
+
 class JobStatus(Enum):
     PENDING   = "pending"
     RUNNING   = "running"
@@ -224,9 +229,10 @@ class GenerationParams:
     height:                     Optional[int] = None
     width:                      Optional[int] = None
     num_steps:                  Optional[int] = None
-    generation_mode:            str           = "generate"  # generate|a2v|retake|extend
+    generation_mode:            str           = "generate"  # generate|a2v|retake|extend|ic_lora|keyframe|lipdub
     audio_input:            Optional[dict] = None
     source_video:           Optional[dict] = None
+    end_image:              Optional[dict] = None
     retake_start:              Optional[int] = None
     retake_end:                Optional[int] = None
     extend_frames:             Optional[int] = None
@@ -235,6 +241,14 @@ class GenerationParams:
     video_conditioning_specs: list[tuple[dict, float]] = dataclasses.field(default_factory=list)
     # a2v chain clip 2+: i2v last-frame visual + mux audio (avoids A2V re-conditioning glitches).
     a2v_visual_i2v_continue: bool = False
+    # ltx-2-mlx advanced options (optional; server defaults when unset).
+    enhance_prompt: bool = False
+    pipeline_profile: str = "distilled"
+    cfg_scale: Optional[float] = None
+    stg_scale: Optional[float] = None
+    stage2_steps: Optional[int] = None
+    no_regen_audio: bool = False
+    reference_strength: Optional[float] = None
 
 
 @dataclasses.dataclass
@@ -362,6 +376,22 @@ def msg_simple_generate(p: GenerationParams) -> str:
         ]
     if p.a2v_visual_i2v_continue:
         d["a2v_visual_i2v_continue"] = True
+    if p.end_image is not None:
+        d["end_image"] = p.end_image
+    if p.enhance_prompt:
+        d["enhance_prompt"] = True
+    if p.pipeline_profile and p.pipeline_profile != "distilled":
+        d["pipeline_profile"] = p.pipeline_profile
+    if p.cfg_scale is not None:
+        d["cfg_scale"] = float(p.cfg_scale)
+    if p.stg_scale is not None:
+        d["stg_scale"] = float(p.stg_scale)
+    if p.stage2_steps is not None:
+        d["stage2_steps"] = int(p.stage2_steps)
+    if p.no_regen_audio:
+        d["no_regen_audio"] = True
+    if p.reference_strength is not None:
+        d["reference_strength"] = float(p.reference_strength)
     return json.dumps(d)
 
 
@@ -856,6 +886,7 @@ class GenerationQueue:
         delay:          float,
         verbose:        bool = False,
         autocontinue:   bool = False,
+        chain_method:   str = CHAIN_METHOD_AUTOCONTINUE,
     ):
         self.jobs          = jobs
         self.mode          = mode
@@ -863,6 +894,10 @@ class GenerationQueue:
         self.delay = delay
         self.verbose = verbose
         self.autocontinue = autocontinue
+        method = (chain_method or CHAIN_METHOD_AUTOCONTINUE).strip().lower()
+        self.chain_method = (
+            method if method in VALID_CHAIN_METHODS else CHAIN_METHOD_AUTOCONTINUE
+        )
 
     @staticmethod
     def _cleanup_job_temps(job: Job) -> None:
@@ -934,13 +969,35 @@ class GenerationQueue:
                 print(f"  ✓ saved  {job.output_path.name}  "
                       f"({job.file_bytes/1024:.0f} KB{seg}, {job.elapsed:.1f}s)")
                 if self.autocontinue and i + 1 < len(self.jobs):
-                    frame = extract_last_frame(job.output_path)
-                    if frame:
-                        nxt = self.jobs[i + 1].params
-                        nxt.initial_image = frame
-                        # Vary seed so a missed i2v path does not reproduce the same noise as clip 1.
+                    nxt = self.jobs[i + 1].params
+                    if self.chain_method == CHAIN_METHOD_NATIVE_EXTEND:
+                        nxt.generation_mode = "extend"
+                        nxt.initial_image = None
+                        nxt.source_video = load_media_payload(
+                            str(job.output_path),
+                            kind="video",
+                        )
+                        if nxt.extend_frames is None:
+                            nf = nxt.num_frames if nxt.num_frames is not None else job.params.num_frames
+                            if nf is not None:
+                                nf = max(9, int(nf))
+                                nxt.extend_frames = max(2, (nf - 1) // 8 + 1)
+                            else:
+                                nxt.extend_frames = job.params.extend_frames or 2
+                        if not nxt.extend_direction:
+                            nxt.extend_direction = job.params.extend_direction or "after"
                         nxt.seed = int(time.time_ns() % (2**31 - 1)) or 1
-                        print(f"  → autocontinue: last frame → job {i + 2:02d}  seed={nxt.seed}")
+                        print(
+                            f"  → native_extend: {job.output_path.name} → job {i + 2:02d}  "
+                            f"mode=extend  extend_frames={nxt.extend_frames}"
+                        )
+                    else:
+                        frame = extract_last_frame(job.output_path)
+                        if frame:
+                            nxt.initial_image = frame
+                            # Vary seed so a missed i2v path does not reproduce the same noise as clip 1.
+                            nxt.seed = int(time.time_ns() % (2**31 - 1)) or 1
+                            print(f"  → autocontinue: last frame → job {i + 2:02d}  seed={nxt.seed}")
             else:
                 failed += 1
                 print(f"  ✗ FAILED  {job.error}")
@@ -1490,6 +1547,7 @@ def build_jobs(
     image_path:    str | None = None,
     audio_path:    str | None = None,
     video_path:    str | None = None,
+    end_image_path: str | None = None,
     video_conditioning_specs: list[tuple[dict, float]] | None = None,
 ) -> list[Job]:
     """
@@ -1497,6 +1555,7 @@ def build_jobs(
     Each prompt is repeated `count` times before moving to the next prompt.
     """
     initial_image = load_image_payload(image_path) if image_path else None
+    end_image = load_image_payload(end_image_path) if end_image_path else None
     audio_input = load_media_payload(audio_path, kind="audio") if audio_path else None
     source_video = load_media_payload(video_path, kind="video") if video_path else None
     jobs: list[Job] = []
@@ -1511,6 +1570,7 @@ def build_jobs(
                 params=GenerationParams(
                     prompt=prompt,
                     initial_image=initial_image,
+                    end_image=end_image,
                     audio_input=audio_input,
                     source_video=source_video,
                     video_conditioning_specs=video_conditioning_specs or [],
@@ -1621,7 +1681,12 @@ examples:
     gen.add_argument(
         "--image", "-i",
         metavar="PATH_OR_URL",
-        help="input image for image-to-video (local path or http(s) URL)",
+        help="input image for i2v / keyframe start (local path or http(s) URL)",
+    )
+    gen.add_argument(
+        "--end-image",
+        metavar="PATH_OR_URL",
+        help="end image for keyframe interpolation (local path or http(s) URL)",
     )
     gen.add_argument(
         "--audio",
@@ -1635,10 +1700,30 @@ examples:
     )
     gen.add_argument(
         "--generation-mode",
-        choices=("generate", "a2v", "retake", "extend", "ic_lora"),
+        choices=("generate", "a2v", "retake", "extend", "ic_lora", "keyframe", "lipdub"),
         default="generate",
         help="local generation route (default: generate)",
     )
+    gen.add_argument(
+        "--enhance-prompt",
+        action="store_true",
+        help="run ltx-2-mlx Gemma prompt enhancement before generation",
+    )
+    gen.add_argument(
+        "--pipeline-profile",
+        choices=("distilled", "two_stage", "hq", "one_stage"),
+        default="distilled",
+        help="ltx-2-mlx generate pipeline profile (default: distilled)",
+    )
+    gen.add_argument("--cfg-scale", type=float, default=None, metavar="F")
+    gen.add_argument("--stg-scale", type=float, default=None, metavar="F")
+    gen.add_argument("--stage2-steps", type=int, default=None, metavar="N")
+    gen.add_argument(
+        "--no-regen-audio",
+        action="store_true",
+        help="retake/extend: keep source audio instead of regenerating",
+    )
+    gen.add_argument("--reference-strength", type=float, default=None, metavar="F")
     gen.add_argument(
         "--num-steps",
         type=int,
@@ -1762,8 +1847,16 @@ examples:
     p.add_argument(
         "--autocontinue",
         action="store_true",
-        help="extract the last frame of each clip and use it as the first "
-             "frame (--image) of the next one; ideal for multi-clip local runs",
+        help="chain clips: last frame of each clip feeds the next (see --chain-method)",
+    )
+    p.add_argument(
+        "--chain-method",
+        choices=sorted(VALID_CHAIN_METHODS),
+        default=CHAIN_METHOD_AUTOCONTINUE,
+        metavar="METHOD",
+        help="how chained clips connect when --autocontinue is set: "
+             "autocontinue (extract last frame → i2v, default) or "
+             "native_extend (ltx-2-mlx RetakePipeline.extend_from_video on prior MP4)",
     )
     p.add_argument(
         "--autoconcat",
@@ -1868,6 +1961,30 @@ async def async_main(args: argparse.Namespace):
         if not args.video_conditioning:
             print("Error: --generation-mode ic_lora requires --video-conditioning <video> <scale>")
             sys.exit(2)
+    if args.generation_mode == "keyframe":
+        if not args.image or not args.end_image:
+            print("Error: --generation-mode keyframe requires --image and --end-image")
+            sys.exit(2)
+    if args.generation_mode == "lipdub":
+        if not args.video:
+            print("Error: --generation-mode lipdub requires --video (reference video)")
+            sys.exit(2)
+        if not args.lora or len(args.lora) != 1:
+            print("Error: --generation-mode lipdub requires exactly one --lora")
+            sys.exit(2)
+    if args.chain_method == CHAIN_METHOD_NATIVE_EXTEND:
+        if not args.autocontinue:
+            print("Error: --chain-method native_extend requires --autocontinue")
+            sys.exit(2)
+        if args.audiocontinue:
+            print("Error: --chain-method native_extend is incompatible with --audiocontinue")
+            sys.exit(2)
+        if args.generation_mode not in ("generate",):
+            print(
+                "Error: --chain-method native_extend only supports --generation-mode generate "
+                "(use i2v via --image on clip 1)",
+            )
+            sys.exit(2)
     if args.num_steps is not None and args.num_steps < 1:
         print("Error: --num-steps must be >= 1")
         sys.exit(2)
@@ -1938,6 +2055,13 @@ async def async_main(args: argparse.Namespace):
         "extend_frames":           args.extend_frames,
         "extend_direction":        args.extend_direction,
         "lora_specs":              lora_specs,
+        "enhance_prompt":          bool(args.enhance_prompt),
+        "pipeline_profile":        args.pipeline_profile,
+        "cfg_scale":               args.cfg_scale,
+        "stg_scale":               args.stg_scale,
+        "stage2_steps":            args.stage2_steps,
+        "no_regen_audio":          bool(args.no_regen_audio),
+        "reference_strength":      args.reference_strength,
     }
 
     # ── Build jobs ────────────────────────────────────────────────────────────
@@ -1953,6 +2077,7 @@ async def async_main(args: argparse.Namespace):
         image_path=args.image,
         audio_path=args.audio,
         video_path=args.video,
+        end_image_path=args.end_image,
         video_conditioning_specs=vc_specs,
     )
 
@@ -2023,6 +2148,7 @@ async def async_main(args: argparse.Namespace):
         delay=delay,
         verbose=args.verbose,
         autocontinue=args.autocontinue,
+        chain_method=args.chain_method,
     )
     try:
         done, failed = await queue.run_all()

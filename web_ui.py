@@ -42,19 +42,35 @@ RESOLUTION_PRESETS = [
     {"id": "1280x720", "width": 1280, "height": 720, "label": "1280 × 720 (HD)"},
 ]
 
-DURATION_PRESETS = [
-    {"id": "2s", "seconds": 2.0, "label": "~2 seconds"},
-    {"id": "4s", "seconds": 4.0, "label": "~4 seconds"},
-    {"id": "5s", "seconds": 5.0, "label": "~5 seconds"},
-]
-
 GENERATION_MODES = [
     {"id": "generate", "label": "Text to video"},
     {"id": "i2v", "label": "Image to video (i2v)"},
     {"id": "a2v", "label": "Audio to video (a2v)"},
     {"id": "retake", "label": "Retake (edit region)"},
     {"id": "extend", "label": "Extend video"},
+    {"id": "keyframe", "label": "Keyframe interpolation"},
+    {"id": "lipdub", "label": "LipDub (experimental)"},
     {"id": "ic_lora", "label": "IC LoRA conditioning"},
+]
+
+CHAIN_METHODS = [
+    {
+        "id": "autocontinue",
+        "label": "Autocontinue (last frame → i2v)",
+        "description": "Extract last frame and feed as start image for clip 2+",
+    },
+    {
+        "id": "native_extend",
+        "label": "Extend video (ltx-2-mlx)",
+        "description": "Clip 1 generate/i2v; clip 2+ native extend_from_video on prior MP4",
+    },
+]
+
+PIPELINE_PROFILES = [
+    {"id": "distilled", "label": "Distilled (fast, default)"},
+    {"id": "two_stage", "label": "Two-stage (dev + upscale)"},
+    {"id": "hq", "label": "HQ (res_2s + CFG)"},
+    {"id": "one_stage", "label": "One-stage (full-res CFG)"},
 ]
 
 CLIP_MULTIPLIER_MAX = 10
@@ -66,7 +82,70 @@ FPS = 24
 PROGRESS_KEEPALIVE_INTERVAL_S = 1.0
 
 
-def _lora_catalog() -> tuple[list[dict[str, Any]], str]:
+def snap_frames(raw: int) -> int:
+    k = max(0, round((int(raw) - 1) / 8))
+    return 8 * k + 1
+
+
+def duration_to_frames(seconds: float) -> int:
+    return snap_frames(int(seconds * FPS))
+
+
+def _duration_preset(preset_id: str, seconds: float, *, test: bool = False) -> dict[str, Any]:
+    nf = duration_to_frames(seconds)
+    suffix = " (test)" if test else ""
+    return {
+        "id": preset_id,
+        "seconds": float(seconds),
+        "num_frames": nf,
+        "label": f"~{seconds:g} seconds{suffix} ({nf} frames @ {FPS} fps)",
+    }
+
+
+DURATION_PRESETS = [
+    _duration_preset("2s", 2.0),
+    _duration_preset("4s", 4.0),
+    _duration_preset("5s", 5.0),
+    _duration_preset("8s", 8.0, test=True),
+    _duration_preset("10s", 10.0, test=True),
+]
+
+
+def _label_for_lora_spec(spec: str) -> str:
+    name = spec.rsplit("/", 1)[-1] if "/" in spec else spec
+    if name.endswith(".safetensors"):
+        name = name[:-12]
+    return name or spec
+
+
+def _read_custom_loras(output_dir: Path) -> list[dict[str, Any]]:
+    raw = read_web_settings(output_dir).get("custom_loras")
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        spec = str(item.get("spec") or "").strip()
+        if not spec:
+            continue
+        lid = str(item.get("id") or "").strip() or f"custom_{uuid.uuid4().hex[:8]}"
+        try:
+            scale = float(item.get("scale", 1.0))
+        except (TypeError, ValueError):
+            scale = 1.0
+        label = str(item.get("label") or "").strip() or _label_for_lora_spec(spec)
+        out.append({"id": lid, "label": label, "spec": spec, "scale": scale, "custom": True})
+    return out
+
+
+def _write_custom_loras(output_dir: Path, entries: list[dict[str, Any]]) -> None:
+    data = read_web_settings(output_dir)
+    data["custom_loras"] = entries
+    write_web_settings(output_dir, data)
+
+
+def _lora_catalog(output_dir: Path | None = None) -> tuple[list[dict[str, Any]], str]:
     """
     LoRA presets for the Web UI (default from LTX_WS_DEFAULT_LORA / server defaults).
     Returns (presets including a None entry, default_preset_id).
@@ -81,10 +160,7 @@ def _lora_catalog() -> tuple[list[dict[str, Any]], str]:
     )
 
     def _label_for_spec(spec: str) -> str:
-        name = spec.rsplit("/", 1)[-1] if "/" in spec else spec
-        if name.endswith(".safetensors"):
-            name = name[:-12]
-        return name or spec
+        return _label_for_lora_spec(spec)
 
     seen: set[str] = set()
     presets: list[dict[str, Any]] = [
@@ -129,6 +205,16 @@ def _lora_catalog() -> tuple[list[dict[str, Any]], str]:
         if path == default_path and scale == default_scale:
             continue
         _add(f"env_{i}", f"Env LoRA — {_label_for_spec(path)}", path, scale)
+
+    if output_dir is not None:
+        for entry in _read_custom_loras(output_dir):
+            _add(
+                str(entry["id"]),
+                str(entry["label"]),
+                str(entry["spec"]),
+                float(entry["scale"]),
+            )
+            presets[-1]["custom"] = True
 
     return presets, default_id
 
@@ -217,13 +303,15 @@ def bind_all_http_hint(port: int) -> str:
     return f"http://<this-host>:{port}/"
 
 
-def snap_frames(raw: int) -> int:
-    k = max(0, round((int(raw) - 1) / 8))
-    return 8 * k + 1
+def num_frames_to_extend_latent(num_frames: int | None, *, duration_seconds: float | None = None) -> int:
+    """
+    Latent frame count for native_extend segments so each extension ≈ one clip duration.
 
-
-def duration_to_frames(seconds: float) -> int:
-    return snap_frames(int(seconds * FPS))
+    LTX uses 8k+1 pixel frames; extend API counts latent frames (~(frames-1)//8 + 1).
+    """
+    nf = int(num_frames) if num_frames is not None else duration_to_frames(float(duration_seconds or 5.0))
+    nf = snap_frames(nf)
+    return max(2, (nf - 1) // 8 + 1)
 
 
 def _clip_settings_from_body(body: dict[str, Any]) -> dict[str, Any]:
@@ -232,6 +320,9 @@ def _clip_settings_from_body(body: dict[str, Any]) -> dict[str, Any]:
     audiocontinue = bool(body.get("audiocontinue", False))
     autocontinue = bool(body.get("autocontinue", False)) or clip_count > 1 or audiocontinue
     autoconcat = bool(body.get("autoconcat", False)) or clip_count > 1 or audiocontinue
+    chain_method = str(body.get("chain_method") or "autocontinue").strip().lower()
+    if chain_method not in ("autocontinue", "native_extend"):
+        chain_method = "autocontinue"
     return {
         "num_frames": body.get("num_frames") or duration_to_frames(duration_s),
         "width": body.get("width"),
@@ -243,6 +334,7 @@ def _clip_settings_from_body(body: dict[str, Any]) -> dict[str, Any]:
         "autocontinue": autocontinue,
         "autoconcat": autoconcat,
         "audiocontinue": audiocontinue,
+        "chain_method": chain_method,
     }
 
 
@@ -316,7 +408,7 @@ def _upload_paths_from_body(body: dict[str, Any], upload_dir: Path) -> list[Path
         upload_root = upload_dir.resolve()
     except OSError:
         return paths
-    for key in ("image_path", "audio_path", "video_path"):
+    for key in ("image_path", "audio_path", "video_path", "end_image_path"):
         raw = body.get(key)
         if not raw:
             continue
@@ -432,6 +524,7 @@ class RunRecord:
     autocontinue: bool = False
     autoconcat: bool = False
     audiocontinue: bool = False
+    chain_method: str = "autocontinue"
     merged_url: Optional[str] = None
     merged_clip_id: Optional[str] = None
 
@@ -491,6 +584,31 @@ class AppState:
         data = read_web_settings(self.output_dir)
         data["preferred_model"] = self.preferred_model
         write_web_settings(self.output_dir, data)
+
+    def preferred_lora_preset_ids(self) -> list[str]:
+        data = read_web_settings(self.output_dir)
+        raw = data.get("preferred_lora_preset_ids")
+        if isinstance(raw, list):
+            return [str(x).strip() for x in raw if str(x).strip() and str(x).strip() != "none"]
+        legacy = str(data.get("preferred_lora_preset_id") or "").strip()
+        if legacy and legacy != "none":
+            return [legacy]
+        return []
+
+    def persist_preferred_loras(self, preset_ids: list[str]) -> list[str]:
+        clean: list[str] = []
+        seen: set[str] = set()
+        for raw in preset_ids:
+            pid = str(raw or "").strip()
+            if not pid or pid == "none" or pid in seen:
+                continue
+            seen.add(pid)
+            clean.append(pid)
+        data = read_web_settings(self.output_dir)
+        data["preferred_lora_preset_ids"] = clean
+        data.pop("preferred_lora_preset_id", None)
+        write_web_settings(self.output_dir, data)
+        return clean
 
     def ensure_worker(self) -> None:
         """Start background generation worker (idempotent)."""
@@ -740,12 +858,14 @@ def _build_params_from_request(body: dict[str, Any]) -> Any:
     ) = _import_videofentanyl()
     ui_mode = (body.get("mode") or "generate").strip().lower()
     mode = _api_mode(ui_mode)
-    image_path = body.get("image_path") if ui_mode in ("i2v", "a2v", "generate") else None
-    audio_path = body.get("audio_path") if ui_mode == "a2v" else None
-    video_path = body.get("video_path") if ui_mode in ("retake", "extend") else None
+    image_path = body.get("image_path") if ui_mode in ("i2v", "a2v", "generate", "keyframe") else None
+    end_image_path = body.get("end_image_path") if ui_mode == "keyframe" else None
+    audio_path = body.get("audio_path") if ui_mode in ("a2v", "lipdub") else None
+    video_path = body.get("video_path") if ui_mode in ("retake", "extend", "lipdub") else None
     load_image_payload, load_media_payload = _import_videofentanyl()[5:7]
 
     image_payload = load_image_payload(image_path) if image_path else None
+    end_image_payload = load_image_payload(end_image_path) if end_image_path else None
     audio_payload = load_media_payload(audio_path, kind="audio") if audio_path else None
     video_payload = load_media_payload(video_path, kind="video") if video_path else None
 
@@ -773,12 +893,13 @@ def _build_params_from_request(body: dict[str, Any]) -> Any:
         enhancement_enabled=False,
         single_clip_mode=True,
         initial_image=image_payload,
+        end_image=end_image_payload,
         seed=body.get("seed"),
         num_frames=num_frames,
         height=body.get("height"),
         width=body.get("width"),
         num_steps=body.get("num_steps"),
-        generation_mode=mode,
+        generation_mode=mode if ui_mode != "keyframe" else "keyframe",
         audio_input=audio_payload,
         source_video=video_payload,
         retake_start=body.get("retake_start"),
@@ -787,6 +908,13 @@ def _build_params_from_request(body: dict[str, Any]) -> Any:
         extend_direction=body.get("extend_direction"),
         lora_specs=lora_specs,
         video_conditioning_specs=video_conditioning_specs,
+        enhance_prompt=bool(body.get("enhance_prompt", False)),
+        pipeline_profile=str(body.get("pipeline_profile") or "distilled"),
+        cfg_scale=body.get("cfg_scale"),
+        stg_scale=body.get("stg_scale"),
+        stage2_steps=body.get("stage2_steps"),
+        no_regen_audio=bool(body.get("no_regen_audio", False)),
+        reference_strength=body.get("reference_strength"),
     )
 
 
@@ -931,6 +1059,16 @@ async def _run_clip_inprocess(
                     a2v_visual_i2v_continue=bool(
                         getattr(params, "a2v_visual_i2v_continue", False)
                     ),
+                    end_image_data=getattr(params, "end_image", None),
+                    enhance_prompt=bool(getattr(params, "enhance_prompt", False)),
+                    pipeline_profile=str(
+                        getattr(params, "pipeline_profile", None) or "distilled"
+                    ),
+                    cfg_scale=getattr(params, "cfg_scale", None),
+                    stg_scale=getattr(params, "stg_scale", None),
+                    stage2_steps=getattr(params, "stage2_steps", None),
+                    no_regen_audio=bool(getattr(params, "no_regen_audio", False)),
+                    reference_strength=getattr(params, "reference_strength", None),
                 )
             finally:
                 progress_stop.set()
@@ -1056,14 +1194,82 @@ def _clip_request_body(
     gen_body: dict[str, Any],
     prompt: str,
     index: int,
-    autocontinue: bool,
+    chaining_enabled: bool,
+    chain_method: str,
 ) -> dict[str, Any]:
     """Per-clip request body; start image upload applies only to the first clip when chaining."""
     body = dict(gen_body)
     body["prompt"] = prompt
-    if index > 0 and autocontinue:
+    if index > 0 and chaining_enabled:
         body.pop("image_path", None)
+        body.pop("end_image_path", None)
+        if chain_method == "native_extend":
+            body.pop("video_path", None)
     return body
+
+
+def _apply_chain_continuation(
+    params: Any,
+    i: int,
+    chain_method: str,
+    chaining_enabled: bool,
+    initial_image: Any,
+    extract_last_frame: Any,
+    load_media_payload: Any,
+    prev_path: Path,
+    prev_filename: str,
+    gen_body: dict[str, Any],
+) -> None:
+    if i == 0 and initial_image:
+        params.initial_image = initial_image
+        params.seed = int(time.time_ns() % (2**31 - 1)) or 1
+    elif i > 0 and chaining_enabled:
+        if chain_method == "native_extend":
+            params.initial_image = None
+            params.generation_mode = "extend"
+            if prev_path.exists():
+                params.source_video = load_media_payload(str(prev_path), kind="video")
+                if gen_body.get("extend_frames") is not None:
+                    params.extend_frames = int(gen_body["extend_frames"])
+                else:
+                    params.extend_frames = num_frames_to_extend_latent(
+                        gen_body.get("num_frames"),
+                        duration_seconds=gen_body.get("duration_seconds"),
+                    )
+                params.extend_direction = str(gen_body.get("extend_direction") or "after")
+                params.seed = int(time.time_ns() % (2**31 - 1)) or 1
+                log.info(
+                    "Web UI: native_extend clip %d ← video %s (extend_frames=%s)",
+                    i + 1,
+                    prev_filename,
+                    params.extend_frames,
+                )
+            else:
+                log.warning(
+                    "Web UI: native_extend failed — missing prior clip %s",
+                    prev_path,
+                )
+        else:
+            if prev_path.exists():
+                frame = extract_last_frame(prev_path)
+                if frame:
+                    params.initial_image = frame
+                    params.seed = int(time.time_ns() % (2**31 - 1)) or 1
+                    log.info(
+                        "Web UI: autocontinue clip %d ← last frame of %s",
+                        i + 1,
+                        prev_filename,
+                    )
+                else:
+                    log.warning(
+                        "Web UI: autocontinue failed — no frame from %s",
+                        prev_path,
+                    )
+            else:
+                log.warning(
+                    "Web UI: autocontinue failed — missing prior clip %s",
+                    prev_path,
+                )
 
 
 def _apply_autocontinue_frame(
@@ -1075,30 +1281,19 @@ def _apply_autocontinue_frame(
     prev_path: Path,
     prev_filename: str,
 ) -> None:
-    if i == 0 and initial_image:
-        params.initial_image = initial_image
-        params.seed = int(time.time_ns() % (2**31 - 1)) or 1
-    elif i > 0 and autocontinue:
-        if prev_path.exists():
-            frame = extract_last_frame(prev_path)
-            if frame:
-                params.initial_image = frame
-                params.seed = int(time.time_ns() % (2**31 - 1)) or 1
-                log.info(
-                    "Web UI: autocontinue clip %d ← last frame of %s",
-                    i + 1,
-                    prev_filename,
-                )
-            else:
-                log.warning(
-                    "Web UI: autocontinue failed — no frame from %s",
-                    prev_path,
-                )
-        else:
-            log.warning(
-                "Web UI: autocontinue failed — missing prior clip %s",
-                prev_path,
-            )
+    """Backward-compatible wrapper; prefer _apply_chain_continuation."""
+    _apply_chain_continuation(
+        params,
+        i,
+        "autocontinue",
+        autocontinue,
+        initial_image,
+        extract_last_frame,
+        None,
+        prev_path,
+        prev_filename,
+        {},
+    )
 
 
 async def _finish_autoconcat(
@@ -1177,7 +1372,7 @@ async def _execute_run_embedded(state: AppState, run_id: str) -> None:
         _VideoSession,
         extract_last_frame,
         _load_image,
-        _load_media,
+        load_media_payload,
         sanitize_filename,
         try_autoconcat_clips,
     ) = _import_videofentanyl()
@@ -1192,6 +1387,7 @@ async def _execute_run_embedded(state: AppState, run_id: str) -> None:
             "autoconcat": run.autoconcat,
             "audiocontinue": run.audiocontinue,
             "autocontinue": run.autocontinue,
+            "chain_method": getattr(run, "chain_method", "autocontinue"),
             "clip_count": len(run.prompts),
         },
     )
@@ -1200,7 +1396,8 @@ async def _execute_run_embedded(state: AppState, run_id: str) -> None:
     gen_body = _RUN_BODIES.get(run_id, {})
     prompts = run.prompts
     total_clips = len(prompts)
-    autocontinue = run.autocontinue
+    chaining_enabled = run.autocontinue
+    chain_method = getattr(run, "chain_method", None) or gen_body.get("chain_method") or "autocontinue"
     prefix = sanitize_filename(prompts[0]) or "clip"
 
     audio_segments: list[dict[str, Any]] | None = None
@@ -1239,25 +1436,37 @@ async def _execute_run_embedded(state: AppState, run_id: str) -> None:
                 },
             )
 
-            body = _clip_request_body(gen_body, prompt, i, autocontinue)
+            body = _clip_request_body(gen_body, prompt, i, chaining_enabled, chain_method)
             params = _build_params_from_request(body)
             _apply_audiocontinue_audio(params, i, audio_segments)
             if i == 0 and initial_image:
-                _apply_autocontinue_frame(
-                    params, i, True, initial_image, extract_last_frame, Path(), ""
+                _apply_chain_continuation(
+                    params,
+                    i,
+                    chain_method,
+                    True,
+                    initial_image,
+                    extract_last_frame,
+                    load_media_payload,
+                    Path(),
+                    "",
+                    gen_body,
                 )
-            elif i > 0 and autocontinue:
+            elif i > 0 and chaining_enabled:
                 params.initial_image = None
                 prev_clip = state.clips[run.clip_ids[i - 1]]
                 prev_path = state.output_dir / prev_clip.filename
-                _apply_autocontinue_frame(
+                _apply_chain_continuation(
                     params,
                     i,
+                    chain_method,
                     True,
                     None,
                     extract_last_frame,
+                    load_media_payload,
                     prev_path,
                     prev_clip.filename,
+                    gen_body,
                 )
                 if (
                     params.generation_mode == "a2v"
@@ -1334,7 +1543,7 @@ async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
         VideoSession,
         extract_last_frame,
         _load_image,
-        _load_media,
+        load_media_payload,
         sanitize_filename,
         try_autoconcat_clips,
     ) = _import_videofentanyl()
@@ -1349,6 +1558,7 @@ async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
             "autoconcat": run.autoconcat,
             "audiocontinue": run.audiocontinue,
             "autocontinue": run.autocontinue,
+            "chain_method": getattr(run, "chain_method", "autocontinue"),
             "clip_count": len(run.prompts),
         },
     )
@@ -1358,7 +1568,8 @@ async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
     gen_body = _RUN_BODIES.get(run_id, {})
     prompts = run.prompts
     total_clips = len(prompts)
-    autocontinue = run.autocontinue
+    chaining_enabled = run.autocontinue
+    chain_method = getattr(run, "chain_method", None) or gen_body.get("chain_method") or "autocontinue"
     prefix = sanitize_filename(prompts[0]) or "clip"
 
     audio_segments: list[dict[str, Any]] | None = None
@@ -1397,25 +1608,37 @@ async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
                 },
             )
 
-            body = _clip_request_body(gen_body, prompt, i, autocontinue)
+            body = _clip_request_body(gen_body, prompt, i, chaining_enabled, chain_method)
             params = _build_params_from_request(body)
             _apply_audiocontinue_audio(params, i, audio_segments)
             if i == 0 and initial_image:
-                _apply_autocontinue_frame(
-                    params, i, True, initial_image, extract_last_frame, Path(), ""
+                _apply_chain_continuation(
+                    params,
+                    i,
+                    chain_method,
+                    True,
+                    initial_image,
+                    extract_last_frame,
+                    load_media_payload,
+                    Path(),
+                    "",
+                    gen_body,
                 )
-            elif i > 0 and autocontinue:
+            elif i > 0 and chaining_enabled:
                 params.initial_image = None
                 prev_clip = state.clips[run.clip_ids[i - 1]]
                 prev_path = state.output_dir / prev_clip.filename
-                _apply_autocontinue_frame(
+                _apply_chain_continuation(
                     params,
                     i,
+                    chain_method,
                     True,
                     None,
                     extract_last_frame,
+                    load_media_payload,
                     prev_path,
                     prev_clip.filename,
+                    gen_body,
                 )
                 if (
                     params.generation_mode == "a2v"
@@ -1579,7 +1802,10 @@ def create_app(
         local = scan_local_models()
         models = local + KNOWN_MODELS
         ok = await _is_connected(request)
-        lora_presets, default_lora_preset_id = _lora_catalog()
+        lora_presets, default_lora_preset_id = _lora_catalog(state.output_dir)
+        preferred_lora_ids = state.preferred_lora_preset_ids()
+        if not preferred_lora_ids and default_lora_preset_id != "none":
+            preferred_lora_ids = [default_lora_preset_id]
         default_model = default_model_preference(local, "auto")
         model_note = (
             "MLX weights only (dgrauet/ltx-2.3-mlx*). "
@@ -1602,12 +1828,96 @@ def create_app(
             "resolution_presets": RESOLUTION_PRESETS,
             "duration_presets": DURATION_PRESETS,
             "generation_modes": GENERATION_MODES,
+            "chain_methods": CHAIN_METHODS,
+            "pipeline_profiles": PIPELINE_PROFILES,
             "clip_multiplier_max": CLIP_MULTIPLIER_MAX,
             "defaults": _defaults(),
             "model_note": model_note,
             "lora_presets": lora_presets,
             "default_lora_preset_id": default_lora_preset_id,
+            "preferred_lora_preset_ids": preferred_lora_ids,
             "ffmpeg_available": bool(shutil.which("ffmpeg")),
+        }
+
+    @app.post("/api/config/loras")
+    async def set_preferred_loras(body: dict[str, Any]):
+        raw = body.get("preset_ids") or body.get("preferred_lora_preset_ids") or []
+        if not isinstance(raw, list):
+            raise HTTPException(400, "preset_ids must be a list")
+        catalog, _ = _lora_catalog(state.output_dir)
+        valid = {p["id"] for p in catalog if p.get("id") and p["id"] != "none"}
+        ids = state.persist_preferred_loras([str(x) for x in raw if str(x) in valid])
+        return {"ok": True, "preferred_lora_preset_ids": ids}
+
+    @app.post("/api/loras/custom")
+    async def add_custom_lora(body: dict[str, Any]):
+        spec = str(body.get("spec") or body.get("url") or "").strip()
+        if not spec:
+            raise HTTPException(400, "spec or url is required")
+        if not (
+            spec.startswith(("http://", "https://"))
+            or spec.endswith(".safetensors")
+            or Path(spec).expanduser().exists()
+        ):
+            raise HTTPException(
+                400,
+                "spec must be an http(s) URL (e.g. Hugging Face resolve link) or local .safetensors path",
+            )
+        try:
+            scale = float(body.get("scale", 1.0))
+        except (TypeError, ValueError):
+            raise HTTPException(400, "scale must be a number")
+        label = str(body.get("label") or "").strip() or _label_for_lora_spec(spec)
+        lid = f"custom_{uuid.uuid4().hex[:8]}"
+        entries = [
+            {
+                "id": e["id"],
+                "label": e["label"],
+                "spec": e["spec"],
+                "scale": e["scale"],
+            }
+            for e in _read_custom_loras(state.output_dir)
+        ]
+        entries.append({"id": lid, "label": label, "spec": spec, "scale": scale})
+        _write_custom_loras(state.output_dir, entries)
+        lora_presets, default_lora_preset_id = _lora_catalog(state.output_dir)
+        preferred = state.preferred_lora_preset_ids()
+        if lid not in preferred:
+            preferred.append(lid)
+            state.persist_preferred_loras(preferred)
+        return {
+            "ok": True,
+            "id": lid,
+            "lora_presets": lora_presets,
+            "default_lora_preset_id": default_lora_preset_id,
+            "preferred_lora_preset_ids": state.preferred_lora_preset_ids(),
+        }
+
+    @app.delete("/api/loras/custom/{lora_id}")
+    async def delete_custom_lora(lora_id: str):
+        lid = (lora_id or "").strip()
+        if not lid.startswith("custom_"):
+            raise HTTPException(400, "only custom_* presets can be deleted")
+        kept = [e for e in _read_custom_loras(state.output_dir) if e["id"] != lid]
+        if len(kept) == len(_read_custom_loras(state.output_dir)):
+            raise HTTPException(404, "custom LoRA not found")
+        _write_custom_loras(
+            state.output_dir,
+            [
+                {"id": e["id"], "label": e["label"], "spec": e["spec"], "scale": e["scale"]}
+                for e in kept
+            ],
+        )
+        state.persist_preferred_loras(
+            [x for x in state.preferred_lora_preset_ids() if x != lid]
+        )
+        lora_presets, default_lora_preset_id = _lora_catalog(state.output_dir)
+        return {
+            "ok": True,
+            "deleted": lid,
+            "lora_presets": lora_presets,
+            "default_lora_preset_id": default_lora_preset_id,
+            "preferred_lora_preset_ids": state.preferred_lora_preset_ids(),
         }
 
     @app.post("/api/loras/ensure")
@@ -1733,6 +2043,14 @@ def create_app(
                 raise HTTPException(400, "ic_lora requires lora_specs")
             if not body.get("video_conditioning"):
                 raise HTTPException(400, "ic_lora requires video_conditioning")
+        if ui_mode == "keyframe" and (not body.get("image_path") or not body.get("end_image_path")):
+            raise HTTPException(400, "keyframe mode requires start and end image uploads")
+        if ui_mode == "lipdub":
+            if not body.get("video_path"):
+                raise HTTPException(400, "lipdub mode requires reference video upload")
+            lora_items = body.get("lora_specs") or []
+            if len(lora_items) != 1:
+                raise HTTPException(400, "lipdub requires exactly one LoRA preset")
 
         if clip_count > 1 and len(prompts) == 1:
             prompts = [prompts[0]] * clip_count
@@ -1749,6 +2067,18 @@ def create_app(
                     "audiocontinue requires ffmpeg on PATH to split audio",
                 )
 
+        chain_method = str(body.get("chain_method") or "autocontinue").strip().lower()
+        if chain_method not in ("autocontinue", "native_extend"):
+            chain_method = "autocontinue"
+        if chain_method == "native_extend":
+            if audiocontinue:
+                raise HTTPException(400, "native_extend is incompatible with audiocontinue")
+            if ui_mode not in ("generate", "i2v"):
+                raise HTTPException(
+                    400,
+                    "native_extend chaining only supports generate / i2v base modes",
+                )
+
         mode = ui_mode
         run_id = str(uuid.uuid4())
         autocontinue = bool(body.get("autocontinue", False)) or clip_count > 1 or audiocontinue
@@ -1757,6 +2087,7 @@ def create_app(
             autocontinue = True
 
         body = dict(body)
+        body["chain_method"] = chain_method
         if audiocontinue:
             body["autocompact"] = True
         if clip_count > 1:
@@ -1805,6 +2136,7 @@ def create_app(
             autocontinue=autocontinue or (continue_from is not None),
             autoconcat=autoconcat,
             audiocontinue=audiocontinue,
+            chain_method=chain_method,
         )
         state.runs[run_id] = run
         _RUN_BODIES[run_id] = body

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { snapshotFromClip } from "./clipEditor";
 import { applyProgressEvent } from "./progress";
-import type { Clip, Config, ProgressState } from "./types";
+import type { Clip, Config, LoraPreset, ProgressState } from "./types";
 
 const API = "";
 const MODEL_PREF_KEY = "ltx-ws-preferred-model";
@@ -86,6 +86,54 @@ function pickPlaybackClip(clips: Clip[], chainId: string): string | null {
   return merged?.id ?? current?.id ?? latest?.id ?? null;
 }
 
+function ChainMethodPicker({
+  chainMethod,
+  onChange,
+  className,
+}: {
+  chainMethod: string;
+  onChange: (method: string) => void;
+  className?: string;
+}) {
+  return (
+    <div className={`chain-method-panel${className ? ` ${className}` : ""}`}>
+      <span className="media-panel-title">Continue longer clips via</span>
+      <div className="chain-method-radios">
+        <label className="check chain-method-option">
+          <input
+            type="radio"
+            name="chainMethod"
+            value="autocontinue"
+            checked={chainMethod === "autocontinue"}
+            onChange={() => onChange("autocontinue")}
+          />
+          <span>
+            <strong>Autocontinue</strong>
+            <span className="chain-method-desc">
+              Last frame → start image for the next clip (standard i2v chain)
+            </span>
+          </span>
+        </label>
+        <label className="check chain-method-option">
+          <input
+            type="radio"
+            name="chainMethod"
+            value="native_extend"
+            checked={chainMethod === "native_extend"}
+            onChange={() => onChange("native_extend")}
+          />
+          <span>
+            <strong>Extend video</strong>
+            <span className="chain-method-desc">
+              Clip 1 t2v/i2v; clips 2+ native ltx-2-mlx extend on the prior MP4
+            </span>
+          </span>
+        </label>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [config, setConfig] = useState<Config | null>(null);
   const [clips, setClips] = useState<Clip[]>([]);
@@ -107,8 +155,13 @@ export default function App() {
   const [autocontinue, setAutocontinue] = useState(true);
   const [autoconcat, setAutoconcat] = useState(false);
   const [audiocontinue, setAudiocontinue] = useState(false);
+  const [chainMethod, setChainMethod] = useState("autocontinue");
+  const [enhancePrompt, setEnhancePrompt] = useState(false);
+  const [pipelineProfile, setPipelineProfile] = useState("distilled");
   const [imagePath, setImagePath] = useState<string | null>(null);
   const [imageName, setImageName] = useState<string | null>(null);
+  const [endImagePath, setEndImagePath] = useState<string | null>(null);
+  const [endImageName, setEndImageName] = useState<string | null>(null);
   const [audioPath, setAudioPath] = useState<string | null>(null);
   const [audioName, setAudioName] = useState<string | null>(null);
   const [videoPath, setVideoPath] = useState<string | null>(null);
@@ -117,10 +170,15 @@ export default function App() {
   const [extendFrames, setExtendFrames] = useState(2);
   const [extendDirection, setExtendDirection] = useState("after");
   const [showOptions, setShowOptions] = useState(true);
-  const [loraPresetId, setLoraPresetId] = useState("default");
+  const [loraPresetIds, setLoraPresetIds] = useState<string[]>([]);
   const [loraStatus, setLoraStatus] = useState<string | null>(null);
+  const [customLoraUrl, setCustomLoraUrl] = useState("");
+  const [customLoraLabel, setCustomLoraLabel] = useState("");
+  const [customLoraScale, setCustomLoraScale] = useState("1.0");
+  const [addingCustomLora, setAddingCustomLora] = useState(false);
 
   const imageRef = useRef<HTMLInputElement>(null);
+  const endImageRef = useRef<HTMLInputElement>(null);
   const audioRef = useRef<HTMLInputElement>(null);
   const videoRef = useRef<HTMLInputElement>(null);
 
@@ -145,61 +203,164 @@ export default function App() {
     return clips.find((x) => x.id === selectedClipId) ?? null;
   }, [clips, selectedClipId]);
 
+  const ensureLoraPresets = useCallback(async (
+    presetIds: string[],
+    presetsOverride?: LoraPreset[],
+  ) => {
+    const presets = presetsOverride ?? config?.lora_presets ?? [];
+    const specs = presetIds
+      .map((id) => presets.find((p) => p.id === id))
+      .filter((p): p is NonNullable<typeof p> => Boolean(p?.spec));
+    if (!specs.length) {
+      setLoraStatus(null);
+      return;
+    }
+    setLoraStatus(`Checking ${specs.length} LoRA(s)…`);
+    try {
+      for (const preset of specs) {
+        const r = await fetch(`${API}/api/loras/ensure`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ spec: preset.spec }),
+        });
+        if (!r.ok) {
+          const err = await r.json().catch(() => ({}));
+          throw new Error(err.detail || `LoRA download failed: ${preset.label}`);
+        }
+      }
+      setLoraStatus(`${specs.length} LoRA(s) ready`);
+    } catch (e) {
+      setLoraStatus(String(e));
+    }
+  }, [config?.lora_presets]);
+
   const load = useCallback(async () => {
     try {
       const cfg = await fetchConfig();
       setConfig(cfg);
-      const preferred =
+      const preferredModel =
         cfg.preferred_model ||
         localStorage.getItem(MODEL_PREF_KEY) ||
         cfg.default_model ||
         "auto";
-      setModel(preferred);
-      localStorage.setItem(MODEL_PREF_KEY, preferred);
+      setModel(preferredModel);
+      localStorage.setItem(MODEL_PREF_KEY, preferredModel);
       setNumSteps(cfg.defaults.num_steps);
-      if (cfg.default_lora_preset_id) {
-        setLoraPresetId(cfg.default_lora_preset_id);
+      const loraIds =
+        cfg.preferred_lora_preset_ids?.length
+          ? cfg.preferred_lora_preset_ids
+          : cfg.default_lora_preset_id && cfg.default_lora_preset_id !== "none"
+            ? [cfg.default_lora_preset_id]
+            : [];
+      setLoraPresetIds(loraIds);
+      if (loraIds.length) {
+        await ensureLoraPresets(loraIds, cfg.lora_presets);
       }
       const all = await fetchClips();
       setClips(all);
     } catch (e) {
       setError(String(e));
     }
-  }, []);
+  }, [ensureLoraPresets]);
 
-  const ensureLoraPreset = useCallback(async (presetId: string) => {
-    if (!presetId || presetId === "none") {
-      setLoraStatus(null);
-      return;
-    }
-    const preset = config?.lora_presets?.find((p) => p.id === presetId);
-    if (!preset?.spec) return;
-    setLoraStatus("Checking LoRA…");
+  const persistLoraSelection = useCallback(async (ids: string[]) => {
     try {
-      const r = await fetch(`${API}/api/loras/ensure`, {
+      await fetch(`${API}/api/config/loras`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ spec: preset.spec }),
+        body: JSON.stringify({ preset_ids: ids }),
+      });
+    } catch (err) {
+      console.warn("Could not persist LoRA selection", err);
+    }
+  }, []);
+
+  const toggleLoraPreset = useCallback(
+    (presetId: string, checked: boolean) => {
+      setLoraPresetIds((prev) => {
+        const next = checked
+          ? [...prev.filter((id) => id !== presetId), presetId]
+          : prev.filter((id) => id !== presetId);
+        void persistLoraSelection(next);
+        void ensureLoraPresets(next);
+        return next;
+      });
+    },
+    [ensureLoraPresets, persistLoraSelection],
+  );
+
+  async function addCustomLora() {
+    const spec = customLoraUrl.trim();
+    if (!spec || addingCustomLora) return;
+    setAddingCustomLora(true);
+    setLoraStatus("Adding custom LoRA…");
+    try {
+      const r = await fetch(`${API}/api/loras/custom`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          spec,
+          label: customLoraLabel.trim() || undefined,
+          scale: parseFloat(customLoraScale) || 1.0,
+        }),
       });
       if (!r.ok) {
         const err = await r.json().catch(() => ({}));
-        throw new Error(err.detail || "LoRA download failed");
+        throw new Error(err.detail || "Could not add custom LoRA");
       }
-      setLoraStatus("LoRA ready");
+      const data = await r.json();
+      setConfig((c) =>
+        c
+          ? {
+              ...c,
+              lora_presets: data.lora_presets ?? c.lora_presets,
+              preferred_lora_preset_ids:
+                data.preferred_lora_preset_ids ?? c.preferred_lora_preset_ids,
+            }
+          : c,
+      );
+      const ids: string[] = data.preferred_lora_preset_ids ?? [];
+      setLoraPresetIds(ids);
+      setCustomLoraUrl("");
+      setCustomLoraLabel("");
+      setCustomLoraScale("1.0");
+      if (data.id) {
+        await ensureLoraPresets([data.id], data.lora_presets);
+      }
+    } catch (e) {
+      setLoraStatus(String(e));
+    } finally {
+      setAddingCustomLora(false);
+    }
+  }
+
+  async function removeCustomLora(presetId: string) {
+    if (!presetId.startsWith("custom_")) return;
+    try {
+      const r = await fetch(`${API}/api/loras/custom/${encodeURIComponent(presetId)}`, {
+        method: "DELETE",
+      });
+      if (!r.ok) throw new Error("Delete failed");
+      const data = await r.json();
+      setConfig((c) =>
+        c
+          ? {
+              ...c,
+              lora_presets: data.lora_presets ?? c.lora_presets,
+              preferred_lora_preset_ids:
+                data.preferred_lora_preset_ids ?? c.preferred_lora_preset_ids,
+            }
+          : c,
+      );
+      setLoraPresetIds(data.preferred_lora_preset_ids ?? []);
     } catch (e) {
       setLoraStatus(String(e));
     }
-  }, [config?.lora_presets]);
+  }
 
   useEffect(() => {
     load();
   }, [load]);
-
-  useEffect(() => {
-    if (config?.default_lora_preset_id) {
-      ensureLoraPreset(config.default_lora_preset_id);
-    }
-  }, [config?.default_lora_preset_id, ensureLoraPreset]);
 
   useEffect(() => {
     if (clipMultiplier > 1) {
@@ -285,29 +446,40 @@ export default function App() {
   function clearAllMedia() {
     setImagePath(null);
     setImageName(null);
+    setEndImagePath(null);
+    setEndImageName(null);
     setAudioPath(null);
     setAudioName(null);
     setVideoPath(null);
     if (imageRef.current) imageRef.current.value = "";
+    if (endImageRef.current) endImageRef.current.value = "";
     if (audioRef.current) audioRef.current.value = "";
     if (videoRef.current) videoRef.current.value = "";
   }
 
   function clearMediaForMode(nextMode: string) {
-    if (nextMode !== "i2v" && nextMode !== "generate" && nextMode !== "a2v") {
+    if (!["i2v", "generate", "a2v", "keyframe"].includes(nextMode)) {
       setImagePath(null);
       setImageName(null);
       if (imageRef.current) imageRef.current.value = "";
     }
-    if (nextMode !== "a2v") {
+    if (nextMode !== "keyframe") {
+      setEndImagePath(null);
+      setEndImageName(null);
+      if (endImageRef.current) endImageRef.current.value = "";
+    }
+    if (nextMode !== "a2v" && nextMode !== "lipdub") {
       setAudioPath(null);
       setAudioName(null);
       if (audioRef.current) audioRef.current.value = "";
       setAudiocontinue(false);
     }
-    if (nextMode !== "retake" && nextMode !== "extend") {
+    if (!["retake", "extend", "lipdub"].includes(nextMode)) {
       setVideoPath(null);
       if (videoRef.current) videoRef.current.value = "";
+    }
+    if (nextMode === "a2v") {
+      setChainMethod("autocontinue");
     }
   }
 
@@ -324,7 +496,13 @@ export default function App() {
     setBusy(false);
     setProgress(null);
     setError(null);
-    setLoraPresetId(config?.default_lora_preset_id ?? "default");
+    setLoraPresetIds(
+      config?.preferred_lora_preset_ids?.length
+        ? config.preferred_lora_preset_ids
+        : config?.default_lora_preset_id && config.default_lora_preset_id !== "none"
+          ? [config.default_lora_preset_id]
+          : [],
+    );
     clearAllMedia();
     try {
       await fetch(`${API}/api/session/clear`, { method: "POST" });
@@ -333,13 +511,19 @@ export default function App() {
     }
   }
 
-  const needsImageUpload = mode === "i2v";
+  const needsImageUpload = mode === "i2v" || mode === "keyframe";
   const isA2v = mode === "a2v";
-  const needsVideoUpload = mode === "retake" || mode === "extend";
+  const needsEndImageUpload = mode === "keyframe";
+  const needsVideoUpload = mode === "retake" || mode === "extend" || mode === "lipdub";
   const showStartImageOptional = mode === "generate";
+  const isT2vLike = mode === "generate" || mode === "i2v";
+  const showChainMethodChoice =
+    isT2vLike && !audiocontinue && isMultiClip;
+  const chainMethodLabel =
+    chainMethod === "native_extend" ? "extend video" : "autocontinue";
   const showChainedImageHint =
     isA2v &&
-    (audiocontinue || autocontinue || isMultiClip) &&
+    (autocontinue || isMultiClip || audiocontinue) &&
     Boolean(imagePath);
 
   async function uploadFile(file: File, kind: string): Promise<string> {
@@ -454,14 +638,16 @@ export default function App() {
         const clipCount = Number(msg.clip_count ?? 0);
         streamFinalOnly =
           autoconcatRun || (Boolean(msg.autocontinue) && clipCount > 1);
+        const chainLabel =
+          msg.chain_method === "native_extend" ? "extend video" : "autocontinue";
         setProgress({
           phase: "queued",
           message: audiocontinueRun
             ? `Music video: ${msg.clip_count ?? "?"} clips (audiocontinue)…`
             : autoconcatRun
-              ? `Generating ${msg.clip_count ?? "?"} clips (autoconcat)…`
+              ? `Generating ${msg.clip_count ?? "?"} clips (${chainLabel} + autoconcat)…`
               : streamFinalOnly
-                ? `Generating ${msg.clip_count ?? "?"} clips (autocontinue)…`
+                ? `Generating ${msg.clip_count ?? "?"} clips (${chainLabel})…`
                 : "Generation queued…",
         });
       } else if (msg.type === "clip_started") {
@@ -624,30 +810,48 @@ export default function App() {
       autocontinue: autocontinue || isMultiClip || audiocontinue,
       autoconcat: autoconcat || isMultiClip || audiocontinue,
       audiocontinue: audiocontinue && mode === "a2v",
+      chain_method: chainMethod,
+      enhance_prompt: enhancePrompt,
+      pipeline_profile: pipelineProfile,
       chain_id: isChainEdit ? chainId : undefined,
       continue_from: isChainEdit ? activeClip?.id : undefined,
-      retake_start: retakeStart,
-      retake_end: retakeEnd,
-      extend_frames: extendFrames,
-      extend_direction: extendDirection,
     };
+    if (mode === "retake") {
+      body.retake_start = retakeStart;
+      body.retake_end = retakeEnd;
+    }
+    if (mode === "extend") {
+      body.extend_frames = extendFrames;
+      body.extend_direction = extendDirection;
+    }
     if (
-      (mode === "i2v" || mode === "generate" || mode === "a2v") &&
+      (mode === "i2v" || mode === "generate" || mode === "a2v" || mode === "keyframe") &&
       imagePath
     ) {
       body.image_path = imagePath;
     }
-    if (mode === "a2v" && audioPath) {
+    if (mode === "keyframe" && endImagePath) {
+      body.end_image_path = endImagePath;
+    }
+    if ((mode === "a2v" || mode === "lipdub") && audioPath) {
       body.audio_path = audioPath;
     }
-    if ((mode === "retake" || mode === "extend") && videoPath) {
+    if ((mode === "retake" || mode === "extend" || mode === "lipdub") && videoPath) {
       body.video_path = videoPath;
     }
     if (seed.trim()) body.seed = parseInt(seed, 10);
 
-    const loraPreset = config?.lora_presets?.find((p) => p.id === loraPresetId);
-    if (loraPreset?.spec) {
-      body.lora_specs = [[loraPreset.spec, loraPreset.scale]];
+    const selectedLoras = (config?.lora_presets ?? []).filter(
+      (p) => loraPresetIds.includes(p.id) && p.spec,
+    );
+    if (mode === "lipdub" && selectedLoras.length !== 1) {
+      setError("LipDub requires exactly one LoRA — select a single preset.");
+      setBusy(false);
+      setProgress(null);
+      return;
+    }
+    if (selectedLoras.length) {
+      body.lora_specs = selectedLoras.map((p) => [p.spec, p.scale]);
     }
 
     try {
@@ -819,6 +1023,54 @@ export default function App() {
             </button>
           </div>
 
+          {config && isT2vLike && (
+            <div className="composer-chain">
+              <div className="options-grid composer-chain-grid">
+                <label>
+                  Duration
+                  <select
+                    value={durationId}
+                    onChange={(e) => setDurationId(e.target.value)}
+                  >
+                    {config.duration_presets.map((d) => (
+                      <option key={d.id} value={d.id}>{d.label}</option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  Clips (× duration)
+                  <select
+                    value={clipMultiplier}
+                    onChange={(e) => setClipMultiplier(Number(e.target.value))}
+                  >
+                    {Array.from(
+                      { length: config.clip_multiplier_max ?? 10 },
+                      (_, i) => i + 1,
+                    ).map((n) => (
+                      <option key={n} value={n}>
+                        ×{n}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+
+              {showChainMethodChoice && !showOptions && (
+                <ChainMethodPicker
+                  chainMethod={chainMethod}
+                  onChange={setChainMethod}
+                />
+              )}
+
+              {isMultiClip && !audiocontinue && (
+                <p className="hint duration-total">
+                  ~{durationSeconds}s × {clipMultiplier} clips ≈ ~{totalDurationSeconds}s
+                  merged ({chainMethodLabel} + autoconcat)
+                </p>
+              )}
+            </div>
+          )}
+
           <button
             type="button"
             className="options-toggle"
@@ -884,48 +1136,73 @@ export default function App() {
                     ))}
                   </select>
                 </label>
-                <label>
-                  Duration
-                  <select
-                    value={durationId}
-                    onChange={(e) => setDurationId(e.target.value)}
-                  >
-                    {config.duration_presets.map((d) => (
-                      <option key={d.id} value={d.id}>{d.label}</option>
+              </div>
+
+              <div className="lora-panel">
+                <span className="media-panel-title">LoRA presets (multi-select)</span>
+                <div className="lora-checklist">
+                  {(config.lora_presets ?? [])
+                    .filter((p) => p.id !== "none")
+                    .map((p) => (
+                      <label key={p.id} className="check lora-check">
+                        <input
+                          type="checkbox"
+                          checked={loraPresetIds.includes(p.id)}
+                          onChange={(e) => toggleLoraPreset(p.id, e.target.checked)}
+                        />
+                        <span>
+                          {p.label}
+                          {p.custom ? (
+                            <button
+                              type="button"
+                              className="lora-remove"
+                              title="Remove custom LoRA"
+                              onClick={(e) => {
+                                e.preventDefault();
+                                void removeCustomLora(p.id);
+                              }}
+                            >
+                              ×
+                            </button>
+                          ) : null}
+                        </span>
+                      </label>
                     ))}
-                  </select>
-                </label>
-                <label>
-                  Clips (× duration)
-                  <select
-                    value={clipMultiplier}
-                    onChange={(e) => setClipMultiplier(Number(e.target.value))}
+                </div>
+                <div className="lora-custom-form">
+                  <input
+                    type="url"
+                    placeholder="Hugging Face resolve URL or .safetensors path"
+                    value={customLoraUrl}
+                    onChange={(e) => setCustomLoraUrl(e.target.value)}
+                  />
+                  <input
+                    type="text"
+                    placeholder="Label (optional)"
+                    value={customLoraLabel}
+                    onChange={(e) => setCustomLoraLabel(e.target.value)}
+                  />
+                  <input
+                    type="number"
+                    min={0}
+                    max={2}
+                    step={0.05}
+                    title="Scale"
+                    value={customLoraScale}
+                    onChange={(e) => setCustomLoraScale(e.target.value)}
+                  />
+                  <button
+                    type="button"
+                    className="btn-secondary"
+                    disabled={!customLoraUrl.trim() || addingCustomLora}
+                    onClick={() => void addCustomLora()}
                   >
-                    {Array.from(
-                      { length: config.clip_multiplier_max ?? 10 },
-                      (_, i) => i + 1,
-                    ).map((n) => (
-                      <option key={n} value={n}>
-                        ×{n}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label>
-                  LoRA
-                  <select
-                    value={loraPresetId}
-                    onChange={(e) => {
-                      const id = e.target.value;
-                      setLoraPresetId(id);
-                      ensureLoraPreset(id);
-                    }}
-                  >
-                    {(config.lora_presets ?? []).map((p) => (
-                      <option key={p.id} value={p.id}>{p.label}</option>
-                    ))}
-                  </select>
-                </label>
+                    Add LoRA
+                  </button>
+                </div>
+              </div>
+
+              <div className="options-grid">
                 <label>
                   Steps
                   <input
@@ -951,18 +1228,19 @@ export default function App() {
                 <p className="hint">{loraStatus}</p>
               )}
 
-              {isMultiClip && !audiocontinue && (
-                <p className="hint duration-total">
-                  ~{durationSeconds}s × {clipMultiplier} clips ≈ ~{totalDurationSeconds}s
-                  merged (autocontinue + autoconcat on)
-                </p>
-              )}
-
               {audiocontinue && (
                 <p className="hint duration-total">
                   Music video: splits audio into {clipMultiplier} segment(s) (~
                   {durationSeconds}s each), autocontinue + autoconcat + compact merge
                 </p>
+              )}
+
+              {showChainMethodChoice && (
+                <ChainMethodPicker
+                  chainMethod={chainMethod}
+                  onChange={setChainMethod}
+                  className="options-chain-method"
+                />
               )}
 
               <div className="options-checks">
@@ -991,12 +1269,21 @@ export default function App() {
                 <label className="check">
                   <input
                     type="checkbox"
-                    checked={autocontinue}
-                    onChange={(e) => setAutocontinue(e.target.checked)}
-                    disabled={isMultiClip || audiocontinue}
+                    checked={enhancePrompt}
+                    onChange={(e) => setEnhancePrompt(e.target.checked)}
                   />
-                  Autocontinue (last frame → next clip)
+                  Enhance prompt (Gemma)
                 </label>
+                {!isMultiClip && !audiocontinue && (
+                  <label className="check">
+                    <input
+                      type="checkbox"
+                      checked={autocontinue}
+                      onChange={(e) => setAutocontinue(e.target.checked)}
+                    />
+                    Chain clips (continue from prior clip)
+                  </label>
+                )}
                 <label className="check">
                   <input
                     type="checkbox"
@@ -1006,9 +1293,56 @@ export default function App() {
                   />
                   Autoconcat (merge clips with ffmpeg)
                 </label>
+                <label>
+                  Pipeline profile
+                  <select
+                    value={pipelineProfile}
+                    onChange={(e) => setPipelineProfile(e.target.value)}
+                  >
+                    {(config?.pipeline_profiles ?? [
+                      { id: "distilled", label: "Distilled" },
+                      { id: "two_stage", label: "Two-stage" },
+                      { id: "hq", label: "HQ" },
+                      { id: "one_stage", label: "One-stage" },
+                    ]).map((p) => (
+                      <option key={p.id} value={p.id}>{p.label}</option>
+                    ))}
+                  </select>
+                </label>
               </div>
 
-              {(isA2v || needsImageUpload || showStartImageOptional || needsVideoUpload) && (
+              {chainMethod === "native_extend" && showChainMethodChoice && (
+                <p className="hint">
+                  Extend video: each segment after clip 1 adds ~{durationSeconds}s via native
+                  extend (latent frames match your duration preset). Autoconcat merges into one file.
+                </p>
+              )}
+
+              {mode === "extend" && (
+                <div className="options-grid">
+                  <label>
+                    Extend frames (latent)
+                    <input
+                      type="number"
+                      min={1}
+                      value={extendFrames}
+                      onChange={(e) => setExtendFrames(Number(e.target.value))}
+                    />
+                  </label>
+                  <label>
+                    Direction
+                    <select
+                      value={extendDirection}
+                      onChange={(e) => setExtendDirection(e.target.value)}
+                    >
+                      <option value="after">After</option>
+                      <option value="before">Before</option>
+                    </select>
+                  </label>
+                </div>
+              )}
+
+              {(isA2v || needsImageUpload || showStartImageOptional || needsVideoUpload || needsEndImageUpload) && (
                 <div className="media-panel">
                   {isA2v && (
                     <>
@@ -1055,7 +1389,7 @@ export default function App() {
                           </span>
                         </label>
                       </div>
-                      {showChainedImageHint && (
+                      {showChainedImageHint && chainMethod === "autocontinue" && (
                         <p className="hint">
                           With autocontinue / audiocontinue, the start image is used for
                           clip 1 only; later clips use the last frame of the prior clip.
@@ -1088,6 +1422,26 @@ export default function App() {
                         {imageName ?? "Choose image file…"}
                       </span>
                     </label>
+                    {needsEndImageUpload && (
+                      <label className="media-upload">
+                        <span className="media-upload-label">End image (required)</span>
+                        <input
+                          ref={endImageRef}
+                          type="file"
+                          accept="image/*"
+                          onChange={async (e) => {
+                            const f = e.target.files?.[0];
+                            if (f) {
+                              setEndImagePath(await uploadFile(f, "image"));
+                              setEndImageName(f.name);
+                            }
+                          }}
+                        />
+                        <span className="media-upload-hint">
+                          {endImageName ?? "Choose end frame…"}
+                        </span>
+                      </label>
+                    )}
                     </>
                   )}
                   {needsVideoUpload && (

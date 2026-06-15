@@ -372,6 +372,49 @@ def _resolve_audio_payload(msg: dict, session: dict) -> dict | str | None:
     return None
 
 
+def _resolve_end_image_payload(msg: dict, session: dict) -> dict | str | None:
+    keys = (
+        "end_image",
+        "endImage",
+        "end_frame",
+        "endFrame",
+        "target_image",
+        "targetImage",
+    )
+    for source in (msg, session):
+        for key in keys:
+            raw = source.get(key)
+            if isinstance(raw, dict) and raw:
+                return raw
+            if isinstance(raw, str) and raw.strip():
+                p = raw.strip()
+                if os.path.isfile(p) or p.startswith(("http://", "https://")):
+                    return p
+                return {"data_url": p, "mime_type": "image/jpeg"}
+    return None
+
+
+def _msg_bool(msg: dict, name: str, default: bool = False) -> bool:
+    raw = msg.get(name)
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+    return bool(raw)
+
+
+def _msg_float(msg: dict, name: str) -> float | None:
+    raw = msg.get(name)
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 def _resolve_source_video_payload(msg: dict, session: dict) -> dict | str | None:
     keys = (
         "source_video",
@@ -660,6 +703,7 @@ class RequestHandler:
 
         # Resolve initial image: prefer simple_generate, then session_init_v2.
         initial_image: dict | str | None = _resolve_initial_image_payload(msg, self._session)
+        end_image = _resolve_end_image_payload(msg, self._session)
         audio_input = _resolve_audio_payload(msg, self._session)
         source_video = _resolve_source_video_payload(msg, self._session)
         lora_specs = _resolve_lora_specs(msg, self._session)
@@ -693,6 +737,8 @@ class RequestHandler:
                 mode = "a2v"
             elif lora_specs and video_conditioning_specs:
                 mode = "ic_lora"
+            elif end_image and initial_image:
+                mode = "keyframe"
             else:
                 mode = "generate"
 
@@ -790,6 +836,20 @@ class RequestHandler:
                         a2v_visual_i2v_continue=bool(
                             msg.get("a2v_visual_i2v_continue", False)
                         ),
+                        end_image_data=end_image,
+                        enhance_prompt=_msg_bool(msg, "enhance_prompt"),
+                        pipeline_profile=str(
+                            msg.get("pipeline_profile") or "distilled"
+                        ),
+                        cfg_scale=_msg_float(msg, "cfg_scale"),
+                        stg_scale=_msg_float(msg, "stg_scale"),
+                        stage2_steps=(
+                            int(msg["stage2_steps"])
+                            if msg.get("stage2_steps") is not None
+                            else None
+                        ),
+                        no_regen_audio=_msg_bool(msg, "no_regen_audio"),
+                        reference_strength=_msg_float(msg, "reference_strength"),
                     )
                 )
                 try:

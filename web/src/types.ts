@@ -9,6 +9,7 @@ export interface LoraPreset {
   label: string;
   spec: string;
   scale: number;
+  custom?: boolean;
 }
 
 export interface PresetOption {
@@ -17,6 +18,7 @@ export interface PresetOption {
   width?: number;
   height?: number;
   seconds?: number;
+  num_frames?: number;
 }
 
 export interface Config {
@@ -28,6 +30,8 @@ export interface Config {
   resolution_presets: PresetOption[];
   duration_presets: PresetOption[];
   generation_modes: { id: string; label: string }[];
+  chain_methods?: { id: string; label: string; description?: string }[];
+  pipeline_profiles?: { id: string; label: string }[];
   defaults: {
     num_frames: number;
     width: number;
@@ -42,6 +46,7 @@ export interface Config {
   active_model?: string;
   lora_presets?: LoraPreset[];
   default_lora_preset_id?: string;
+  preferred_lora_preset_ids?: string[];
   ffmpeg_available?: boolean;
 }
 
