@@ -273,16 +273,16 @@ def _largest_mp4_under(root: Path) -> Path | None:
 
 
 def _cleanup_temp_video(path: str | None) -> None:
-    """Remove a temp MP4 and its parent directory (best-effort)."""
+    """Remove a temp MP4 and its parent work directory (best-effort)."""
     if not path:
         return
     try:
         p = Path(path)
-        p.unlink(missing_ok=True)
-        try:
-            p.parent.rmdir()
-        except OSError:
-            pass
+        if p.is_file():
+            p.unlink(missing_ok=True)
+        parent = p.parent
+        if parent.is_dir() and parent.name.startswith(("fv_", "fvserver_work_")):
+            shutil.rmtree(parent, ignore_errors=True)
     except OSError:
         pass
 
@@ -295,6 +295,9 @@ def _resolve_initial_image_payload(msg: dict, session: dict) -> dict | str | Non
 
     Returns a ``dict`` (data URL / base64) or a ``str`` (filesystem path or ``http(s)`` URL)
     for ``GenerationRequest`` / ``InputConfig(image_path=…)``, matching FastVideo I2V usage.
+
+    Session fallback is skipped when the generate message explicitly includes any image field
+    (even when empty), so a prior ``session_init_v2`` image cannot leak into a later T2V job.
     """
     keys = (
         "initial_image",
@@ -310,7 +313,9 @@ def _resolve_initial_image_payload(msg: dict, session: dict) -> dict | str | Non
         "referenceImage",
         "inputs",
     )
-    for source in (msg, session):
+    input_image_keys = ("image_path", "imagePath", "reference_image", "referenceImage")
+
+    def _pick_from(source: dict) -> dict | str | None:
         for key in keys:
             raw = source.get(key)
             if key == "inputs" and isinstance(raw, dict):
@@ -324,7 +329,24 @@ def _resolve_initial_image_payload(msg: dict, session: dict) -> dict | str | Non
                     return nested
             if isinstance(raw, dict) and raw:
                 return raw
-    return None
+            if isinstance(raw, str) and raw.strip():
+                p = raw.strip()
+                if os.path.isfile(p) or p.startswith(("http://", "https://")):
+                    return p
+                return {"data_url": p, "mime_type": "image/jpeg"}
+        return None
+
+    explicit_in_msg = any(key in msg for key in keys)
+    inputs = msg.get("inputs")
+    if isinstance(inputs, dict) and any(k in inputs for k in input_image_keys):
+        explicit_in_msg = True
+
+    from_msg = _pick_from(msg)
+    if explicit_in_msg:
+        return from_msg
+    if from_msg is not None:
+        return from_msg
+    return _pick_from(session)
 
 
 def _resolve_audio_payload(msg: dict, session: dict) -> dict | str | None:

@@ -23,6 +23,7 @@ export interface Config {
   server_connected: boolean;
   server_url: string;
   preferred_model: string;
+  default_model?: string;
   models: ModelOption[];
   resolution_presets: PresetOption[];
   duration_presets: PresetOption[];

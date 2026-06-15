@@ -4,6 +4,27 @@ import { applyProgressEvent } from "./progress";
 import type { Clip, Config, ProgressState } from "./types";
 
 const API = "";
+const MODEL_PREF_KEY = "ltx-ws-preferred-model";
+const BLOB_VIDEO_PREFIX = "blob:";
+
+async function cacheVideoAsBlobUrl(serverUrl: string): Promise<string> {
+  const res = await fetch(serverUrl);
+  if (!res.ok) throw new Error(`Video download failed (${res.status})`);
+  const blob = await res.blob();
+  return URL.createObjectURL(blob);
+}
+
+function preserveBlobVideoUrls(prev: Clip[], incoming: Clip[]): Clip[] {
+  const blobById = new Map(
+    prev
+      .filter((c) => c.video_url?.startsWith(BLOB_VIDEO_PREFIX))
+      .map((c) => [c.id, c.video_url] as const),
+  );
+  return incoming.map((c) => {
+    const blob = blobById.get(c.id);
+    return blob ? { ...c, video_url: blob } : c;
+  });
+}
 
 async function fetchConfig(): Promise<Config> {
   const r = await fetch(`${API}/api/config`);
@@ -31,7 +52,7 @@ function mergeClips(prev: Clip[], incoming: Clip[]): Clip[] {
 /** Replace all clips for one chain (e.g. after autoconcat removes fragments). */
 function replaceChainClips(prev: Clip[], chainId: string, chainClips: Clip[]): Clip[] {
   const rest = prev.filter((c) => c.chain_id !== chainId);
-  return [...rest, ...chainClips];
+  return [...rest, ...preserveBlobVideoUrls(prev, chainClips)];
 }
 
 function formatBytes(n?: number) {
@@ -119,11 +140,13 @@ export default function App() {
     try {
       const cfg = await fetchConfig();
       setConfig(cfg);
-      setModel(
-        cfg.embedded && cfg.active_model
-          ? cfg.active_model
-          : cfg.preferred_model,
-      );
+      const preferred =
+        cfg.preferred_model ||
+        localStorage.getItem(MODEL_PREF_KEY) ||
+        cfg.default_model ||
+        "auto";
+      setModel(preferred);
+      localStorage.setItem(MODEL_PREF_KEY, preferred);
       setNumSteps(cfg.defaults.num_steps);
       if (cfg.default_lora_preset_id) {
         setLoraPresetId(cfg.default_lora_preset_id);
@@ -250,6 +273,35 @@ export default function App() {
     }
   }
 
+  function clearAllMedia() {
+    setImagePath(null);
+    setImageName(null);
+    setAudioPath(null);
+    setAudioName(null);
+    setVideoPath(null);
+    if (imageRef.current) imageRef.current.value = "";
+    if (audioRef.current) audioRef.current.value = "";
+    if (videoRef.current) videoRef.current.value = "";
+  }
+
+  function clearMediaForMode(nextMode: string) {
+    if (nextMode !== "i2v" && nextMode !== "generate" && nextMode !== "a2v") {
+      setImagePath(null);
+      setImageName(null);
+      if (imageRef.current) imageRef.current.value = "";
+    }
+    if (nextMode !== "a2v") {
+      setAudioPath(null);
+      setAudioName(null);
+      if (audioRef.current) audioRef.current.value = "";
+      setAudiocontinue(false);
+    }
+    if (nextMode !== "retake" && nextMode !== "extend") {
+      setVideoPath(null);
+      if (videoRef.current) videoRef.current.value = "";
+    }
+  }
+
   function startNewProject() {
     setChainId(null);
     setSelectedClipId(null);
@@ -258,6 +310,7 @@ export default function App() {
     setAudiocontinue(false);
     setError(null);
     setLoraPresetId(config?.default_lora_preset_id ?? "default");
+    clearAllMedia();
   }
 
   const needsImageUpload = mode === "i2v";
@@ -293,6 +346,7 @@ export default function App() {
 
   async function changeModel(newModel: string, restart: boolean) {
     setModel(newModel);
+    localStorage.setItem(MODEL_PREF_KEY, newModel);
     const r = await fetch(`${API}/api/config/model`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -301,8 +355,26 @@ export default function App() {
     if (!r.ok) return;
     const data = await r.json();
     setConfig((c) =>
-      c ? { ...c, server_connected: data.server_connected } : c,
+      c
+        ? {
+            ...c,
+            preferred_model: data.preferred_model ?? newModel,
+            server_connected: data.server_connected ?? c.server_connected,
+          }
+        : c,
     );
+  }
+
+  function cacheClipVideoLocally(clipId: string, serverUrl: string) {
+    cacheVideoAsBlobUrl(serverUrl)
+      .then((blobUrl) => {
+        setClips((prev) =>
+          prev.map((c) => (c.id === clipId ? { ...c, video_url: blobUrl } : c)),
+        );
+      })
+      .catch((err) => {
+        console.warn("Failed to cache clip video locally", err);
+      });
   }
 
   async function subscribeRun(runId: string, runChainId: string) {
@@ -392,19 +464,27 @@ export default function App() {
                 ? `Clip ${idx}/${total} done — ${idx === total ? "merging…" : "continuing…"}`
                 : "Clip saved — continuing…",
           });
+          if (msg.clip_id && msg.video_url) {
+            cacheClipVideoLocally(
+              msg.clip_id as string,
+              msg.video_url as string,
+            );
+          }
         } else {
           setProgress({ phase: "clip_done", message: "Clip saved" });
           if (msg.clip_id && msg.video_url) {
-            setSelectedClipId(msg.clip_id as string);
+            const clipId = msg.clip_id as string;
+            const serverUrl = msg.video_url as string;
+            setSelectedClipId(clipId);
             setClips((prev) => {
-              const others = prev.filter((c) => c.id !== msg.clip_id);
-              const existing = prev.find((c) => c.id === msg.clip_id);
+              const others = prev.filter((c) => c.id !== clipId);
+              const existing = prev.find((c) => c.id === clipId);
               return [
                 ...others,
                 {
                   ...(existing ?? {}),
-                  id: msg.clip_id as string,
-                  video_url: msg.video_url as string,
+                  id: clipId,
+                  video_url: serverUrl,
                   chain_id: runChainId,
                   status: "done",
                   label: existing?.label ?? "CURRENT",
@@ -416,6 +496,7 @@ export default function App() {
                 } as Clip,
               ];
             });
+            cacheClipVideoLocally(clipId, serverUrl);
           }
         }
       } else if (msg.type === "merged") {
@@ -444,6 +525,7 @@ export default function App() {
               } as Clip,
             ];
           });
+          cacheClipVideoLocally(clipId, videoUrl);
         }
         fetchClips(runChainId).then((chainClips) => {
           setClips((prev) => replaceChainClips(prev, runChainId, chainClips));
@@ -488,14 +570,23 @@ export default function App() {
       audiocontinue: audiocontinue && mode === "a2v",
       chain_id: isChainEdit ? chainId : undefined,
       continue_from: isChainEdit ? activeClip?.id : undefined,
-      image_path: imagePath,
-      audio_path: audioPath,
-      video_path: videoPath,
       retake_start: retakeStart,
       retake_end: retakeEnd,
       extend_frames: extendFrames,
       extend_direction: extendDirection,
     };
+    if (
+      (mode === "i2v" || mode === "generate" || mode === "a2v") &&
+      imagePath
+    ) {
+      body.image_path = imagePath;
+    }
+    if (mode === "a2v" && audioPath) {
+      body.audio_path = audioPath;
+    }
+    if ((mode === "retake" || mode === "extend") && videoPath) {
+      body.video_path = videoPath;
+    }
     if (seed.trim()) body.seed = parseInt(seed, 10);
 
     const loraPreset = config?.lora_presets?.find((p) => p.id === loraPresetId);
@@ -690,7 +781,7 @@ export default function App() {
                     onChange={(e) => changeModel(e.target.value, false)}
                   >
                     {config.models.map((m) => (
-                      <option key={m.id} value={m.repo}>{m.label}</option>
+                      <option key={m.id} value={m.id}>{m.label}</option>
                     ))}
                   </select>
                 </label>
@@ -713,7 +804,14 @@ export default function App() {
               <div className="options-grid">
                 <label>
                   Mode
-                  <select value={mode} onChange={(e) => setMode(e.target.value)}>
+                  <select
+                    value={mode}
+                    onChange={(e) => {
+                      const next = e.target.value;
+                      setMode(next);
+                      clearMediaForMode(next);
+                    }}
+                  >
                     {config.generation_modes.map((m) => (
                       <option key={m.id} value={m.id}>{m.label}</option>
                     ))}

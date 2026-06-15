@@ -61,6 +61,7 @@ CLIP_MULTIPLIER_MAX = 10
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "web_outputs"
 DEFAULT_UPLOAD_DIR = REPO_ROOT / "web_uploads"
 INDEX_FILE = "index.json"
+SETTINGS_FILE = "settings.json"
 FPS = 24
 PROGRESS_KEEPALIVE_INTERVAL_S = 1.0
 
@@ -262,6 +263,93 @@ def scan_local_models() -> list[dict[str, str]]:
     return found
 
 
+def _all_model_ids(local: list[dict[str, str]] | None = None) -> set[str]:
+    local = local or scan_local_models()
+    return {m["id"] for m in KNOWN_MODELS + local}
+
+
+def default_model_preference(
+    local: list[dict[str, str]] | None = None,
+    cli_default: str = "auto",
+) -> str:
+    """Prefer the first local weights directory when present, else CLI/env default."""
+    local = local or scan_local_models()
+    if local:
+        return local[0]["id"]
+    return (cli_default or "auto").strip() or "auto"
+
+
+def resolve_model_preference(
+    saved: str,
+    local: list[dict[str, str]] | None = None,
+    cli_default: str = "auto",
+) -> str:
+    local = local or scan_local_models()
+    saved = (saved or "").strip()
+    ids = _all_model_ids(local)
+    if saved and saved in ids:
+        return saved
+    return default_model_preference(local, cli_default)
+
+
+def read_web_settings(output_dir: Path) -> dict[str, Any]:
+    path = output_dir / SETTINGS_FILE
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError, TypeError):
+        return {}
+
+
+def write_web_settings(output_dir: Path, data: dict[str, Any]) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / SETTINGS_FILE
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def _upload_paths_from_body(body: dict[str, Any], upload_dir: Path) -> list[Path]:
+    """Collect upload-dir files referenced by a generate request body."""
+    paths: list[Path] = []
+    try:
+        upload_root = upload_dir.resolve()
+    except OSError:
+        return paths
+    for key in ("image_path", "audio_path", "video_path"):
+        raw = body.get(key)
+        if not raw:
+            continue
+        try:
+            candidate = Path(str(raw)).resolve()
+        except (OSError, ValueError):
+            continue
+        if not candidate.is_file():
+            continue
+        try:
+            if candidate.is_relative_to(upload_root):
+                paths.append(candidate)
+        except AttributeError:
+            if str(candidate).startswith(str(upload_root)):
+                paths.append(candidate)
+    return paths
+
+
+def _delete_upload_paths(paths: list[Path]) -> None:
+    for path in paths:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            log.warning("Could not delete upload %s: %s", path, exc)
+
+
+def _cleanup_run_uploads(state: AppState, gen_body: dict[str, Any]) -> None:
+    paths = _upload_paths_from_body(gen_body, state.upload_dir)
+    if paths:
+        log.info("Web UI: cleaning %d upload file(s)", len(paths))
+        _delete_upload_paths(paths)
+
+
 class RunStatus(str, Enum):
     QUEUED = "queued"
     RUNNING = "running"
@@ -337,11 +425,36 @@ class AppState:
         self.runtime_defaults = runtime_defaults or {}
         self.server_process = server_process
         self.video_server = video_server
+        self._cli_model_default = preferred_model
         self.runs: dict[str, RunRecord] = {}
         self.clips: dict[str, ClipRecord] = {}
         self.event_queues: dict[str, asyncio.Queue[dict[str, Any]]] = {}
         self._pending: asyncio.Queue[str] = asyncio.Queue()
         self._worker_started = False
+
+    def apply_saved_settings(self) -> None:
+        """Load persisted UI settings; default model preference favors local weights."""
+        local = scan_local_models()
+        saved = str(read_web_settings(self.output_dir).get("preferred_model") or "").strip()
+        self.preferred_model = resolve_model_preference(
+            saved,
+            local,
+            self._cli_model_default,
+        )
+
+    def persist_preferred_model(self, model: str) -> None:
+        model = (model or "auto").strip() or "auto"
+        local = scan_local_models()
+        ids = _all_model_ids(local)
+        if model in ids:
+            self.preferred_model = model
+        else:
+            self.preferred_model = resolve_model_preference(
+                model, local, self._cli_model_default
+            )
+        data = read_web_settings(self.output_dir)
+        data["preferred_model"] = self.preferred_model
+        write_web_settings(self.output_dir, data)
 
     def ensure_worker(self) -> None:
         """Start background generation worker (idempotent)."""
@@ -349,6 +462,7 @@ class AppState:
             return
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.upload_dir.mkdir(parents=True, exist_ok=True)
+        self.apply_saved_settings()
         self.load_index()
         asyncio.create_task(_worker_loop(self))
         self._worker_started = True
@@ -549,9 +663,9 @@ def _build_params_from_request(body: dict[str, Any]) -> Any:
     ) = _import_videofentanyl()
     ui_mode = (body.get("mode") or "generate").strip().lower()
     mode = _api_mode(ui_mode)
-    image_path = body.get("image_path")
-    audio_path = body.get("audio_path")
-    video_path = body.get("video_path")
+    image_path = body.get("image_path") if ui_mode in ("i2v", "a2v", "generate") else None
+    audio_path = body.get("audio_path") if ui_mode == "a2v" else None
+    video_path = body.get("video_path") if ui_mode in ("retake", "extend") else None
     load_image_payload, load_media_payload = _import_videofentanyl()[5:7]
 
     image_payload = load_image_payload(image_path) if image_path else None
@@ -604,11 +718,11 @@ def _cleanup_temp_video(path: str | None) -> None:
         return
     try:
         p = Path(path)
-        p.unlink(missing_ok=True)
-        try:
-            p.parent.rmdir()
-        except OSError:
-            pass
+        if p.is_file():
+            p.unlink(missing_ok=True)
+        parent = p.parent
+        if parent.is_dir() and parent.name.startswith(("fv_", "fvserver_work_")):
+            shutil.rmtree(parent, ignore_errors=True)
     except OSError:
         pass
 
@@ -1320,6 +1434,9 @@ async def _worker_loop(state: AppState) -> None:
                     "chain_id": state.runs.get(run_id).chain_id if state.runs.get(run_id) else None,
                 },
             )
+            gen_body = _RUN_BODIES.pop(run_id, {})
+            if gen_body:
+                _cleanup_run_uploads(state, gen_body)
 
 
 def create_app(
@@ -1387,9 +1504,10 @@ def create_app(
         if http_url:
             state.http_url = http_url
         local = scan_local_models()
-        models = KNOWN_MODELS + local
+        models = local + KNOWN_MODELS
         ok = await _is_connected(request)
         lora_presets, default_lora_preset_id = _lora_catalog()
+        default_model = default_model_preference(local, "auto")
         model_note = (
             "MLX weights only (dgrauet/ltx-2.3-mlx*). "
             "Restart server.py with --model when changing model."
@@ -1406,6 +1524,7 @@ def create_app(
             "web_url": state.http_url,
             "active_model": state.active_model,
             "preferred_model": state.preferred_model,
+            "default_model": default_model,
             "models": models,
             "resolution_presets": RESOLUTION_PRESETS,
             "duration_presets": DURATION_PRESETS,
@@ -1433,7 +1552,7 @@ def create_app(
     @app.post("/api/config/model")
     async def set_model(body: dict[str, Any]):
         model = str(body.get("model") or "auto").strip()
-        state.preferred_model = model
+        state.persist_preferred_model(model)
         if state.embedded:
             return {
                 "preferred_model": state.preferred_model,
@@ -1451,7 +1570,7 @@ def create_app(
                 sys.executable,
                 str(REPO_ROOT / "server.py"),
                 "--model",
-                model,
+                state.preferred_model,
                 "--host",
                 "127.0.0.1",
                 "--port",
@@ -1690,10 +1809,24 @@ def create_app(
 
     @app.get("/api/videos/{filename}")
     async def serve_video(filename: str):
+        from starlette.background import BackgroundTask
+
         path = state.output_dir / filename
         if not path.is_file():
             raise HTTPException(404, "Video not found")
-        return FileResponse(path, media_type="video/mp4", filename=filename)
+
+        def _unlink_after_stream() -> None:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                log.warning("Could not delete streamed video %s: %s", path, exc)
+
+        return FileResponse(
+            path,
+            media_type="video/mp4",
+            filename=filename,
+            background=BackgroundTask(_unlink_after_stream),
+        )
 
     if ws_handler is not None:
         @app.websocket("/ws")
@@ -1747,23 +1880,6 @@ def run_standalone() -> None:
     parser.add_argument("--spawn-server", action="store_true")
     args = parser.parse_args()
 
-    server_proc = None
-    if args.spawn_server:
-        server_proc = subprocess.Popen(
-            [
-                sys.executable,
-                str(REPO_ROOT / "server.py"),
-                "--model",
-                args.model,
-                "--web-ui",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                "8765",
-            ],
-            cwd=str(REPO_ROOT),
-        )
-
     ws_url = args.server_url
     http_url = f"http://{public_host(args.host)}:{args.port}/"
     state = AppState(
@@ -1772,8 +1888,25 @@ def run_standalone() -> None:
         upload_dir=args.upload_dir.resolve(),
         preferred_model=args.model,
         http_url=http_url,
-        server_process=server_proc,
     )
+    state.apply_saved_settings()
+    server_proc = None
+    if args.spawn_server:
+        server_proc = subprocess.Popen(
+            [
+                sys.executable,
+                str(REPO_ROOT / "server.py"),
+                "--model",
+                state.preferred_model,
+                "--web-ui",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "8765",
+            ],
+            cwd=str(REPO_ROOT),
+        )
+    state.server_process = server_proc
     app = create_app(state)
     import uvicorn
 

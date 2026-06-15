@@ -524,8 +524,36 @@ def _decode_weighted_media_inputs(
 
 
 def _apply_pending_loras(pipe: Any, lora_paths: list[tuple[str, float]] | None) -> None:
-    if lora_paths:
-        pipe._pending_loras = list(lora_paths)
+    if hasattr(pipe, "_pending_loras"):
+        pipe._pending_loras = list(lora_paths or [])
+
+
+def _release_pipe_after_generation(pipe: Any) -> None:
+    """Drop per-request conditioning state so cached pipeline instances do not leak prior inputs."""
+    if hasattr(pipe, "_pending_loras"):
+        pipe._pending_loras = []
+    conditioner = getattr(pipe, "image_conditioner", None)
+    if conditioner is not None and hasattr(conditioner, "free"):
+        try:
+            conditioner.free()
+        except Exception:
+            pass
+
+
+def _unlink_fvserver_temp(path: str | None, marker: str) -> None:
+    if path and os.path.isfile(path) and marker in path:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def _export_output_mp4(source_path: str) -> str:
+    """Copy generation output to a standalone temp file (outside per-job workdirs)."""
+    fd, final_path = tempfile.mkstemp(prefix="fvserver_out_", suffix=".mp4")
+    os.close(fd)
+    shutil.copy2(source_path, final_path)
+    return final_path
 
 
 def _frame_rate_from_kwargs(kwargs: dict[str, Any], default: float) -> float:
@@ -1232,10 +1260,11 @@ class LocalVideoGenerator:
         tmp_video: str | None = None
         tmp_video_conditioning_cleanup: list[str] = []
         tmp_lora_cleanup: list[str] = []
-        prefix = f"fv_{req.job_id[:8]}_" if req.job_id else "fvserver_out_"
+        prefix = f"fv_{req.job_id[:8]}_" if req.job_id else "fvserver_work_"
         tmpdir = tempfile.mkdtemp(prefix=prefix)
         out_path = os.path.join(tmpdir, "output.mp4")
-        retained_tmpdir = False
+        last_pipe: Any | None = None
+        media_cleanups: list[str] = []
 
         try:
             tmp_image, tmp_image_cleanup = _decode_media_input(
@@ -1262,6 +1291,15 @@ class LocalVideoGenerator:
                 default_suffix=".mp4",
             )
             tmp_video_conditioning_cleanup = vc_cleanup
+            for path, cleanup, marker in (
+                (tmp_image, tmp_image_cleanup, "fvserver_img_"),
+                (tmp_audio, tmp_audio_cleanup, "fvserver_audio_"),
+                (tmp_video, tmp_video_cleanup, "fvserver_video_"),
+            ):
+                if cleanup:
+                    media_cleanups.append(cleanup)
+                elif path and marker in path:
+                    media_cleanups.append(path)
             if self._resolved_default_loras is not None and not req.lora_specs:
                 resolved_loras = list(self._resolved_default_loras)
             else:
@@ -1330,6 +1368,7 @@ class LocalVideoGenerator:
                             )
                             silent_path = os.path.join(tmpdir, "output_silent.mp4")
                             pipe = self._get_pipe("i2v")
+                            last_pipe = pipe
                             _invoke_generate_and_save(
                                 pipe,
                                 **common_gen_kwargs,
@@ -1344,6 +1383,7 @@ class LocalVideoGenerator:
                             )
                         else:
                             pipe = self._get_pipe("a2v")
+                            last_pipe = pipe
                             _invoke_generate_and_save(
                                 pipe,
                                 **common_gen_kwargs,
@@ -1356,6 +1396,7 @@ class LocalVideoGenerator:
                         start_frame = int(req.retake_start if req.retake_start is not None else 1)
                         end_frame = int(req.retake_end if req.retake_end is not None else start_frame)
                         pipe = self._get_pipe("retake")
+                        last_pipe = pipe
                         if hasattr(pipe, "generate_and_save"):
                             _invoke_generate_and_save(
                                 pipe,
@@ -1384,6 +1425,7 @@ class LocalVideoGenerator:
                         ext_frames = int(req.extend_frames if req.extend_frames is not None else 2)
                         direction = (req.extend_direction or "after").strip().lower()
                         pipe = self._get_pipe("extend")
+                        last_pipe = pipe
                         if hasattr(pipe, "generate_and_save"):
                             _invoke_generate_and_save(
                                 pipe,
@@ -1417,6 +1459,7 @@ class LocalVideoGenerator:
                                 "lora_paths": [(str(p), float(s)) for p, s in resolved_loras],
                             },
                         )
+                        last_pipe = pipe
                         _invoke_generate_and_save(
                             pipe,
                             prompt=req.prompt,
@@ -1451,6 +1494,7 @@ class LocalVideoGenerator:
                             )
                         # Separate i2v instance (88e6872): do not reuse the t2v pipe cache entry.
                         pipe = self._get_pipe("i2v")
+                        last_pipe = pipe
                         _invoke_generate_and_save(
                             pipe,
                             **common_gen_kwargs,
@@ -1458,6 +1502,7 @@ class LocalVideoGenerator:
                         )
                     else:
                         pipe = self._get_pipe("t2v")
+                        last_pipe = pipe
                         if self.upscale and "spatial_upscaler" in self._pipe_classes:
                             base_h, base_w = self._calculate_stage1_dimensions(height, width)
                             lowres_out_path = os.path.join(tmpdir, "output_lowres.mp4")
@@ -1510,31 +1555,15 @@ class LocalVideoGenerator:
                 raise RuntimeError(
                     f"Generation completed but output file not found: {video_path}"
                 )
-            retained_tmpdir = True
-            return video_path
+            if last_pipe is not None:
+                _release_pipe_after_generation(last_pipe)
+            return _export_output_mp4(video_path)
 
         finally:
-            for tmp, marker in (
-                (tmp_image, "fvserver_img_"),
-                (tmp_audio, "fvserver_audio_"),
-                (tmp_video, "fvserver_video_"),
-            ):
-                if tmp and os.path.isfile(tmp) and marker in tmp:
-                    try:
-                        os.unlink(tmp)
-                    except OSError:
-                        pass
+            for tmp in media_cleanups:
+                _unlink_fvserver_temp(tmp, "fvserver_")
             for tmp in tmp_video_conditioning_cleanup:
-                if tmp and os.path.isfile(tmp) and "fvserver_vcond_" in tmp:
-                    try:
-                        os.unlink(tmp)
-                    except OSError:
-                        pass
+                _unlink_fvserver_temp(tmp, "fvserver_vcond_")
             for tmp in tmp_lora_cleanup:
-                if tmp and os.path.isfile(tmp) and "fvserver_lora_" in tmp:
-                    try:
-                        os.unlink(tmp)
-                    except OSError:
-                        pass
-            if not retained_tmpdir:
-                shutil.rmtree(tmpdir, ignore_errors=True)
+                _unlink_fvserver_temp(tmp, "fvserver_lora_")
+            shutil.rmtree(tmpdir, ignore_errors=True)
