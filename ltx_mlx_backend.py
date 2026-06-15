@@ -714,12 +714,17 @@ def _decode_latents_to_mp4(
         except ImportError:
             pass
     pipe._load_decoders()
-    pipe._decode_and_save_video(
-        video_latent,
-        audio_latent,
-        output_path,
-        frame_rate=frame_rate,
-    )
+    fn = getattr(pipe, "_decode_and_save_video", None)
+    if fn is None:
+        raise RuntimeError(f"{type(pipe).__name__} has no _decode_and_save_video()")
+    sig = inspect.signature(fn)
+    accepted = set(sig.parameters.keys())
+    decode_kwargs: dict[str, Any] = {}
+    if "frame_rate" in accepted:
+        decode_kwargs["frame_rate"] = float(frame_rate)
+    elif "fps" in accepted:
+        decode_kwargs["fps"] = float(frame_rate)
+    fn(video_latent, audio_latent, output_path, **decode_kwargs)
 
 
 def _filter_call_kwargs(fn: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
