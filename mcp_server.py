@@ -18,6 +18,9 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from videofentanyl import (
+    CHAIN_METHOD_AUTOCONTINUE,
+    CHAIN_METHOD_NATIVE_EXTEND,
+    VALID_CHAIN_METHODS,
     GenerationParams,
     Job,
     JobStatus,
@@ -27,6 +30,7 @@ from videofentanyl import (
     load_media_payload,
     sanitize_filename,
     try_autoconcat_clips,
+    try_finalize_native_extend_chain,
 )
 
 DEFAULT_SERVER_URL = "ws://127.0.0.1:8765/ws"
@@ -51,7 +55,7 @@ def _new_output_path(prompt: str, output_dir: Path, prefix: str) -> Path:
 
 def _normalize_mode(mode: str) -> str:
     val = (mode or "generate").strip().lower()
-    allowed = {"generate", "a2v", "retake", "extend", "ic_lora"}
+    allowed = {"generate", "a2v", "retake", "extend", "ic_lora", "keyframe", "lipdub"}
     if val not in allowed:
         raise ValueError(f"Unsupported mode {mode!r}; expected one of {sorted(allowed)}")
     return val
@@ -75,10 +79,19 @@ def _build_params(
     extend_direction: str | None,
     lora_specs: list[list[Any]] | None,
     video_conditioning: list[list[Any]] | None,
+    end_image: str | None = None,
+    enhance_prompt: bool = False,
+    pipeline_profile: str = "distilled",
+    cfg_scale: float | None = None,
+    stg_scale: float | None = None,
+    stage2_steps: int | None = None,
+    no_regen_audio: bool = False,
+    reference_strength: float | None = None,
 ) -> GenerationParams:
     normalized_mode = _normalize_mode(mode)
 
     image_payload = load_image_payload(image) if image else None
+    end_image_payload = load_image_payload(end_image) if end_image else None
     audio_payload = load_media_payload(audio, kind="audio") if audio else None
     video_payload = load_media_payload(video, kind="video") if video else None
 
@@ -103,6 +116,7 @@ def _build_params(
         auto_extension_enabled=False,
         loop_generation_enabled=False,
         initial_image=image_payload,
+        end_image=end_image_payload,
         seed=seed,
         num_frames=num_frames,
         height=height,
@@ -117,6 +131,13 @@ def _build_params(
         extend_direction=extend_direction,
         lora_specs=parsed_loras,
         video_conditioning_specs=parsed_vcond,
+        enhance_prompt=enhance_prompt,
+        pipeline_profile=pipeline_profile,
+        cfg_scale=cfg_scale,
+        stg_scale=stg_scale,
+        stage2_steps=stage2_steps,
+        no_regen_audio=no_regen_audio,
+        reference_strength=reference_strength,
     )
 
 
@@ -221,6 +242,14 @@ async def ltx_generate_video(
     extend_direction: str | None = None,
     lora_specs: list[list[Any]] | None = None,
     video_conditioning: list[list[Any]] | None = None,
+    end_image: str | None = None,
+    enhance_prompt: bool = False,
+    pipeline_profile: str = "distilled",
+    cfg_scale: float | None = None,
+    stg_scale: float | None = None,
+    stage2_steps: int | None = None,
+    no_regen_audio: bool = False,
+    reference_strength: float | None = None,
     output_filename: str | None = None,
 ) -> dict[str, Any]:
     """
@@ -246,6 +275,14 @@ async def ltx_generate_video(
             raise ValueError("mode=ic_lora requires lora_specs")
         if not video_conditioning:
             raise ValueError("mode=ic_lora requires video_conditioning")
+    if mode == "keyframe":
+        if not image or not end_image:
+            raise ValueError("mode=keyframe requires image and end_image")
+    if mode == "lipdub":
+        if not video:
+            raise ValueError("mode=lipdub requires video (reference video)")
+        if not lora_specs or len(lora_specs) != 1:
+            raise ValueError("mode=lipdub requires exactly one lora_specs entry")
 
     params = _build_params(
         prompt=prompt,
@@ -264,6 +301,14 @@ async def ltx_generate_video(
         extend_direction=extend_direction,
         lora_specs=lora_specs,
         video_conditioning=video_conditioning,
+        end_image=end_image,
+        enhance_prompt=enhance_prompt,
+        pipeline_profile=pipeline_profile,
+        cfg_scale=cfg_scale,
+        stg_scale=stg_scale,
+        stage2_steps=stage2_steps,
+        no_regen_audio=no_regen_audio,
+        reference_strength=reference_strength,
     )
 
     _OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -294,6 +339,7 @@ async def ltx_generate_sequence(
     prompts: list[str],
     mode: str = "generate",
     autocontinue: bool = True,
+    chain_method: str = CHAIN_METHOD_AUTOCONTINUE,
     autoconcat: bool = False,
     image: str | None = None,
     audio: str | None = None,
@@ -309,10 +355,19 @@ async def ltx_generate_sequence(
     extend_direction: str | None = None,
     lora_specs: list[list[Any]] | None = None,
     video_conditioning: list[list[Any]] | None = None,
+    end_image: str | None = None,
+    enhance_prompt: bool = False,
+    pipeline_profile: str = "distilled",
+    cfg_scale: float | None = None,
+    stg_scale: float | None = None,
+    stage2_steps: int | None = None,
+    no_regen_audio: bool = False,
+    reference_strength: float | None = None,
     output_prefix: str = DEFAULT_PREFIX,
 ) -> dict[str, Any]:
     """
-    Generate multiple clips sequentially and optionally chain them via autocontinue.
+    Generate multiple clips sequentially. Chain clip 2+ via autocontinue (last frame)
+    or native_extend (ltx-2-mlx extend_from_video on the prior MP4).
     """
     clean_prompts = [p.strip() for p in prompts if isinstance(p, str) and p.strip()]
     if not clean_prompts:
@@ -336,6 +391,17 @@ async def ltx_generate_sequence(
             raise ValueError("mode=ic_lora requires lora_specs")
         if not video_conditioning:
             raise ValueError("mode=ic_lora requires video_conditioning")
+
+    method = (chain_method or CHAIN_METHOD_AUTOCONTINUE).strip().lower()
+    if method not in VALID_CHAIN_METHODS:
+        method = CHAIN_METHOD_AUTOCONTINUE
+    if method == CHAIN_METHOD_NATIVE_EXTEND:
+        if not autocontinue:
+            raise ValueError("chain_method=native_extend requires autocontinue=true")
+        if normalized_mode != "generate" and not image:
+            raise ValueError(
+                "chain_method=native_extend supports mode=generate (optionally with image on clip 1)"
+            )
 
     image_payload = load_image_payload(image) if image else None
     audio_payload = load_media_payload(audio, kind="audio") if audio else None
@@ -413,20 +479,54 @@ async def ltx_generate_sequence(
             )
 
             if autocontinue and idx + 1 < len(jobs):
-                next_frame = extract_last_frame(job.output_path)
-                if not next_frame:
-                    raise RuntimeError(f"autocontinue failed to extract last frame from clip {idx + 1}")
-                jobs[idx + 1].params.initial_image = next_frame
+                nxt = jobs[idx + 1].params
+                if method == CHAIN_METHOD_NATIVE_EXTEND:
+                    nxt.generation_mode = "extend"
+                    nxt.initial_image = None
+                    nxt.source_video = load_media_payload(
+                        str(job.output_path),
+                        kind="video",
+                    )
+                    if nxt.extend_frames is None:
+                        from videofentanyl import (
+                            extend_latent_frames_for_video,
+                            resolve_extend_latent_frames,
+                        )
+
+                        probed = extend_latent_frames_for_video(job.output_path)
+                        if probed is not None:
+                            nxt.extend_frames = probed
+                        else:
+                            nf = nxt.num_frames if nxt.num_frames is not None else jobs[idx].params.num_frames
+                            nxt.extend_frames = resolve_extend_latent_frames(num_frames=nf)
+                    if not nxt.extend_direction:
+                        nxt.extend_direction = extend_direction or "after"
+                    nxt.seed = int(time.time_ns() % (2**31 - 1)) or 1
+                else:
+                    next_frame = extract_last_frame(job.output_path)
+                    if not next_frame:
+                        raise RuntimeError(
+                            f"autocontinue failed to extract last frame from clip {idx + 1}"
+                        )
+                    nxt.initial_image = next_frame
         if autoconcat:
-            # Reuse existing ffmpeg concat helper.
-            await asyncio.to_thread(
-                try_autoconcat_clips,
-                jobs,
-                output_prefix,
-                "mp4",
-                _VERBOSE,
-                False,
-            )
+            if method == CHAIN_METHOD_NATIVE_EXTEND:
+                await asyncio.to_thread(
+                    try_finalize_native_extend_chain,
+                    jobs,
+                    output_prefix,
+                    "mp4",
+                    _VERBOSE,
+                )
+            else:
+                await asyncio.to_thread(
+                    try_autoconcat_clips,
+                    jobs,
+                    output_prefix,
+                    "mp4",
+                    _VERBOSE,
+                    False,
+                )
             merged_candidates = sorted(_OUTPUT_DIR.glob(f"{output_prefix}_merged_*.mp4"))
             merged_path = str(merged_candidates[-1].resolve()) if merged_candidates else None
         else:
@@ -439,6 +539,7 @@ async def ltx_generate_sequence(
         "server": _SERVER_URL,
         "count": len(results),
         "autocontinue": bool(autocontinue),
+        "chain_method": method,
         "autoconcat": bool(autoconcat),
         "merged_output_path": merged_path,
         "total_elapsed_s": round(time.time() - started, 3),

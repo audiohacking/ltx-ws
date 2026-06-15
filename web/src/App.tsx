@@ -1,11 +1,24 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { snapshotFromClip } from "./clipEditor";
+import { clipDisplayPrompt, snapshotFromClip } from "./clipEditor";
 import { applyProgressEvent } from "./progress";
-import type { Clip, Config, ProgressState } from "./types";
+import type { Clip, Config, LoraPreset, ProgressState } from "./types";
 
 const API = "";
 const MODEL_PREF_KEY = "ltx-ws-preferred-model";
+const LORA_SEL_KEY = "ltx-ws-lora-preset-ids";
 const BLOB_VIDEO_PREFIX = "blob:";
+
+type LoraActivity =
+  | { phase: "idle" }
+  | {
+      phase: "working";
+      label: string;
+      index: number;
+      total: number;
+      downloading: boolean;
+    }
+  | { phase: "ready"; message: string }
+  | { phase: "error"; message: string };
 
 async function cacheVideoAsBlobUrl(serverUrl: string): Promise<string> {
   const res = await fetch(serverUrl);
@@ -86,6 +99,136 @@ function pickPlaybackClip(clips: Clip[], chainId: string): string | null {
   return merged?.id ?? current?.id ?? latest?.id ?? null;
 }
 
+function ChainMethodPicker({
+  chainMethod,
+  onChange,
+  className,
+}: {
+  chainMethod: string;
+  onChange: (method: string) => void;
+  className?: string;
+}) {
+  return (
+    <div className={`chain-method-panel${className ? ` ${className}` : ""}`}>
+      <span className="chain-method-label">Chain</span>
+      <div className="chain-method-radios">
+        <label className="check chain-method-option">
+          <input
+            type="radio"
+            name="chainMethod"
+            value="autocontinue"
+            checked={chainMethod === "autocontinue"}
+            onChange={() => onChange("autocontinue")}
+          />
+          Autocontinue
+        </label>
+        <label className="check chain-method-option">
+          <input
+            type="radio"
+            name="chainMethod"
+            value="native_extend"
+            checked={chainMethod === "native_extend"}
+            onChange={() => onChange("native_extend")}
+          />
+          Extend video
+        </label>
+      </div>
+    </div>
+  );
+}
+
+function loraSelectionSummary(presets: LoraPreset[], selectedIds: string[]) {
+  const selected = presets.filter((p) => selectedIds.includes(p.id));
+  if (selected.length === 0) return "None";
+  if (selected.length === 1) {
+    const raw = selected[0].label.replace(/\s*\(default\)\s*$/i, "").trim();
+    return raw.length > 20 ? `${raw.slice(0, 19)}…` : raw;
+  }
+  return `${selected.length} LoRAs`;
+}
+
+function loraSelectionTitle(presets: LoraPreset[], selectedIds: string[]) {
+  const selected = presets.filter((p) => selectedIds.includes(p.id));
+  if (!selected.length) return "No LoRA selected";
+  return selected.map((p) => p.label).join(", ");
+}
+
+function LoraMultiSelect({
+  presets,
+  selectedIds,
+  disabled,
+  onToggle,
+  onRemoveCustom,
+}: {
+  presets: LoraPreset[];
+  selectedIds: string[];
+  disabled?: boolean;
+  onToggle: (id: string, checked: boolean) => void;
+  onRemoveCustom: (id: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e: MouseEvent) => {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [open]);
+
+  const summary = loraSelectionSummary(presets, selectedIds);
+  const title = loraSelectionTitle(presets, selectedIds);
+
+  return (
+    <div className={`multi-select${open ? " is-open" : ""}`} ref={rootRef}>
+      <button
+        type="button"
+        className="multi-select-trigger"
+        disabled={disabled}
+        aria-expanded={open}
+        title={title}
+        onClick={() => setOpen((v) => !v)}
+      >
+        <span className="multi-select-trigger-text">{summary}</span>
+      </button>
+      {open && (
+        <div className="multi-select-menu" role="listbox" aria-label="LoRA presets">
+          {presets.map((p) => (
+            <label key={p.id} className="multi-select-item">
+              <input
+                type="checkbox"
+                checked={selectedIds.includes(p.id)}
+                disabled={disabled}
+                onChange={(e) => onToggle(p.id, e.target.checked)}
+              />
+              <span className="multi-select-item-label">{p.label}</span>
+              {p.custom ? (
+                <button
+                  type="button"
+                  className="lora-remove"
+                  title="Remove"
+                  disabled={disabled}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    onRemoveCustom(p.id);
+                  }}
+                >
+                  ×
+                </button>
+              ) : null}
+            </label>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function App() {
   const [config, setConfig] = useState<Config | null>(null);
   const [clips, setClips] = useState<Clip[]>([]);
@@ -93,6 +236,7 @@ export default function App() {
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
   const [prompt, setPrompt] = useState("");
   const [busy, setBusy] = useState(false);
+  const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [progress, setProgress] = useState<ProgressState | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -107,29 +251,50 @@ export default function App() {
   const [autocontinue, setAutocontinue] = useState(true);
   const [autoconcat, setAutoconcat] = useState(false);
   const [audiocontinue, setAudiocontinue] = useState(false);
+  const [chainMethod, setChainMethod] = useState("autocontinue");
+  const [enhancePrompt, setEnhancePrompt] = useState(false);
+  const [pipelineProfile, setPipelineProfile] = useState("distilled");
   const [imagePath, setImagePath] = useState<string | null>(null);
   const [imageName, setImageName] = useState<string | null>(null);
+  const [endImagePath, setEndImagePath] = useState<string | null>(null);
+  const [endImageName, setEndImageName] = useState<string | null>(null);
   const [audioPath, setAudioPath] = useState<string | null>(null);
   const [audioName, setAudioName] = useState<string | null>(null);
   const [videoPath, setVideoPath] = useState<string | null>(null);
+  const [sourceClipId, setSourceClipId] = useState<string | null>(null);
   const [retakeStart, setRetakeStart] = useState(1);
   const [retakeEnd, setRetakeEnd] = useState(1);
   const [extendFrames, setExtendFrames] = useState(2);
   const [extendDirection, setExtendDirection] = useState("after");
   const [showOptions, setShowOptions] = useState(true);
-  const [loraPresetId, setLoraPresetId] = useState("default");
-  const [loraStatus, setLoraStatus] = useState<string | null>(null);
+  const [loraPresetIds, setLoraPresetIds] = useState<string[]>([]);
+  const [loraActivity, setLoraActivity] = useState<LoraActivity>({ phase: "idle" });
+  const [loraBusy, setLoraBusy] = useState(false);
+  const [customLoraUrl, setCustomLoraUrl] = useState("");
+  const [customLoraLabel, setCustomLoraLabel] = useState("");
+  const [customLoraScale, setCustomLoraScale] = useState("1.0");
+  const [addingCustomLora, setAddingCustomLora] = useState(false);
 
   const imageRef = useRef<HTMLInputElement>(null);
+  const endImageRef = useRef<HTMLInputElement>(null);
   const audioRef = useRef<HTMLInputElement>(null);
   const videoRef = useRef<HTMLInputElement>(null);
+  const ensuredLoraSpecsRef = useRef<Set<string>>(new Set());
+  const loraPresetsRef = useRef<LoraPreset[]>([]);
 
   const libraryClips = useMemo(() => {
     return clips
-      .filter((c) => c.status === "done" && c.video_url)
+      .filter((c) => c.status === "done" && (c.video_url || c.filename))
       .sort((a, b) => b.created_at.localeCompare(a.created_at))
       .slice(0, 48);
   }, [clips]);
+
+  const videoLibraryClips = useMemo(
+    () => libraryClips.filter((c) => c.filename),
+    [libraryClips],
+  );
+
+  const hasVideoSource = Boolean(videoPath || sourceClipId);
 
   const chainParts = useMemo(() => {
     if (!chainId || !selectedClipId) return [];
@@ -145,61 +310,232 @@ export default function App() {
     return clips.find((x) => x.id === selectedClipId) ?? null;
   }, [clips, selectedClipId]);
 
+  const ensureLoraPresets = useCallback(async (
+    presetIds: string[],
+    presetsOverride?: LoraPreset[],
+  ) => {
+    const presets = presetsOverride ?? loraPresetsRef.current;
+    const selected = presetIds
+      .map((id) => presets.find((p) => p.id === id))
+      .filter((p): p is NonNullable<typeof p> => Boolean(p?.spec));
+    if (!selected.length) {
+      setLoraActivity({ phase: "idle" });
+      return;
+    }
+
+    const pending = selected.filter((p) => !ensuredLoraSpecsRef.current.has(p.spec));
+    if (!pending.length) {
+      setLoraActivity({
+        phase: "ready",
+        message: `${selected.length} LoRA(s) ready`,
+      });
+      return;
+    }
+
+    setLoraBusy(true);
+    try {
+      for (let i = 0; i < pending.length; i++) {
+        const preset = pending[i];
+        setLoraActivity({
+          phase: "working",
+          label: preset.label,
+          index: i + 1,
+          total: pending.length,
+          downloading: true,
+        });
+        const r = await fetch(`${API}/api/loras/ensure`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ spec: preset.spec }),
+        });
+        if (!r.ok) {
+          const err = await r.json().catch(() => ({}));
+          throw new Error(err.detail || `LoRA download failed: ${preset.label}`);
+        }
+        const data = (await r.json()) as { cached?: boolean };
+        ensuredLoraSpecsRef.current.add(preset.spec);
+        if (data.cached) {
+          setLoraActivity({
+            phase: "working",
+            label: preset.label,
+            index: i + 1,
+            total: pending.length,
+            downloading: false,
+          });
+        }
+      }
+      setLoraActivity({
+        phase: "ready",
+        message: `${selected.length} LoRA(s) ready`,
+      });
+    } catch (e) {
+      setLoraActivity({ phase: "error", message: String(e) });
+    } finally {
+      setLoraBusy(false);
+    }
+  }, []);
+
   const load = useCallback(async () => {
     try {
       const cfg = await fetchConfig();
       setConfig(cfg);
-      const preferred =
+      loraPresetsRef.current = cfg.lora_presets ?? [];
+      const preferredModel =
         cfg.preferred_model ||
         localStorage.getItem(MODEL_PREF_KEY) ||
         cfg.default_model ||
         "auto";
-      setModel(preferred);
-      localStorage.setItem(MODEL_PREF_KEY, preferred);
+      setModel(preferredModel);
+      localStorage.setItem(MODEL_PREF_KEY, preferredModel);
       setNumSteps(cfg.defaults.num_steps);
-      if (cfg.default_lora_preset_id) {
-        setLoraPresetId(cfg.default_lora_preset_id);
+      let loraIds: string[] = [];
+      try {
+        const stored = localStorage.getItem(LORA_SEL_KEY);
+        if (stored) {
+          const parsed = JSON.parse(stored) as unknown;
+          if (Array.isArray(parsed)) {
+            loraIds = parsed.map(String).filter(Boolean);
+          }
+        }
+      } catch {
+        /* ignore */
+      }
+      if (!loraIds.length) {
+        loraIds =
+          cfg.preferred_lora_preset_ids?.length
+            ? cfg.preferred_lora_preset_ids
+            : cfg.default_lora_preset_id && cfg.default_lora_preset_id !== "none"
+              ? [cfg.default_lora_preset_id]
+              : [];
+      }
+      setLoraPresetIds(loraIds);
+      if (loraIds.length) {
+        void ensureLoraPresets(loraIds, cfg.lora_presets);
+      } else {
+        setLoraActivity({ phase: "idle" });
       }
       const all = await fetchClips();
       setClips(all);
     } catch (e) {
       setError(String(e));
     }
-  }, []);
+  }, [ensureLoraPresets]);
 
-  const ensureLoraPreset = useCallback(async (presetId: string) => {
-    if (!presetId || presetId === "none") {
-      setLoraStatus(null);
-      return;
-    }
-    const preset = config?.lora_presets?.find((p) => p.id === presetId);
-    if (!preset?.spec) return;
-    setLoraStatus("Checking LoRA…");
+  const persistLoraSelection = useCallback(async (ids: string[]) => {
     try {
-      const r = await fetch(`${API}/api/loras/ensure`, {
+      localStorage.setItem(LORA_SEL_KEY, JSON.stringify(ids));
+    } catch {
+      /* ignore */
+    }
+    try {
+      await fetch(`${API}/api/config/loras`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ spec: preset.spec }),
+        body: JSON.stringify({ preset_ids: ids }),
+      });
+    } catch (err) {
+      console.warn("Could not persist LoRA selection", err);
+    }
+  }, []);
+
+  const toggleLoraPreset = useCallback(
+    (presetId: string, checked: boolean) => {
+      if (loraBusy) return;
+      setLoraPresetIds((prev) => {
+        const next = checked
+          ? [...prev.filter((id) => id !== presetId), presetId]
+          : prev.filter((id) => id !== presetId);
+        void persistLoraSelection(next);
+        void ensureLoraPresets(next);
+        return next;
+      });
+    },
+    [ensureLoraPresets, loraBusy, persistLoraSelection],
+  );
+
+  async function addCustomLora() {
+    const spec = customLoraUrl.trim();
+    if (!spec || addingCustomLora) return;
+    setAddingCustomLora(true);
+    setLoraActivity({
+      phase: "working",
+      label: customLoraLabel.trim() || "Custom LoRA",
+      index: 1,
+      total: 1,
+      downloading: true,
+    });
+    try {
+      const r = await fetch(`${API}/api/loras/custom`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          spec,
+          label: customLoraLabel.trim() || undefined,
+          scale: parseFloat(customLoraScale) || 1.0,
+        }),
       });
       if (!r.ok) {
         const err = await r.json().catch(() => ({}));
-        throw new Error(err.detail || "LoRA download failed");
+        throw new Error(err.detail || "Could not add custom LoRA");
       }
-      setLoraStatus("LoRA ready");
+      const data = await r.json();
+      const nextPresets = data.lora_presets ?? [];
+      loraPresetsRef.current = nextPresets;
+      setConfig((c) =>
+        c
+          ? {
+              ...c,
+              lora_presets: nextPresets,
+              preferred_lora_preset_ids:
+                data.preferred_lora_preset_ids ?? c.preferred_lora_preset_ids,
+            }
+          : c,
+      );
+      const ids: string[] = data.preferred_lora_preset_ids ?? [];
+      setLoraPresetIds(ids);
+      setCustomLoraUrl("");
+      setCustomLoraLabel("");
+      setCustomLoraScale("1.0");
+      if (data.id) {
+        await ensureLoraPresets([data.id], nextPresets);
+      }
     } catch (e) {
-      setLoraStatus(String(e));
+      setLoraActivity({ phase: "error", message: String(e) });
+    } finally {
+      setAddingCustomLora(false);
     }
-  }, [config?.lora_presets]);
+  }
+
+  async function removeCustomLora(presetId: string) {
+    if (!presetId.startsWith("custom_") || loraBusy) return;
+    try {
+      const r = await fetch(`${API}/api/loras/custom/${encodeURIComponent(presetId)}`, {
+        method: "DELETE",
+      });
+      if (!r.ok) throw new Error("Delete failed");
+      const data = await r.json();
+      const nextPresets = data.lora_presets ?? [];
+      loraPresetsRef.current = nextPresets;
+      setConfig((c) =>
+        c
+          ? {
+              ...c,
+              lora_presets: nextPresets,
+              preferred_lora_preset_ids:
+                data.preferred_lora_preset_ids ?? c.preferred_lora_preset_ids,
+            }
+          : c,
+      );
+      setLoraPresetIds(data.preferred_lora_preset_ids ?? []);
+      setLoraActivity({ phase: "idle" });
+    } catch (e) {
+      setLoraActivity({ phase: "error", message: String(e) });
+    }
+  }
 
   useEffect(() => {
     load();
   }, [load]);
-
-  useEffect(() => {
-    if (config?.default_lora_preset_id) {
-      ensureLoraPreset(config.default_lora_preset_id);
-    }
-  }, [config?.default_lora_preset_id, ensureLoraPreset]);
 
   useEffect(() => {
     if (clipMultiplier > 1) {
@@ -285,29 +621,42 @@ export default function App() {
   function clearAllMedia() {
     setImagePath(null);
     setImageName(null);
+    setEndImagePath(null);
+    setEndImageName(null);
     setAudioPath(null);
     setAudioName(null);
     setVideoPath(null);
+    setSourceClipId(null);
     if (imageRef.current) imageRef.current.value = "";
+    if (endImageRef.current) endImageRef.current.value = "";
     if (audioRef.current) audioRef.current.value = "";
     if (videoRef.current) videoRef.current.value = "";
   }
 
   function clearMediaForMode(nextMode: string) {
-    if (nextMode !== "i2v" && nextMode !== "generate" && nextMode !== "a2v") {
+    if (!["i2v", "generate", "a2v", "keyframe"].includes(nextMode)) {
       setImagePath(null);
       setImageName(null);
       if (imageRef.current) imageRef.current.value = "";
     }
-    if (nextMode !== "a2v") {
+    if (nextMode !== "keyframe") {
+      setEndImagePath(null);
+      setEndImageName(null);
+      if (endImageRef.current) endImageRef.current.value = "";
+    }
+    if (nextMode !== "a2v" && nextMode !== "lipdub") {
       setAudioPath(null);
       setAudioName(null);
       if (audioRef.current) audioRef.current.value = "";
       setAudiocontinue(false);
     }
-    if (nextMode !== "retake" && nextMode !== "extend") {
+    if (!["retake", "extend", "lipdub"].includes(nextMode)) {
       setVideoPath(null);
+      setSourceClipId(null);
       if (videoRef.current) videoRef.current.value = "";
+    }
+    if (nextMode === "a2v") {
+      setChainMethod("autocontinue");
     }
   }
 
@@ -324,7 +673,13 @@ export default function App() {
     setBusy(false);
     setProgress(null);
     setError(null);
-    setLoraPresetId(config?.default_lora_preset_id ?? "default");
+    setLoraPresetIds(
+      config?.preferred_lora_preset_ids?.length
+        ? config.preferred_lora_preset_ids
+        : config?.default_lora_preset_id && config.default_lora_preset_id !== "none"
+          ? [config.default_lora_preset_id]
+          : [],
+    );
     clearAllMedia();
     try {
       await fetch(`${API}/api/session/clear`, { method: "POST" });
@@ -333,13 +688,19 @@ export default function App() {
     }
   }
 
-  const needsImageUpload = mode === "i2v";
+  const needsImageUpload = mode === "i2v" || mode === "keyframe";
   const isA2v = mode === "a2v";
-  const needsVideoUpload = mode === "retake" || mode === "extend";
+  const needsEndImageUpload = mode === "keyframe";
+  const needsVideoUpload = mode === "retake" || mode === "extend" || mode === "lipdub";
   const showStartImageOptional = mode === "generate";
+  const isT2vLike = mode === "generate" || mode === "i2v";
+  const showChainMethodChoice =
+    isT2vLike && !audiocontinue && isMultiClip;
+  const chainMethodLabel =
+    chainMethod === "native_extend" ? "extend video" : "autocontinue";
   const showChainedImageHint =
     isA2v &&
-    (audiocontinue || autocontinue || isMultiClip) &&
+    (autocontinue || isMultiClip || audiocontinue) &&
     Boolean(imagePath);
 
   async function uploadFile(file: File, kind: string): Promise<string> {
@@ -404,7 +765,18 @@ export default function App() {
       });
   }
 
+  async function cancelActiveRun() {
+    if (!activeRunId) return;
+    try {
+      await fetch(`${API}/api/runs/${activeRunId}/cancel`, { method: "POST" });
+      setProgress({ phase: "cancelled", message: "Cancelling…" });
+    } catch (err) {
+      console.warn("Cancel request failed", err);
+    }
+  }
+
   async function subscribeRun(runId: string, runChainId: string) {
+    setActiveRunId(runId);
     let closed = false;
     let autoconcatRun = false;
     let audiocontinueRun = false;
@@ -415,6 +787,7 @@ export default function App() {
       if (closed) return;
       closed = true;
       es.close();
+      setActiveRunId(null);
       setBusy(false);
       setProgress(null);
       setChainId(runChainId);
@@ -454,14 +827,16 @@ export default function App() {
         const clipCount = Number(msg.clip_count ?? 0);
         streamFinalOnly =
           autoconcatRun || (Boolean(msg.autocontinue) && clipCount > 1);
+        const chainLabel =
+          msg.chain_method === "native_extend" ? "extend video" : "autocontinue";
         setProgress({
           phase: "queued",
           message: audiocontinueRun
             ? `Music video: ${msg.clip_count ?? "?"} clips (audiocontinue)…`
             : autoconcatRun
-              ? `Generating ${msg.clip_count ?? "?"} clips (autoconcat)…`
+              ? `Generating ${msg.clip_count ?? "?"} clips (${chainLabel} + autoconcat)…`
               : streamFinalOnly
-                ? `Generating ${msg.clip_count ?? "?"} clips (autocontinue)…`
+                ? `Generating ${msg.clip_count ?? "?"} clips (${chainLabel})…`
                 : "Generation queued…",
         });
       } else if (msg.type === "clip_started") {
@@ -587,11 +962,18 @@ export default function App() {
           setClips((prev) => replaceChainClips(prev, runChainId, chainClips));
           setSelectedClipId(pickPlaybackClip(chainClips, runChainId) ?? clipId ?? null);
         });
+      } else if (msg.type === "run_cancelled") {
+        setProgress({
+          phase: "cancelled",
+          message: String(msg.message || "Generation cancelled"),
+        });
+        finishRun();
       } else if (msg.type === "run_complete" || msg.type === "run_done") {
         finishRun();
       } else if (msg.type === "error" || msg.type === "clip_failed") {
         setError(msg.error || msg.message || "Failed");
         es.close();
+        setActiveRunId(null);
         setBusy(false);
       }
     };
@@ -613,41 +995,68 @@ export default function App() {
 
     const isChainEdit = editingChain && autocontinue;
 
+    const durationPreset = config?.duration_presets.find((d) => d.id === durationId);
+
     const body: Record<string, unknown> = {
       prompt: prompt.trim(),
       mode,
       width: resolution.width,
       height: resolution.height,
       duration_seconds: durationSeconds,
+      num_frames: durationPreset?.num_frames,
       clip_count: clipMultiplier,
       num_steps: numSteps,
       autocontinue: autocontinue || isMultiClip || audiocontinue,
       autoconcat: autoconcat || isMultiClip || audiocontinue,
       audiocontinue: audiocontinue && mode === "a2v",
+      chain_method: chainMethod,
+      enhance_prompt: enhancePrompt,
+      pipeline_profile: pipelineProfile,
       chain_id: isChainEdit ? chainId : undefined,
       continue_from: isChainEdit ? activeClip?.id : undefined,
-      retake_start: retakeStart,
-      retake_end: retakeEnd,
-      extend_frames: extendFrames,
-      extend_direction: extendDirection,
     };
+    if (mode === "retake") {
+      body.retake_start = retakeStart;
+      body.retake_end = retakeEnd;
+    }
+    if (mode === "extend") {
+      body.extend_frames = extendFrames;
+      body.extend_direction = extendDirection;
+    }
     if (
-      (mode === "i2v" || mode === "generate" || mode === "a2v") &&
+      (mode === "i2v" || mode === "generate" || mode === "a2v" || mode === "keyframe") &&
       imagePath
     ) {
       body.image_path = imagePath;
     }
-    if (mode === "a2v" && audioPath) {
+    if (mode === "keyframe" && endImagePath) {
+      body.end_image_path = endImagePath;
+    }
+    if ((mode === "a2v" || mode === "lipdub") && audioPath) {
       body.audio_path = audioPath;
     }
-    if ((mode === "retake" || mode === "extend") && videoPath) {
+    if ((mode === "retake" || mode === "extend" || mode === "lipdub") && sourceClipId) {
+      body.source_clip_id = sourceClipId;
+    } else if ((mode === "retake" || mode === "extend" || mode === "lipdub") && videoPath) {
       body.video_path = videoPath;
     }
-    if (seed.trim()) body.seed = parseInt(seed, 10);
+    if (seed.trim()) {
+      body.seed = parseInt(seed, 10);
+    } else {
+      body.seed = -1;
+    }
 
-    const loraPreset = config?.lora_presets?.find((p) => p.id === loraPresetId);
-    if (loraPreset?.spec) {
-      body.lora_specs = [[loraPreset.spec, loraPreset.scale]];
+    const selectedLoras = (config?.lora_presets ?? []).filter(
+      (p) => loraPresetIds.includes(p.id) && p.spec,
+    );
+    if (mode === "lipdub" && selectedLoras.length !== 1) {
+      setError("LipDub requires exactly one LoRA — select a single preset.");
+      setBusy(false);
+      setProgress(null);
+      return;
+    }
+    if (selectedLoras.length) {
+      body.lora_specs = selectedLoras.map((p) => [p.spec, p.scale]);
     }
 
     try {
@@ -696,7 +1105,9 @@ export default function App() {
     if (mode === "i2v" && !imagePath && !continuing) return false;
     if (mode === "a2v" && !audioPath) return false;
     if (audiocontinue && !config?.ffmpeg_available) return false;
-    if ((mode === "retake" || mode === "extend") && !videoPath) return false;
+    if ((mode === "retake" || mode === "extend" || mode === "lipdub") && !hasVideoSource) {
+      return false;
+    }
     return true;
   }, [
     prompt,
@@ -709,6 +1120,8 @@ export default function App() {
     clipMultiplier,
     config?.ffmpeg_available,
     videoPath,
+    sourceClipId,
+    hasVideoSource,
     autocontinue,
     activeClip,
     chainId,
@@ -763,7 +1176,18 @@ export default function App() {
                     <div className="progress-pulse" />
                   )}
                 </div>
-                <span>{progress?.message ?? "Working…"}</span>
+                <div className="progress-overlay-row">
+                  <span>{progress?.message ?? "Working…"}</span>
+                  {activeRunId && progress?.phase !== "cancelled" && (
+                    <button
+                      type="button"
+                      className="btn-cancel"
+                      onClick={() => void cancelActiveRun()}
+                    >
+                      Cancel
+                    </button>
+                  )}
+                </div>
               </div>
             )}
           </div>
@@ -857,8 +1281,8 @@ export default function App() {
                 {config.model_note}
               </p>
 
-              <div className="options-grid">
-                <label>
+              <div className="options-grid options-grid-compact">
+                <label className="opt-mode">
                   Mode
                   <select
                     value={mode}
@@ -873,7 +1297,7 @@ export default function App() {
                     ))}
                   </select>
                 </label>
-                <label>
+                <label className="opt-resolution">
                   Resolution
                   <select
                     value={resolutionId}
@@ -884,19 +1308,23 @@ export default function App() {
                     ))}
                   </select>
                 </label>
-                <label>
+                <label className="opt-narrow">
                   Duration
                   <select
                     value={durationId}
                     onChange={(e) => setDurationId(e.target.value)}
                   >
                     {config.duration_presets.map((d) => (
-                      <option key={d.id} value={d.id}>{d.label}</option>
+                      <option key={d.id} value={d.id} title={d.label}>
+                        {d.label.includes("(test)")
+                          ? `~${d.seconds}s*`
+                          : `~${d.seconds}s`}
+                      </option>
                     ))}
                   </select>
                 </label>
-                <label>
-                  Clips (× duration)
+                <label className="opt-narrow">
+                  Clips
                   <select
                     value={clipMultiplier}
                     onChange={(e) => setClipMultiplier(Number(e.target.value))}
@@ -911,22 +1339,7 @@ export default function App() {
                     ))}
                   </select>
                 </label>
-                <label>
-                  LoRA
-                  <select
-                    value={loraPresetId}
-                    onChange={(e) => {
-                      const id = e.target.value;
-                      setLoraPresetId(id);
-                      ensureLoraPreset(id);
-                    }}
-                  >
-                    {(config.lora_presets ?? []).map((p) => (
-                      <option key={p.id} value={p.id}>{p.label}</option>
-                    ))}
-                  </select>
-                </label>
-                <label>
+                <label className="opt-narrow">
                   Steps
                   <input
                     type="number"
@@ -936,7 +1349,7 @@ export default function App() {
                     onChange={(e) => setNumSteps(Number(e.target.value))}
                   />
                 </label>
-                <label>
+                <label className="opt-seed">
                   Seed
                   <input
                     type="text"
@@ -947,22 +1360,98 @@ export default function App() {
                 </label>
               </div>
 
-              {loraStatus && (
-                <p className="hint">{loraStatus}</p>
+              {(loraActivity.phase === "working" || loraActivity.phase === "error") && (
+                <div
+                  className={`lora-status-banner ${
+                    loraActivity.phase === "error" ? "error" : "working"
+                  }`}
+                  role="status"
+                  aria-live="polite"
+                >
+                  {loraActivity.phase === "working" && (
+                    <>
+                      <span className="lora-status-spinner" aria-hidden />
+                      <span>
+                        {loraActivity.downloading
+                          ? `Downloading: ${loraActivity.label}`
+                          : `Verifying: ${loraActivity.label}`}
+                        {loraActivity.total > 1
+                          ? ` (${loraActivity.index}/${loraActivity.total})`
+                          : ""}
+                      </span>
+                    </>
+                  )}
+                  {loraActivity.phase === "error" && (
+                    <span>{loraActivity.message}</span>
+                  )}
+                </div>
               )}
+
+              <div className="lora-row">
+                <label className="lora-row-select">
+                  LoRA
+                  <LoraMultiSelect
+                    presets={(config.lora_presets ?? []).filter((p) => p.id !== "none")}
+                    selectedIds={loraPresetIds}
+                    disabled={loraBusy || addingCustomLora}
+                    onToggle={(id, checked) => toggleLoraPreset(id, checked)}
+                    onRemoveCustom={(id) => void removeCustomLora(id)}
+                  />
+                </label>
+                <div className="lora-row-add">
+                  <input
+                    type="text"
+                    className="lora-add-url"
+                    placeholder="URL or path"
+                    aria-label="LoRA URL or file path"
+                    value={customLoraUrl}
+                    disabled={addingCustomLora}
+                    onChange={(e) => setCustomLoraUrl(e.target.value)}
+                  />
+                  <input
+                    type="text"
+                    className="lora-add-name"
+                    placeholder="Label"
+                    aria-label="LoRA display name"
+                    value={customLoraLabel}
+                    disabled={addingCustomLora}
+                    onChange={(e) => setCustomLoraLabel(e.target.value)}
+                  />
+                  <input
+                    type="number"
+                    className="lora-add-scale"
+                    min={0}
+                    max={2}
+                    step={0.05}
+                    aria-label="LoRA strength"
+                    title="Strength (0–2)"
+                    placeholder="1.0"
+                    value={customLoraScale}
+                    disabled={addingCustomLora}
+                    onChange={(e) => setCustomLoraScale(e.target.value)}
+                  />
+                  <button
+                    type="button"
+                    className="btn-secondary btn-compact lora-add-btn"
+                    disabled={!customLoraUrl.trim() || addingCustomLora || loraBusy}
+                    onClick={() => void addCustomLora()}
+                  >
+                    {addingCustomLora ? "…" : "Add"}
+                  </button>
+                </div>
+              </div>
 
               {isMultiClip && !audiocontinue && (
-                <p className="hint duration-total">
-                  ~{durationSeconds}s × {clipMultiplier} clips ≈ ~{totalDurationSeconds}s
-                  merged (autocontinue + autoconcat on)
+                <p className="hint hint-inline">
+                  ~{totalDurationSeconds}s total · {chainMethodLabel}
                 </p>
               )}
 
-              {audiocontinue && (
-                <p className="hint duration-total">
-                  Music video: splits audio into {clipMultiplier} segment(s) (~
-                  {durationSeconds}s each), autocontinue + autoconcat + compact merge
-                </p>
+              {showChainMethodChoice && (
+                <ChainMethodPicker
+                  chainMethod={chainMethod}
+                  onChange={setChainMethod}
+                />
               )}
 
               <div className="options-checks">
@@ -980,23 +1469,30 @@ export default function App() {
                       }}
                       disabled={!audioPath || !config?.ffmpeg_available}
                     />
-                    Audiocontinue (music video — split audio per clip)
+                    Audiocontinue
                   </label>
                 )}
                 {mode === "a2v" && !config?.ffmpeg_available && (
-                  <p className="hint">
-                    Audiocontinue requires ffmpeg on the server PATH.
-                  </p>
+                  <p className="hint hint-inline">Requires ffmpeg.</p>
                 )}
                 <label className="check">
                   <input
                     type="checkbox"
-                    checked={autocontinue}
-                    onChange={(e) => setAutocontinue(e.target.checked)}
-                    disabled={isMultiClip || audiocontinue}
+                    checked={enhancePrompt}
+                    onChange={(e) => setEnhancePrompt(e.target.checked)}
                   />
-                  Autocontinue (last frame → next clip)
+                  Enhance prompt
                 </label>
+                {!isMultiClip && !audiocontinue && (
+                  <label className="check">
+                    <input
+                      type="checkbox"
+                      checked={autocontinue}
+                      onChange={(e) => setAutocontinue(e.target.checked)}
+                    />
+                    Chain clips
+                  </label>
+                )}
                 <label className="check">
                   <input
                     type="checkbox"
@@ -1004,11 +1500,51 @@ export default function App() {
                     onChange={(e) => setAutoconcat(e.target.checked)}
                     disabled={isMultiClip || audiocontinue}
                   />
-                  Autoconcat (merge clips with ffmpeg)
+                  Autoconcat
+                </label>
+                <label className="opt-profile">
+                  Profile
+                  <select
+                    value={pipelineProfile}
+                    onChange={(e) => setPipelineProfile(e.target.value)}
+                  >
+                    {(config?.pipeline_profiles ?? [
+                      { id: "distilled", label: "Distilled" },
+                      { id: "two_stage", label: "Two-stage" },
+                      { id: "hq", label: "HQ" },
+                      { id: "one_stage", label: "One-stage" },
+                    ]).map((p) => (
+                      <option key={p.id} value={p.id}>{p.label}</option>
+                    ))}
+                  </select>
                 </label>
               </div>
 
-              {(isA2v || needsImageUpload || showStartImageOptional || needsVideoUpload) && (
+              {mode === "extend" && (
+                <div className="options-grid">
+                  <label>
+                    Extend frames (latent)
+                    <input
+                      type="number"
+                      min={1}
+                      value={extendFrames}
+                      onChange={(e) => setExtendFrames(Number(e.target.value))}
+                    />
+                  </label>
+                  <label>
+                    Direction
+                    <select
+                      value={extendDirection}
+                      onChange={(e) => setExtendDirection(e.target.value)}
+                    >
+                      <option value="after">After</option>
+                      <option value="before">Before</option>
+                    </select>
+                  </label>
+                </div>
+              )}
+
+              {(isA2v || needsImageUpload || showStartImageOptional || needsVideoUpload || needsEndImageUpload) && (
                 <div className="media-panel">
                   {isA2v && (
                     <>
@@ -1055,7 +1591,7 @@ export default function App() {
                           </span>
                         </label>
                       </div>
-                      {showChainedImageHint && (
+                      {showChainedImageHint && chainMethod === "autocontinue" && (
                         <p className="hint">
                           With autocontinue / audiocontinue, the start image is used for
                           clip 1 only; later clips use the last frame of the prior clip.
@@ -1088,28 +1624,88 @@ export default function App() {
                         {imageName ?? "Choose image file…"}
                       </span>
                     </label>
+                    {needsEndImageUpload && (
+                      <label className="media-upload">
+                        <span className="media-upload-label">End image (required)</span>
+                        <input
+                          ref={endImageRef}
+                          type="file"
+                          accept="image/*"
+                          onChange={async (e) => {
+                            const f = e.target.files?.[0];
+                            if (f) {
+                              setEndImagePath(await uploadFile(f, "image"));
+                              setEndImageName(f.name);
+                            }
+                          }}
+                        />
+                        <span className="media-upload-hint">
+                          {endImageName ?? "Choose end frame…"}
+                        </span>
+                      </label>
+                    )}
                     </>
                   )}
                   {needsVideoUpload && (
                     <>
                       {!isA2v && (
-                        <span className="media-panel-title">Source media</span>
+                        <span className="media-panel-title">Source video</span>
                       )}
                       <label className="media-upload">
-                        <span className="media-upload-label">Source video (required)</span>
+                        <span className="media-upload-label">Upload from disk</span>
                         <input
                           ref={videoRef}
                           type="file"
                           accept="video/*"
                           onChange={async (e) => {
                             const f = e.target.files?.[0];
-                            if (f) setVideoPath(await uploadFile(f, "video"));
+                            if (f) {
+                              setSourceClipId(null);
+                              setVideoPath(await uploadFile(f, "video"));
+                            }
                           }}
                         />
                         <span className="media-upload-hint">
-                          {videoPath ? "✓ uploaded" : "Choose video file…"}
+                          {videoPath ? "✓ file selected" : "Choose video file…"}
                         </span>
                       </label>
+                      {videoLibraryClips.length > 0 && (
+                        <label className="clip-source-picker">
+                          <span className="media-upload-label">Or from library</span>
+                          <select
+                            value={sourceClipId ?? ""}
+                            onChange={(e) => {
+                              const id = e.target.value || null;
+                              setSourceClipId(id);
+                              if (id) {
+                                setVideoPath(null);
+                                if (videoRef.current) videoRef.current.value = "";
+                              }
+                            }}
+                          >
+                            <option value="">Select a clip…</option>
+                            {videoLibraryClips.map((c) => {
+                              const label = clipDisplayPrompt(c.prompt);
+                              const meta = [
+                                c.label,
+                                c.width && c.height ? `${c.width}×${c.height}` : null,
+                              ]
+                                .filter(Boolean)
+                                .join(" · ");
+                              return (
+                                <option key={c.id} value={c.id}>
+                                  {meta ? `${label} (${meta})` : label}
+                                </option>
+                              );
+                            })}
+                          </select>
+                        </label>
+                      )}
+                      {hasVideoSource && (
+                        <p className="media-source-note">
+                          {sourceClipId ? "Using library clip as source video." : "Using uploaded file as source video."}
+                        </p>
+                      )}
                     </>
                   )}
                 </div>

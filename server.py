@@ -48,6 +48,7 @@ import mimetypes
 import os
 import re
 import shutil
+import signal
 import sys
 import subprocess
 import tempfile
@@ -372,6 +373,49 @@ def _resolve_audio_payload(msg: dict, session: dict) -> dict | str | None:
     return None
 
 
+def _resolve_end_image_payload(msg: dict, session: dict) -> dict | str | None:
+    keys = (
+        "end_image",
+        "endImage",
+        "end_frame",
+        "endFrame",
+        "target_image",
+        "targetImage",
+    )
+    for source in (msg, session):
+        for key in keys:
+            raw = source.get(key)
+            if isinstance(raw, dict) and raw:
+                return raw
+            if isinstance(raw, str) and raw.strip():
+                p = raw.strip()
+                if os.path.isfile(p) or p.startswith(("http://", "https://")):
+                    return p
+                return {"data_url": p, "mime_type": "image/jpeg"}
+    return None
+
+
+def _msg_bool(msg: dict, name: str, default: bool = False) -> bool:
+    raw = msg.get(name)
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+    return bool(raw)
+
+
+def _msg_float(msg: dict, name: str) -> float | None:
+    raw = msg.get(name)
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 def _resolve_source_video_payload(msg: dict, session: dict) -> dict | str | None:
     keys = (
         "source_video",
@@ -660,6 +704,7 @@ class RequestHandler:
 
         # Resolve initial image: prefer simple_generate, then session_init_v2.
         initial_image: dict | str | None = _resolve_initial_image_payload(msg, self._session)
+        end_image = _resolve_end_image_payload(msg, self._session)
         audio_input = _resolve_audio_payload(msg, self._session)
         source_video = _resolve_source_video_payload(msg, self._session)
         lora_specs = _resolve_lora_specs(msg, self._session)
@@ -675,7 +720,7 @@ class RequestHandler:
             except (TypeError, ValueError):
                 return default
 
-        gen_seed = _msg_int("seed", 1024)
+        gen_seed = _msg_int("seed", -1)
         gen_num_frames = _msg_int("num_frames", self.generator.num_frames)
         gen_height = _msg_int("height", self.generator.height)
         gen_width = _msg_int("width", self.generator.width)
@@ -693,6 +738,8 @@ class RequestHandler:
                 mode = "a2v"
             elif lora_specs and video_conditioning_specs:
                 mode = "ic_lora"
+            elif end_image and initial_image:
+                mode = "keyframe"
             else:
                 mode = "generate"
 
@@ -790,6 +837,20 @@ class RequestHandler:
                         a2v_visual_i2v_continue=bool(
                             msg.get("a2v_visual_i2v_continue", False)
                         ),
+                        end_image_data=end_image,
+                        enhance_prompt=_msg_bool(msg, "enhance_prompt"),
+                        pipeline_profile=str(
+                            msg.get("pipeline_profile") or "distilled"
+                        ),
+                        cfg_scale=_msg_float(msg, "cfg_scale"),
+                        stg_scale=_msg_float(msg, "stg_scale"),
+                        stage2_steps=(
+                            int(msg["stage2_steps"])
+                            if msg.get("stage2_steps") is not None
+                            else None
+                        ),
+                        no_regen_audio=_msg_bool(msg, "no_regen_audio"),
+                        reference_strength=_msg_float(msg, "reference_strength"),
                     )
                 )
                 try:
@@ -830,11 +891,18 @@ class RequestHandler:
                         )
                     video_path = await gen_task
                 except Exception as exc:
-                    log.error("Generation %s failed: %s", generation_id, exc)
+                    from ltx_mlx_backend import GenerationCancelledError
+
+                    if isinstance(exc, GenerationCancelledError):
+                        log.warning("Generation %s cancelled", generation_id)
+                        error_code = "cancelled"
+                    else:
+                        log.error("Generation %s failed: %s", generation_id, exc)
+                        error_code = "generation_failed"
                     try:
                         await self._send_json(
                             type="error",
-                            error_code="generation_failed",
+                            error_code=error_code,
                             message=str(exc),
                         )
                     except Exception:
@@ -920,6 +988,35 @@ class VideoServer:
         self.chunk_size  = chunk_size
         self.spill_dir    = spill_dir
         self.scheduler   = GenerationScheduler()
+        self._sigint_count: int = 0
+        self._sigint_last_ts: float = 0.0
+        self._shutdown = asyncio.Event()
+
+    def is_generation_active(self) -> bool:
+        return self.scheduler.running_generation_id is not None
+
+    def on_console_interrupt(self) -> None:
+        """Idle: graceful shutdown. During MLX work: cancel, then force-quit on repeat."""
+        if not self.is_generation_active():
+            log.info("Shutting down…")
+            self._shutdown.set()
+            return
+
+        now = time.monotonic()
+        if now - self._sigint_last_ts > 2.0:
+            self._sigint_count = 0
+        self._sigint_last_ts = now
+        self._sigint_count += 1
+        self.generator.request_cancel()
+        if self._sigint_count == 1:
+            log.warning(
+                "Interrupt received — cancelling generation "
+                "(press Ctrl+C again within 2s to force quit)"
+            )
+        else:
+            log.warning("Force quit")
+            self.generator.shutdown(wait=False)
+            os._exit(130)
 
     async def handle_ws_connection(self, ws: Any) -> None:
         """Handle one WebSocket client (websockets or WsProtocolAdapter)."""
@@ -952,7 +1049,17 @@ class VideoServer:
         if web_state is not None:
             await self._serve_with_web_ui(web_state)
             return
+        loop = asyncio.get_running_loop()
+        try:
+            loop.add_signal_handler(signal.SIGINT, self.on_console_interrupt)
+            loop.add_signal_handler(signal.SIGTERM, self.on_console_interrupt)
+        except (NotImplementedError, RuntimeError):
+            pass
         url = f"ws://{self.host}:{self.port}/ws"
+        if self.host in ("0.0.0.0", "::", "[::]"):
+            from web_ui import build_server_urls
+
+            url, _ = build_server_urls(self.host, self.port)
         async with websockets.serve(
             self._handle_client,
             self.host,
@@ -963,13 +1070,13 @@ class VideoServer:
             close_timeout=5,
         ):
             log.info("WebSocket server listening on %s", url)
-            await asyncio.Future()
+            await self._shutdown.wait()
 
     async def _serve_with_web_ui(self, web_state: Any) -> None:
-        from web_ui import build_combined_application, bind_all_http_hint, run_uvicorn
+        from web_ui import build_combined_application, build_server_urls, run_uvicorn
 
         web_state.video_server = self
-        http_hint = bind_all_http_hint(self.port)
+        ws_url, http_url = build_server_urls(self.host, self.port)
 
         video_server = self
 
@@ -982,9 +1089,9 @@ class VideoServer:
             await video_server.handle_ws_connection(adapter)
 
         app = build_combined_application(starlette_ws_handler, web_state)
-        log.info("Web UI       : %s  (use your machine IP/hostname in the browser)", http_hint)
-        log.info("WebSocket    : ws://<this-host>:%s/ws", self.port)
-        await run_uvicorn(app, self.host, self.port)
+        log.info("Web UI       : %s", http_url)
+        log.info("WebSocket    : %s", ws_url)
+        await run_uvicorn(app, self.host, self.port, web_state)
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
@@ -1254,11 +1361,12 @@ def main() -> None:
     if model_auto_note:
         print(f"  RAM pick : {model_auto_note}")
     print(f"  Runtime  : Apple Silicon / MLX")
-    print(f"  Endpoint : ws://{args.host}:{args.port}/ws")
-    if args.web_ui:
-        from web_ui import bind_all_http_hint, resolve_web_dist
+    from web_ui import build_server_urls, resolve_web_dist
 
-        print(f"  Web UI   : {bind_all_http_hint(args.port)}  (same host in browser)")
+    ws_url, http_url = build_server_urls(args.host, args.port)
+    print(f"  Endpoint : {ws_url}")
+    if args.web_ui:
+        print(f"  Web UI   : {http_url}")
         if not resolve_web_dist().is_dir():
             print(
                 "  [warn] web/dist missing — build UI: cd web && npm install && npm run build",
@@ -1352,6 +1460,11 @@ def main() -> None:
     try:
         asyncio.run(server.serve(web_state))
     except KeyboardInterrupt:
+        pass
+    finally:
+        server.generator.shutdown(wait=True)
+        if web_state is not None:
+            web_state.cancel_active_generation()
         print("\n\nServer stopped.")
 
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import concurrent.futures
 import functools
 import inspect
 import logging
@@ -32,6 +33,21 @@ log = logging.getLogger("fvserver")
 
 LTX2_SPATIAL_ALIGN = 32
 LTX2_MLX_GIT_TAG = "v0.14.9"
+
+CHAIN_METHOD_AUTOCONTINUE = "autocontinue"
+CHAIN_METHOD_NATIVE_EXTEND = "native_extend"
+# ltx-2-mlx extend/retake: RetakePipeline + dev transformer + CFG (see docs/PIPELINES.md).
+RETAKE_EXTEND_DEFAULT_CFG = 3.0
+RETAKE_EXTEND_DEFAULT_STG = 0.0
+VALID_CHAIN_METHODS = frozenset({CHAIN_METHOD_AUTOCONTINUE, CHAIN_METHOD_NATIVE_EXTEND})
+
+PIPE_PROFILE_DISTILLED = "distilled"
+PIPE_PROFILE_TWO_STAGE = "two_stage"
+PIPE_PROFILE_HQ = "hq"
+PIPE_PROFILE_ONE_STAGE = "one_stage"
+VALID_PIPELINE_PROFILES = frozenset(
+    {PIPE_PROFILE_DISTILLED, PIPE_PROFILE_TWO_STAGE, PIPE_PROFILE_HQ, PIPE_PROFILE_ONE_STAGE}
+)
 
 
 def ltx2_mlx_install_hint() -> str:
@@ -60,7 +76,7 @@ class GenerationRequest:
     image_data: dict | str | None = None
     audio_data: dict | str | None = None
     source_video_data: dict | str | None = None
-    seed: int = 1024
+    seed: int = -1
     num_frames: int | None = None
     height: int | None = None
     width: int | None = None
@@ -75,6 +91,15 @@ class GenerationRequest:
     video_conditioning_specs: list[tuple[dict | str, float]] | None = None
     job_id: str | None = None
     a2v_visual_i2v_continue: bool = False
+    # Optional ltx-2-mlx advanced controls (see https://github.com/dgrauet/ltx-2-mlx#features)
+    end_image_data: dict | str | None = None
+    enhance_prompt: bool = False
+    pipeline_profile: str = PIPE_PROFILE_DISTILLED
+    cfg_scale: float | None = None
+    stg_scale: float | None = None
+    stage2_steps: int | None = None
+    no_regen_audio: bool = False
+    reference_strength: float | None = None
 
 
 def looks_like_hf_repo_id(model: str) -> bool:
@@ -363,6 +388,45 @@ def _pick_safetensors_file(root: Path) -> Path | None:
     return candidates[0]
 
 
+def _lora_cached_path(spec: str) -> Path | None:
+    """Return local path when spec is already on disk; None if download may be needed."""
+    raw = (spec or "").strip()
+    if not raw:
+        return None
+
+    p = Path(raw).expanduser()
+    if p.is_file():
+        return p.resolve()
+
+    if raw.startswith(("http://", "https://")):
+        parsed = urlparse(raw)
+        if parsed.netloc.endswith("huggingface.co") and "/resolve/" in parsed.path:
+            parts = [part for part in parsed.path.strip("/").split("/") if part]
+            if len(parts) >= 5 and parts[2] == "resolve":
+                repo_id = f"{parts[0]}/{parts[1]}"
+                revision = parts[3]
+                filename = "/".join(parts[4:])
+                cache_root = _local_lora_cache_dir()
+                local_dir = cache_root / repo_id.replace("/", "__")
+                candidate = local_dir / filename
+                if candidate.is_file():
+                    return candidate.resolve()
+                # hf_hub_download may also use hub cache layout under local_dir
+                if local_dir.is_dir():
+                    for match in local_dir.rglob(Path(filename).name):
+                        if match.is_file():
+                            return match.resolve()
+
+    if looks_like_hf_repo_id(raw):
+        dest = (_local_lora_cache_dir() / raw.replace("/", "__")).resolve()
+        if dest.is_dir():
+            picked = _pick_safetensors_file(dest)
+            if picked is not None:
+                return picked.resolve()
+
+    return None
+
+
 def _resolve_lora_path(spec: str) -> tuple[str, str | None]:
     """
     Resolve LoRA spec to a local safetensors path.
@@ -371,6 +435,11 @@ def _resolve_lora_path(spec: str) -> tuple[str, str | None]:
     raw = (spec or "").strip()
     if not raw:
         raise ValueError("Empty LoRA spec")
+
+    cached = _lora_cached_path(raw)
+    if cached is not None:
+        log.debug("Using cached LoRA at %s", cached)
+        return str(cached), None
 
     p = Path(raw).expanduser()
     if p.is_file():
@@ -395,7 +464,7 @@ def _resolve_lora_path(spec: str) -> tuple[str, str | None]:
                 cache_root = _local_lora_cache_dir()
                 cache_root.mkdir(parents=True, exist_ok=True)
                 log.info(
-                    "Downloading/using cached LoRA %s (%s @ %s) …",
+                    "Downloading LoRA %s (%s @ %s) …",
                     repo_id,
                     filename,
                     revision,
@@ -556,6 +625,68 @@ def _export_output_mp4(source_path: str) -> str:
     return final_path
 
 
+def _normalize_pipeline_profile(raw: str | None) -> str:
+    profile = (raw or PIPE_PROFILE_DISTILLED).strip().lower()
+    if profile in VALID_PIPELINE_PROFILES:
+        return profile
+    return PIPE_PROFILE_DISTILLED
+
+
+def _maybe_enhance_prompt(
+    prompt: str,
+    *,
+    mode: str,
+    model_dir: str,
+    enabled: bool,
+) -> str:
+    """Run ltx-2-mlx Gemma prompt enhancement when available and requested."""
+    text = (prompt or "").strip()
+    if not enabled or not text:
+        return prompt
+    enhance_mode = "i2v" if mode in ("generate", "i2v", "keyframe") else "t2v"
+    try:
+        import ltx_pipelines_mlx as lpm
+    except ImportError:
+        log.warning("enhance_prompt requested but ltx_pipelines_mlx is not installed")
+        return prompt
+    for attr in ("enhance_prompt", "enhance"):
+        fn = getattr(lpm, attr, None)
+        if callable(fn):
+            try:
+                out = fn(text, mode=enhance_mode, model_dir=model_dir)
+                if isinstance(out, str) and out.strip():
+                    log.info("Prompt enhanced via ltx_pipelines_mlx.%s", attr)
+                    return out.strip()
+            except TypeError:
+                try:
+                    out = fn(text, enhance_mode, model_dir)
+                    if isinstance(out, str) and out.strip():
+                        log.info("Prompt enhanced via ltx_pipelines_mlx.%s (legacy signature)", attr)
+                        return out.strip()
+                except Exception as exc:
+                    log.warning("Prompt enhance via %s failed: %s", attr, exc)
+            except Exception as exc:
+                log.warning("Prompt enhance via %s failed: %s", attr, exc)
+    log.warning(
+        "enhance_prompt requested but no enhance API found in ltx_pipelines_mlx; using original prompt"
+    )
+    return prompt
+
+
+def _apply_optional_generate_kwargs(call_kwargs: dict[str, Any], req: GenerationRequest) -> None:
+    """Attach optional CFG / stage-2 / audio-regen flags when the pipeline accepts them."""
+    if req.cfg_scale is not None:
+        call_kwargs["cfg_scale"] = float(req.cfg_scale)
+    if req.stg_scale is not None:
+        call_kwargs["stg_scale"] = float(req.stg_scale)
+    if req.stage2_steps is not None:
+        call_kwargs["stage2_steps"] = int(req.stage2_steps)
+    if req.no_regen_audio:
+        call_kwargs["no_regen_audio"] = True
+    if req.reference_strength is not None:
+        call_kwargs["reference_strength"] = float(req.reference_strength)
+
+
 def _frame_rate_from_kwargs(kwargs: dict[str, Any], default: float) -> float:
     if "frame_rate" in kwargs:
         return float(kwargs.pop("frame_rate"))
@@ -585,12 +716,17 @@ def _decode_latents_to_mp4(
         except ImportError:
             pass
     pipe._load_decoders()
-    pipe._decode_and_save_video(
-        video_latent,
-        audio_latent,
-        output_path,
-        frame_rate=frame_rate,
-    )
+    fn = getattr(pipe, "_decode_and_save_video", None)
+    if fn is None:
+        raise RuntimeError(f"{type(pipe).__name__} has no _decode_and_save_video()")
+    sig = inspect.signature(fn)
+    accepted = set(sig.parameters.keys())
+    decode_kwargs: dict[str, Any] = {}
+    if "frame_rate" in accepted:
+        decode_kwargs["frame_rate"] = float(frame_rate)
+    elif "fps" in accepted:
+        decode_kwargs["fps"] = float(frame_rate)
+    fn(video_latent, audio_latent, output_path, **decode_kwargs)
 
 
 def _filter_call_kwargs(fn: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -672,10 +808,30 @@ def _invoke_generate_and_save(pipe: Any, **kwargs: Any) -> None:
             "init_image",
             "first_frame_image",
             "start_image",
+            "start",
         ):
             if alias in accepted:
                 call_kwargs[alias] = call_kwargs.pop("image")
                 break
+
+    end_img = call_kwargs.get("end_image")
+    if end_img and "end_image" not in accepted:
+        for alias in ("end_image_path", "end", "target_image", "last_frame_image"):
+            if alias in accepted:
+                call_kwargs[alias] = call_kwargs.pop("end_image")
+                break
+
+    vid = call_kwargs.get("video_path") or call_kwargs.get("reference_video")
+    if vid:
+        for primary, aliases in (
+            ("video_path", ("video", "source_video", "source_video_path", "input_video")),
+            ("reference_video", ("video_path", "video", "source_video")),
+        ):
+            if primary in call_kwargs and primary not in accepted:
+                for alias in aliases:
+                    if alias in accepted:
+                        call_kwargs[alias] = call_kwargs.pop(primary)
+                        break
 
     if not has_varkw:
         dropped_image = img and "image" not in call_kwargs and not any(
@@ -765,6 +921,10 @@ class _ModelProgressStore:
         return snap
 
 
+class GenerationCancelledError(RuntimeError):
+    """Raised when generation is cancelled via ``request_cancel()``."""
+
+
 def _stage_from_tqdm_desc(desc: str) -> str:
     d = (desc or "").strip().lower()
     if "denois" in d:
@@ -817,6 +977,30 @@ class LocalVideoGenerator:
         self._resolved_default_loras: list[tuple[str, float]] | None = None
         self._lpm_module: Any | None = None
         self._model_progress = _ModelProgressStore()
+        self._cancel_requested = threading.Event()
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="ltx-gen",
+        )
+        self._executor_shutdown = False
+
+    def shutdown(self, *, wait: bool = False) -> None:
+        """Release the generation thread pool (call on server exit)."""
+        self.request_cancel()
+        if self._executor_shutdown:
+            return
+        self._executor.shutdown(wait=wait, cancel_futures=True)
+        self._executor_shutdown = True
+
+    def clear_cancel(self) -> None:
+        self._cancel_requested.clear()
+
+    def request_cancel(self) -> None:
+        self._cancel_requested.set()
+
+    def _check_cancel(self) -> None:
+        if self._cancel_requested.is_set():
+            raise GenerationCancelledError("Generation cancelled")
 
     @contextmanager
     def _track_model_progress(self):
@@ -833,10 +1017,22 @@ class LocalVideoGenerator:
 
         class _TrackingTqdm(orig_tqdm):  # type: ignore[misc,valid-type]
             def __init__(self, *args: Any, **kwargs: Any) -> None:
+                generator._check_cancel()
                 super().__init__(*args, **kwargs)
                 self._publish(generator)
 
+            def __iter__(self):
+                for item in super().__iter__():
+                    generator._check_cancel()
+                    yield item
+
+            def refresh(self, *args: Any, **kwargs: Any) -> None:
+                generator._check_cancel()
+                super().refresh(*args, **kwargs)
+                self._publish(generator)
+
             def update(self, n: float = 1) -> bool | None:
+                generator._check_cancel()
                 result = super().update(n)
                 self._publish(generator)
                 return result
@@ -878,8 +1074,7 @@ class LocalVideoGenerator:
             import ltx_pipelines_mlx.utils.samplers as samplers_mod
 
             orig_samplers_tqdm = getattr(samplers_mod, "tqdm", None)
-            if orig_samplers_tqdm in (orig_tqdm, orig_auto, tqdm_mod.tqdm):
-                samplers_mod.tqdm = _TrackingTqdm
+            samplers_mod.tqdm = _TrackingTqdm
         except ImportError:
             pass
         try:
@@ -957,6 +1152,17 @@ class LocalVideoGenerator:
         if ic_cls is not None:
             self._pipe_classes["ic_lora"] = ic_cls
 
+        for key, cls_name in (
+            ("two_stage", "TI2VidTwoStagesPipeline"),
+            ("hq", "TI2VidTwoStagesHQPipeline"),
+            ("keyframe", "KeyframePipeline"),
+            ("lipdub", "LipDubPipeline"),
+        ):
+            cls = getattr(lpm, cls_name, None)
+            if cls is not None:
+                self._pipe_classes[key] = cls
+                log.info("Registered MLX pipeline %s (%s)", key, cls_name)
+
         # Legacy standalone spatial upscaler classes (pre-v0.14 monolith pipelines).
         for cls_name in (
             "SpatialUpscalerX2V11Pipeline",
@@ -994,6 +1200,22 @@ class LocalVideoGenerator:
             self._pipes[key] = pipe
         log.info("MLX pipeline ready ✓ (%s)", key)
         return pipe
+
+    def _resolve_generate_pipe_key(self, profile: str, *, has_image: bool) -> str:
+        profile = _normalize_pipeline_profile(profile)
+        if profile == PIPE_PROFILE_TWO_STAGE and "two_stage" in self._pipe_classes:
+            return "two_stage"
+        if profile == PIPE_PROFILE_HQ and "hq" in self._pipe_classes:
+            return "hq"
+        if profile == PIPE_PROFILE_ONE_STAGE:
+            if has_image and "i2v" in self._pipe_classes:
+                return "i2v"
+            return "t2v"
+        if self.upscale and "two_stage" in self._pipe_classes:
+            return "two_stage"
+        if has_image and "i2v" in self._pipe_classes:
+            return "i2v"
+        return "t2v"
 
     def _resolve_lora_specs(self, specs: list[tuple[str, float]]) -> tuple[list[tuple[str, float]], list[str]]:
         resolved: list[tuple[str, float]] = []
@@ -1131,7 +1353,7 @@ class LocalVideoGenerator:
         image_data: dict | str | None = None,
         audio_data: dict | str | None = None,
         source_video_data: dict | str | None = None,
-        seed: int = 1024,
+        seed: int = -1,
         num_frames: int | None = None,
         height: int | None = None,
         width: int | None = None,
@@ -1147,10 +1369,19 @@ class LocalVideoGenerator:
         *,
         job_id: str | None = None,
         a2v_visual_i2v_continue: bool = False,
+        end_image_data: dict | str | None = None,
+        enhance_prompt: bool = False,
+        pipeline_profile: str = PIPE_PROFILE_DISTILLED,
+        cfg_scale: float | None = None,
+        stg_scale: float | None = None,
+        stage2_steps: int | None = None,
+        no_regen_audio: bool = False,
+        reference_strength: float | None = None,
     ) -> str:
+        self.clear_cancel()
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(
-            None,
+            self._executor,
             functools.partial(
                 self._generate_sync,
                 GenerationRequest(
@@ -1173,6 +1404,14 @@ class LocalVideoGenerator:
                     video_conditioning_specs=video_conditioning_specs,
                     job_id=job_id,
                     a2v_visual_i2v_continue=a2v_visual_i2v_continue,
+                    end_image_data=end_image_data,
+                    enhance_prompt=enhance_prompt,
+                    pipeline_profile=pipeline_profile,
+                    cfg_scale=cfg_scale,
+                    stg_scale=stg_scale,
+                    stage2_steps=stage2_steps,
+                    no_regen_audio=no_regen_audio,
+                    reference_strength=reference_strength,
                 ),
             ),
         )
@@ -1210,7 +1449,9 @@ class LocalVideoGenerator:
 
     def _generate_sync(self, req: GenerationRequest) -> str:
         del req.negative_prompt  # reserved for future CFG-enabled variants
+        self._check_cancel()
         self.load()
+        self._check_cancel()
 
         assert self._model_path is not None
         requested_height = int(req.height or self.height)
@@ -1256,6 +1497,7 @@ class LocalVideoGenerator:
         resolved_loras: list[tuple[str, float]] = []
 
         tmp_image: str | None = None
+        tmp_end_image: str | None = None
         tmp_audio: str | None = None
         tmp_video: str | None = None
         tmp_video_conditioning_cleanup: list[str] = []
@@ -1285,6 +1527,14 @@ class LocalVideoGenerator:
                 temp_prefix="fvserver_video_",
                 default_suffix=".mp4",
             )
+            tmp_end_image, tmp_end_image_cleanup = _decode_media_input(
+                req.end_image_data,
+                temp_prefix="fvserver_end_img_",
+                default_suffix=".jpg",
+            )
+            if not tmp_end_image and isinstance(req.end_image_data, dict):
+                tmp_end_image = _decode_initial_image_dict(req.end_image_data)
+                tmp_end_image_cleanup = tmp_end_image
             vc_items, vc_cleanup = _decode_weighted_media_inputs(
                 req.video_conditioning_specs,
                 temp_prefix="fvserver_vcond_",
@@ -1293,6 +1543,7 @@ class LocalVideoGenerator:
             tmp_video_conditioning_cleanup = vc_cleanup
             for path, cleanup, marker in (
                 (tmp_image, tmp_image_cleanup, "fvserver_img_"),
+                (tmp_end_image, tmp_end_image_cleanup, "fvserver_end_img_"),
                 (tmp_audio, tmp_audio_cleanup, "fvserver_audio_"),
                 (tmp_video, tmp_video_cleanup, "fvserver_video_"),
             ):
@@ -1308,11 +1559,21 @@ class LocalVideoGenerator:
                     resolved_loras.append((lora_path, float(lora_scale)))
                     if lora_cleanup:
                         tmp_lora_cleanup.append(lora_cleanup)
+            effective_prompt = _maybe_enhance_prompt(
+                req.prompt,
+                mode=mode,
+                model_dir=str(self._model_path),
+                enabled=bool(req.enhance_prompt) and mode not in ("extend", "retake"),
+            )
+            profile = _normalize_pipeline_profile(req.pipeline_profile)
             log.info(
-                "Generation effective params: mode=%s seed=%s (requested=%s) size=%sx%s frames=%s "
-                "steps=%s fps=%s (requested size=%sx%s frames=%s steps=%s) image=%s audio=%s video=%s "
-                "retake=%s-%s extend=%s/%s vcond=%s loras=%s model_path=%s",
+                "Generation effective params: mode=%s profile=%s enhance=%s seed=%s (requested=%s) "
+                "size=%sx%s frames=%s steps=%s fps=%s (requested size=%sx%s frames=%s steps=%s) "
+                "image=%s end_image=%s audio=%s video=%s retake=%s-%s extend=%s/%s vcond=%s loras=%s "
+                "model_path=%s",
                 mode,
+                profile if mode not in ("extend", "retake") else "dev+CFG",
+                "yes" if req.enhance_prompt else "no",
                 seed,
                 requested_seed,
                 height,
@@ -1325,6 +1586,7 @@ class LocalVideoGenerator:
                 requested_num_frames,
                 requested_steps,
                 "yes" if tmp_image else "no",
+                "yes" if tmp_end_image else "no",
                 "yes" if tmp_audio else "no",
                 "yes" if tmp_video else "no",
                 req.retake_start if req.retake_start is not None else "-",
@@ -1344,10 +1606,11 @@ class LocalVideoGenerator:
                     self.default_lora_count(),
                 )
 
+            self._check_cancel()
             try:
                 with self._track_model_progress():
                     common_gen_kwargs = dict(
-                        prompt=req.prompt,
+                        prompt=effective_prompt,
                         output_path=out_path,
                         height=height,
                         width=width,
@@ -1357,6 +1620,7 @@ class LocalVideoGenerator:
                         num_steps=steps,
                         lora_paths=resolved_loras,
                     )
+                    _apply_optional_generate_kwargs(common_gen_kwargs, req)
                     if mode == "a2v":
                         if not tmp_audio:
                             raise RuntimeError("a2v mode requires audio input")
@@ -1397,28 +1661,49 @@ class LocalVideoGenerator:
                         end_frame = int(req.retake_end if req.retake_end is not None else start_frame)
                         pipe = self._get_pipe("retake")
                         last_pipe = pipe
-                        if hasattr(pipe, "generate_and_save"):
-                            _invoke_generate_and_save(
-                                pipe,
-                                **common_gen_kwargs,
-                                video_path=tmp_video,
-                                start_frame=start_frame,
-                                end_frame=end_frame,
+                        retake_steps = steps
+                        retake_cfg = float(
+                            req.cfg_scale
+                            if req.cfg_scale is not None
+                            else RETAKE_EXTEND_DEFAULT_CFG
+                        )
+                        retake_stg = float(
+                            req.stg_scale
+                            if req.stg_scale is not None
+                            else RETAKE_EXTEND_DEFAULT_STG
+                        )
+                        retake_kwargs = dict(
+                            prompt=effective_prompt,
+                            output_path=out_path,
+                            video_path=tmp_video,
+                            start_frame=start_frame,
+                            end_frame=end_frame,
+                            seed=seed,
+                            num_steps=retake_steps,
+                            cfg_scale=retake_cfg,
+                            stg_scale=retake_stg,
+                            lora_paths=resolved_loras,
+                            fps=float(self.fps),
+                        )
+                        _apply_optional_generate_kwargs(retake_kwargs, req)
+                        if not callable(getattr(pipe, "retake_from_video", None)):
+                            raise RuntimeError(
+                                f"{type(pipe).__name__} has no retake_from_video(); "
+                                "update ltx-2-mlx"
                             )
-                        else:
-                            _invoke_retake_and_save(
-                                pipe,
-                                default_fps=float(self.fps),
-                                prompt=req.prompt,
-                                output_path=out_path,
-                                video_path=tmp_video,
-                                start_frame=start_frame,
-                                end_frame=end_frame,
-                                seed=seed,
-                                num_steps=steps,
-                                lora_paths=resolved_loras,
-                                fps=float(self.fps),
-                            )
+                        log.info(
+                            "Retake via retake_from_video (frames %s-%s, steps=%s, cfg=%.1f, stg=%.1f)",
+                            start_frame,
+                            end_frame,
+                            retake_steps,
+                            retake_cfg,
+                            retake_stg,
+                        )
+                        _invoke_retake_and_save(
+                            pipe,
+                            default_fps=float(self.fps),
+                            **retake_kwargs,
+                        )
                     elif mode == "extend":
                         if not tmp_video:
                             raise RuntimeError("extend mode requires source video input")
@@ -1426,28 +1711,101 @@ class LocalVideoGenerator:
                         direction = (req.extend_direction or "after").strip().lower()
                         pipe = self._get_pipe("extend")
                         last_pipe = pipe
-                        if hasattr(pipe, "generate_and_save"):
-                            _invoke_generate_and_save(
-                                pipe,
-                                **common_gen_kwargs,
-                                video_path=tmp_video,
-                                extend_frames=ext_frames,
-                                direction=direction,
+                        extend_steps = steps
+                        extend_cfg = float(
+                            req.cfg_scale
+                            if req.cfg_scale is not None
+                            else RETAKE_EXTEND_DEFAULT_CFG
+                        )
+                        extend_stg = float(
+                            req.stg_scale
+                            if req.stg_scale is not None
+                            else RETAKE_EXTEND_DEFAULT_STG
+                        )
+                        extend_kwargs = dict(
+                            prompt=effective_prompt,
+                            output_path=out_path,
+                            video_path=tmp_video,
+                            extend_frames=ext_frames,
+                            direction=direction,
+                            seed=seed,
+                            num_steps=extend_steps,
+                            cfg_scale=extend_cfg,
+                            stg_scale=extend_stg,
+                            lora_paths=resolved_loras,
+                            fps=float(self.fps),
+                        )
+                        _apply_optional_generate_kwargs(extend_kwargs, req)
+                        if not callable(getattr(pipe, "extend_from_video", None)):
+                            raise RuntimeError(
+                                f"{type(pipe).__name__} has no extend_from_video(); "
+                                "update ltx-2-mlx"
                             )
-                        else:
-                            _invoke_extend_and_save(
-                                pipe,
-                                default_fps=float(self.fps),
-                                prompt=req.prompt,
-                                output_path=out_path,
-                                video_path=tmp_video,
-                                extend_frames=ext_frames,
-                                direction=direction,
-                                seed=seed,
-                                num_steps=steps,
-                                lora_paths=resolved_loras,
-                                fps=float(self.fps),
-                            )
+                        log.info(
+                            "Extend via extend_from_video "
+                            "(extend_frames=%s, direction=%s, steps=%s, cfg=%.1f, stg=%.1f)",
+                            ext_frames,
+                            direction,
+                            extend_steps,
+                            extend_cfg,
+                            extend_stg,
+                        )
+                        _invoke_extend_and_save(
+                            pipe,
+                            default_fps=float(self.fps),
+                            **extend_kwargs,
+                        )
+                        try:
+                            from videofentanyl import count_video_frames
+
+                            src_frames = count_video_frames(tmp_video) if tmp_video else None
+                            out_frames = count_video_frames(out_path)
+                            if src_frames is not None and out_frames is not None:
+                                log.info(
+                                    "Extend output: %d frames (source %d, +%d, ~%.2fs @ %.1f fps)",
+                                    out_frames,
+                                    src_frames,
+                                    out_frames - src_frames,
+                                    max(0.0, (out_frames - 1) / float(self.fps)),
+                                    float(self.fps),
+                                )
+                                if out_frames <= src_frames:
+                                    log.warning(
+                                        "Extend did not lengthen the video — verify duration "
+                                        "(5s = 121 frames) and extend_frames=%s",
+                                        ext_frames,
+                                    )
+                        except Exception:
+                            pass
+                    elif mode == "keyframe":
+                        if not tmp_image or not tmp_end_image:
+                            raise RuntimeError("keyframe mode requires start and end images")
+                        pipe = self._get_pipe("keyframe")
+                        last_pipe = pipe
+                        _invoke_generate_and_save(
+                            pipe,
+                            **common_gen_kwargs,
+                            image=tmp_image,
+                            end_image=tmp_end_image,
+                        )
+                    elif mode in ("lipdub", "lip_dub"):
+                        if not tmp_video:
+                            raise RuntimeError("lipdub mode requires reference video")
+                        if len(resolved_loras) != 1:
+                            raise RuntimeError("lipdub mode requires exactly one LoRA spec")
+                        pipe = self._get_pipe(
+                            "lipdub",
+                            pipe_kwargs={
+                                "lora_paths": [(str(p), float(s)) for p, s in resolved_loras],
+                            },
+                        )
+                        last_pipe = pipe
+                        _invoke_generate_and_save(
+                            pipe,
+                            **common_gen_kwargs,
+                            video_path=tmp_video,
+                            reference_video=tmp_video,
+                        )
                     elif mode == "ic_lora":
                         if not resolved_loras:
                             raise RuntimeError("ic_lora mode requires at least one LoRA spec")
@@ -1492,8 +1850,9 @@ class LocalVideoGenerator:
                                 width,
                                 height,
                             )
-                        # Separate i2v instance (88e6872): do not reuse the t2v pipe cache entry.
-                        pipe = self._get_pipe("i2v")
+                        # Separate i2v/two-stage instance: do not reuse the t2v pipe cache entry.
+                        pipe_key = self._resolve_generate_pipe_key(profile, has_image=True)
+                        pipe = self._get_pipe(pipe_key)
                         last_pipe = pipe
                         _invoke_generate_and_save(
                             pipe,
@@ -1501,9 +1860,15 @@ class LocalVideoGenerator:
                             image=tmp_image,
                         )
                     else:
-                        pipe = self._get_pipe("t2v")
+                        pipe_key = self._resolve_generate_pipe_key(profile, has_image=False)
+                        pipe = self._get_pipe(pipe_key)
                         last_pipe = pipe
-                        if self.upscale and "spatial_upscaler" in self._pipe_classes:
+                        if (
+                            profile == PIPE_PROFILE_DISTILLED
+                            and self.upscale
+                            and "spatial_upscaler" in self._pipe_classes
+                            and pipe_key == "t2v"
+                        ):
                             base_h, base_w = self._calculate_stage1_dimensions(height, width)
                             lowres_out_path = os.path.join(tmpdir, "output_lowres.mp4")
                             log.info(
@@ -1543,8 +1908,11 @@ class LocalVideoGenerator:
                                 pipe,
                                 **common_gen_kwargs,
                             )
-            except BaseException:
-                self._salvage_mp4_to_spill(tmpdir, out_path, req.job_id, req.prompt, "ENCODE_FAIL")
+            except BaseException as exc:
+                if not isinstance(exc, GenerationCancelledError):
+                    self._salvage_mp4_to_spill(
+                        tmpdir, out_path, req.job_id, req.prompt, "ENCODE_FAIL"
+                    )
                 raise
 
             video_path = out_path

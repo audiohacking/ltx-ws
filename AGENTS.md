@@ -146,8 +146,9 @@ If `ok=false`, tell the user to start `python server.py` or fix `--server-url`.
 | Parameter | Type | Notes |
 |-----------|------|--------|
 | `prompt` | string | **Required.** Model-ready visual description. |
-| `mode` | string | `generate` (default), `a2v`, `retake`, `extend`, `ic_lora` |
-| `image` | string? | Path or URL — image-to-video start frame |
+| `mode` | string | `generate` (default), `a2v`, `retake`, `extend`, `ic_lora`, `keyframe`, `lipdub` |
+| `image` | string? | Path or URL — image-to-video / keyframe start |
+| `end_image` | string? | Keyframe end frame |
 | `audio` | string? | Required for `a2v` |
 | `video` | string? | Required for `retake` / `extend` |
 | `seed` | int? | Override seed (`-1` random on server) |
@@ -173,9 +174,15 @@ If `ok=false`, tell the user to start `python server.py` or fix `--server-url`.
 |-----------|------|---------|--------|
 | `prompts` | list[string] | **required** | One prompt per segment; order = timeline order |
 | `autocontinue` | bool | **`true`** | **Keep true** for director continuity |
+| `chain_method` | string | `autocontinue` | `autocontinue` (last frame → i2v) or **`native_extend`** (ltx-2-mlx `extend_from_video` on prior MP4 for clip 2+) |
 | `autoconcat` | bool | `false` | Set **`true`** when delivering one merged file |
-| `mode` | string | `generate` | Same modes as single-clip tool |
+| `mode` | string | `generate` | `generate`, `a2v`, `retake`, `extend`, `ic_lora`, `keyframe`, `lipdub` |
 | `image` | string? | — | Start image for **clip 1 only** (unless you override per-clip via separate calls) |
+| `end_image` | string? | — | Keyframe mode: end frame |
+| `enhance_prompt` | bool | `false` | Gemma prompt rewrite via ltx-2-mlx |
+| `pipeline_profile` | string | `distilled` | `distilled`, `two_stage`, `hq`, `one_stage` |
+| `cfg_scale`, `stg_scale`, `stage2_steps` | | — | Optional generate/HQ kwargs |
+| `no_regen_audio`, `reference_strength` | | — | Retake/extend/lipdub |
 | `audio`, `video` | string? | — | Mode-specific (see single-clip tool) |
 | `seed`, `num_frames`, `height`, `width`, `num_steps` | | — | Applied to **every** clip in the sequence |
 | `retake_*`, `extend_*` | | — | Mode-specific |
@@ -184,10 +191,10 @@ If `ok=false`, tell the user to start `python server.py` or fix `--server-url`.
 
 **Autocontinue behavior (critical):**
 
-- After each successful clip, the MCP server extracts the **last full frame** from the MP4.
-- That frame is injected as `initial_image` on the **next** job.
-- Each segment gets a **new seed** on the client path (avoids duplicate noise if I2V attachment fails).
-- If extraction fails, the sequence aborts—do not silently continue.
+- **`chain_method: autocontinue`** (default): after each successful clip, extract the **last full frame** and inject as `initial_image` on the next job.
+- **`chain_method: native_extend`**: clip 1 is `generate`/i2v; clips 2+ run **`mode: extend`** with the prior clip MP4 as `source_video` (ltx-2-mlx `RetakePipeline.extend_from_video`, dev model + CFG; **same `num_steps` as clip 1**, cfg=3.0, stg=0.0 unless overridden). Each extend output **includes prior footage**; with `autoconcat` the **last extend** is promoted as merged (not ffmpeg-concat of overlapping segments). Incompatible with `audiocontinue`.
+- Each chained segment gets a **new seed** on the client path.
+- If chaining fails, the sequence aborts—do not silently continue.
 
 **Autoconcat behavior:**
 
