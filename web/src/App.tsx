@@ -7,6 +7,18 @@ const API = "";
 const MODEL_PREF_KEY = "ltx-ws-preferred-model";
 const BLOB_VIDEO_PREFIX = "blob:";
 
+type LoraActivity =
+  | { phase: "idle" }
+  | {
+      phase: "working";
+      label: string;
+      index: number;
+      total: number;
+      downloading: boolean;
+    }
+  | { phase: "ready"; message: string }
+  | { phase: "error"; message: string };
+
 async function cacheVideoAsBlobUrl(serverUrl: string): Promise<string> {
   const res = await fetch(serverUrl);
   if (!res.ok) throw new Error(`Video download failed (${res.status})`);
@@ -171,7 +183,9 @@ export default function App() {
   const [extendDirection, setExtendDirection] = useState("after");
   const [showOptions, setShowOptions] = useState(true);
   const [loraPresetIds, setLoraPresetIds] = useState<string[]>([]);
-  const [loraStatus, setLoraStatus] = useState<string | null>(null);
+  const [loraActivity, setLoraActivity] = useState<LoraActivity>({ phase: "idle" });
+  const [loraBusy, setLoraBusy] = useState(false);
+  const [showCustomLora, setShowCustomLora] = useState(false);
   const [customLoraUrl, setCustomLoraUrl] = useState("");
   const [customLoraLabel, setCustomLoraLabel] = useState("");
   const [customLoraScale, setCustomLoraScale] = useState("1.0");
@@ -181,6 +195,8 @@ export default function App() {
   const endImageRef = useRef<HTMLInputElement>(null);
   const audioRef = useRef<HTMLInputElement>(null);
   const videoRef = useRef<HTMLInputElement>(null);
+  const ensuredLoraSpecsRef = useRef<Set<string>>(new Set());
+  const loraPresetsRef = useRef<LoraPreset[]>([]);
 
   const libraryClips = useMemo(() => {
     return clips
@@ -207,17 +223,35 @@ export default function App() {
     presetIds: string[],
     presetsOverride?: LoraPreset[],
   ) => {
-    const presets = presetsOverride ?? config?.lora_presets ?? [];
-    const specs = presetIds
+    const presets = presetsOverride ?? loraPresetsRef.current;
+    const selected = presetIds
       .map((id) => presets.find((p) => p.id === id))
       .filter((p): p is NonNullable<typeof p> => Boolean(p?.spec));
-    if (!specs.length) {
-      setLoraStatus(null);
+    if (!selected.length) {
+      setLoraActivity({ phase: "idle" });
       return;
     }
-    setLoraStatus(`Checking ${specs.length} LoRA(s)…`);
+
+    const pending = selected.filter((p) => !ensuredLoraSpecsRef.current.has(p.spec));
+    if (!pending.length) {
+      setLoraActivity({
+        phase: "ready",
+        message: `${selected.length} LoRA(s) ready`,
+      });
+      return;
+    }
+
+    setLoraBusy(true);
     try {
-      for (const preset of specs) {
+      for (let i = 0; i < pending.length; i++) {
+        const preset = pending[i];
+        setLoraActivity({
+          phase: "working",
+          label: preset.label,
+          index: i + 1,
+          total: pending.length,
+          downloading: true,
+        });
         const r = await fetch(`${API}/api/loras/ensure`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -227,17 +261,34 @@ export default function App() {
           const err = await r.json().catch(() => ({}));
           throw new Error(err.detail || `LoRA download failed: ${preset.label}`);
         }
+        const data = (await r.json()) as { cached?: boolean };
+        ensuredLoraSpecsRef.current.add(preset.spec);
+        if (data.cached) {
+          setLoraActivity({
+            phase: "working",
+            label: preset.label,
+            index: i + 1,
+            total: pending.length,
+            downloading: false,
+          });
+        }
       }
-      setLoraStatus(`${specs.length} LoRA(s) ready`);
+      setLoraActivity({
+        phase: "ready",
+        message: `${selected.length} LoRA(s) ready`,
+      });
     } catch (e) {
-      setLoraStatus(String(e));
+      setLoraActivity({ phase: "error", message: String(e) });
+    } finally {
+      setLoraBusy(false);
     }
-  }, [config?.lora_presets]);
+  }, []);
 
   const load = useCallback(async () => {
     try {
       const cfg = await fetchConfig();
       setConfig(cfg);
+      loraPresetsRef.current = cfg.lora_presets ?? [];
       const preferredModel =
         cfg.preferred_model ||
         localStorage.getItem(MODEL_PREF_KEY) ||
@@ -254,7 +305,9 @@ export default function App() {
             : [];
       setLoraPresetIds(loraIds);
       if (loraIds.length) {
-        await ensureLoraPresets(loraIds, cfg.lora_presets);
+        void ensureLoraPresets(loraIds, cfg.lora_presets);
+      } else {
+        setLoraActivity({ phase: "idle" });
       }
       const all = await fetchClips();
       setClips(all);
@@ -277,6 +330,7 @@ export default function App() {
 
   const toggleLoraPreset = useCallback(
     (presetId: string, checked: boolean) => {
+      if (loraBusy) return;
       setLoraPresetIds((prev) => {
         const next = checked
           ? [...prev.filter((id) => id !== presetId), presetId]
@@ -286,14 +340,20 @@ export default function App() {
         return next;
       });
     },
-    [ensureLoraPresets, persistLoraSelection],
+    [ensureLoraPresets, loraBusy, persistLoraSelection],
   );
 
   async function addCustomLora() {
     const spec = customLoraUrl.trim();
     if (!spec || addingCustomLora) return;
     setAddingCustomLora(true);
-    setLoraStatus("Adding custom LoRA…");
+    setLoraActivity({
+      phase: "working",
+      label: customLoraLabel.trim() || "Custom LoRA",
+      index: 1,
+      total: 1,
+      downloading: true,
+    });
     try {
       const r = await fetch(`${API}/api/loras/custom`, {
         method: "POST",
@@ -309,11 +369,13 @@ export default function App() {
         throw new Error(err.detail || "Could not add custom LoRA");
       }
       const data = await r.json();
+      const nextPresets = data.lora_presets ?? [];
+      loraPresetsRef.current = nextPresets;
       setConfig((c) =>
         c
           ? {
               ...c,
-              lora_presets: data.lora_presets ?? c.lora_presets,
+              lora_presets: nextPresets,
               preferred_lora_preset_ids:
                 data.preferred_lora_preset_ids ?? c.preferred_lora_preset_ids,
             }
@@ -324,37 +386,41 @@ export default function App() {
       setCustomLoraUrl("");
       setCustomLoraLabel("");
       setCustomLoraScale("1.0");
+      setShowCustomLora(false);
       if (data.id) {
-        await ensureLoraPresets([data.id], data.lora_presets);
+        await ensureLoraPresets([data.id], nextPresets);
       }
     } catch (e) {
-      setLoraStatus(String(e));
+      setLoraActivity({ phase: "error", message: String(e) });
     } finally {
       setAddingCustomLora(false);
     }
   }
 
   async function removeCustomLora(presetId: string) {
-    if (!presetId.startsWith("custom_")) return;
+    if (!presetId.startsWith("custom_") || loraBusy) return;
     try {
       const r = await fetch(`${API}/api/loras/custom/${encodeURIComponent(presetId)}`, {
         method: "DELETE",
       });
       if (!r.ok) throw new Error("Delete failed");
       const data = await r.json();
+      const nextPresets = data.lora_presets ?? [];
+      loraPresetsRef.current = nextPresets;
       setConfig((c) =>
         c
           ? {
               ...c,
-              lora_presets: data.lora_presets ?? c.lora_presets,
+              lora_presets: nextPresets,
               preferred_lora_preset_ids:
                 data.preferred_lora_preset_ids ?? c.preferred_lora_preset_ids,
             }
           : c,
       );
       setLoraPresetIds(data.preferred_lora_preset_ids ?? []);
+      setLoraActivity({ phase: "idle" });
     } catch (e) {
-      setLoraStatus(String(e));
+      setLoraActivity({ phase: "error", message: String(e) });
     }
   }
 
@@ -1140,73 +1206,127 @@ export default function App() {
                 </label>
               </div>
 
-              <div className="lora-row">
-                <span className="lora-row-label">LoRA</span>
-                <div className="lora-checklist">
-                  {(config.lora_presets ?? [])
-                    .filter((p) => p.id !== "none")
-                    .map((p) => (
-                      <label key={p.id} className="check lora-check">
-                        <input
-                          type="checkbox"
-                          checked={loraPresetIds.includes(p.id)}
-                          onChange={(e) => toggleLoraPreset(p.id, e.target.checked)}
-                        />
-                        <span>
-                          {p.label}
-                          {p.custom ? (
-                            <button
-                              type="button"
-                              className="lora-remove"
-                              title="Remove custom LoRA"
-                              onClick={(e) => {
-                                e.preventDefault();
-                                void removeCustomLora(p.id);
-                              }}
-                            >
-                              ×
-                            </button>
-                          ) : null}
-                        </span>
-                      </label>
-                    ))}
+              {(loraActivity.phase === "working" || loraActivity.phase === "error") && (
+                <div
+                  className={`lora-status-banner ${
+                    loraActivity.phase === "error" ? "error" : "working"
+                  }`}
+                  role="status"
+                  aria-live="polite"
+                >
+                  {loraActivity.phase === "working" && (
+                    <>
+                      <span className="lora-status-spinner" aria-hidden />
+                      <span>
+                        {loraActivity.downloading
+                          ? `Downloading LoRA: ${loraActivity.label}`
+                          : `Verifying cached LoRA: ${loraActivity.label}`}
+                        {loraActivity.total > 1
+                          ? ` (${loraActivity.index}/${loraActivity.total})`
+                          : ""}
+                      </span>
+                    </>
+                  )}
+                  {loraActivity.phase === "error" && (
+                    <span>{loraActivity.message}</span>
+                  )}
                 </div>
-                <div className="lora-custom-form">
-                  <input
-                    type="url"
-                    placeholder="HF URL or .safetensors path"
-                    value={customLoraUrl}
-                    onChange={(e) => setCustomLoraUrl(e.target.value)}
-                  />
-                  <input
-                    type="text"
-                    placeholder="Label"
-                    value={customLoraLabel}
-                    onChange={(e) => setCustomLoraLabel(e.target.value)}
-                  />
-                  <input
-                    type="number"
-                    min={0}
-                    max={2}
-                    step={0.05}
-                    title="Scale"
-                    value={customLoraScale}
-                    onChange={(e) => setCustomLoraScale(e.target.value)}
-                  />
-                  <button
-                    type="button"
-                    className="btn-secondary"
-                    disabled={!customLoraUrl.trim() || addingCustomLora}
-                    onClick={() => void addCustomLora()}
-                  >
-                    Add
-                  </button>
-                </div>
+              )}
+
+              <div className="options-checks lora-presets-row">
+                <span className="lora-presets-title">LoRA presets</span>
+                {(config.lora_presets ?? [])
+                  .filter((p) => p.id !== "none")
+                  .map((p) => (
+                    <label key={p.id} className="check lora-check">
+                      <input
+                        type="checkbox"
+                        checked={loraPresetIds.includes(p.id)}
+                        disabled={loraBusy || addingCustomLora}
+                        onChange={(e) => toggleLoraPreset(p.id, e.target.checked)}
+                      />
+                      <span>
+                        {p.label}
+                        {p.custom ? (
+                          <button
+                            type="button"
+                            className="lora-remove"
+                            title="Remove custom LoRA"
+                            disabled={loraBusy}
+                            onClick={(e) => {
+                              e.preventDefault();
+                              void removeCustomLora(p.id);
+                            }}
+                          >
+                            ×
+                          </button>
+                        ) : null}
+                      </span>
+                    </label>
+                  ))}
               </div>
 
-              {loraStatus && (
-                <p className="hint">{loraStatus}</p>
+              {loraActivity.phase === "ready" && (
+                <p className="hint lora-ready-hint">{loraActivity.message}</p>
               )}
+
+              <details
+                className="lora-custom-details"
+                open={showCustomLora}
+                onToggle={(e) => setShowCustomLora(e.currentTarget.open)}
+              >
+                <summary>Add custom LoRA from Hugging Face…</summary>
+                <p className="hint lora-custom-help">
+                  Paste a Hugging Face <code>resolve</code> URL or a local{" "}
+                  <code>.safetensors</code> path. Strength controls how strongly the
+                  LoRA affects generation (1.0 = default).
+                </p>
+                <div className="options-grid lora-custom-grid">
+                  <label className="lora-custom-wide">
+                    Hugging Face URL or file path
+                    <input
+                      type="url"
+                      placeholder="https://huggingface.co/…/resolve/main/….safetensors"
+                      value={customLoraUrl}
+                      disabled={addingCustomLora}
+                      onChange={(e) => setCustomLoraUrl(e.target.value)}
+                    />
+                  </label>
+                  <label>
+                    Display name (optional)
+                    <input
+                      type="text"
+                      placeholder="My style LoRA"
+                      value={customLoraLabel}
+                      disabled={addingCustomLora}
+                      onChange={(e) => setCustomLoraLabel(e.target.value)}
+                    />
+                  </label>
+                  <label>
+                    Strength (0–2)
+                    <input
+                      type="number"
+                      min={0}
+                      max={2}
+                      step={0.05}
+                      value={customLoraScale}
+                      disabled={addingCustomLora}
+                      onChange={(e) => setCustomLoraScale(e.target.value)}
+                    />
+                  </label>
+                  <label className="lora-custom-action">
+                    <span className="lora-custom-action-spacer">&nbsp;</span>
+                    <button
+                      type="button"
+                      className="btn-secondary"
+                      disabled={!customLoraUrl.trim() || addingCustomLora || loraBusy}
+                      onClick={() => void addCustomLora()}
+                    >
+                      {addingCustomLora ? "Adding…" : "Add to presets"}
+                    </button>
+                  </label>
+                </div>
+              </details>
 
               {isMultiClip && !audiocontinue && (
                 <p className="hint duration-total">

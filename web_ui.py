@@ -220,10 +220,11 @@ def _lora_catalog(output_dir: Path | None = None) -> tuple[list[dict[str, Any]],
 
 
 def _ensure_lora_downloaded(spec: str) -> dict[str, Any]:
-    from ltx_mlx_backend import _resolve_lora_path
+    from ltx_mlx_backend import _lora_cached_path, _resolve_lora_path
 
+    cached = _lora_cached_path(spec) is not None
     path, _ = _resolve_lora_path(spec)
-    return {"ok": True, "spec": spec, "path": path}
+    return {"ok": True, "spec": spec, "path": path, "cached": cached}
 
 
 _RUN_BODIES: dict[str, dict[str, Any]] = {}

@@ -384,6 +384,45 @@ def _pick_safetensors_file(root: Path) -> Path | None:
     return candidates[0]
 
 
+def _lora_cached_path(spec: str) -> Path | None:
+    """Return local path when spec is already on disk; None if download may be needed."""
+    raw = (spec or "").strip()
+    if not raw:
+        return None
+
+    p = Path(raw).expanduser()
+    if p.is_file():
+        return p.resolve()
+
+    if raw.startswith(("http://", "https://")):
+        parsed = urlparse(raw)
+        if parsed.netloc.endswith("huggingface.co") and "/resolve/" in parsed.path:
+            parts = [part for part in parsed.path.strip("/").split("/") if part]
+            if len(parts) >= 5 and parts[2] == "resolve":
+                repo_id = f"{parts[0]}/{parts[1]}"
+                revision = parts[3]
+                filename = "/".join(parts[4:])
+                cache_root = _local_lora_cache_dir()
+                local_dir = cache_root / repo_id.replace("/", "__")
+                candidate = local_dir / filename
+                if candidate.is_file():
+                    return candidate.resolve()
+                # hf_hub_download may also use hub cache layout under local_dir
+                if local_dir.is_dir():
+                    for match in local_dir.rglob(Path(filename).name):
+                        if match.is_file():
+                            return match.resolve()
+
+    if looks_like_hf_repo_id(raw):
+        dest = (_local_lora_cache_dir() / raw.replace("/", "__")).resolve()
+        if dest.is_dir():
+            picked = _pick_safetensors_file(dest)
+            if picked is not None:
+                return picked.resolve()
+
+    return None
+
+
 def _resolve_lora_path(spec: str) -> tuple[str, str | None]:
     """
     Resolve LoRA spec to a local safetensors path.
@@ -392,6 +431,11 @@ def _resolve_lora_path(spec: str) -> tuple[str, str | None]:
     raw = (spec or "").strip()
     if not raw:
         raise ValueError("Empty LoRA spec")
+
+    cached = _lora_cached_path(raw)
+    if cached is not None:
+        log.debug("Using cached LoRA at %s", cached)
+        return str(cached), None
 
     p = Path(raw).expanduser()
     if p.is_file():
@@ -416,7 +460,7 @@ def _resolve_lora_path(spec: str) -> tuple[str, str | None]:
                 cache_root = _local_lora_cache_dir()
                 cache_root.mkdir(parents=True, exist_ok=True)
                 log.info(
-                    "Downloading/using cached LoRA %s (%s @ %s) …",
+                    "Downloading LoRA %s (%s @ %s) …",
                     repo_id,
                     filename,
                     revision,

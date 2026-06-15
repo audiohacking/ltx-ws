@@ -576,28 +576,108 @@ body {
   font-weight: normal;
 }
 
-.lora-row {
+.lora-presets-row {
   margin-top: 12px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
+  align-items: center;
 }
 
-.lora-row-label {
+.lora-presets-title {
   font-size: 0.75rem;
+  font-weight: 600;
   color: var(--muted);
-}
-
-.lora-checklist {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px 16px;
+  letter-spacing: 0.04em;
+  margin-right: 4px;
 }
 
 .lora-check span {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+}
+
+.lora-ready-hint {
+  margin-top: 6px;
+}
+
+.lora-status-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  font-size: 0.85rem;
+  line-height: 1.35;
+}
+
+.lora-status-banner.working {
+  background: var(--accent-soft);
+  border: 1px solid #bfdbfe;
+  color: #1e3a8a;
+}
+
+.lora-status-banner.error {
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  color: var(--danger);
+}
+
+.lora-status-spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(37, 99, 235, 0.25);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  flex-shrink: 0;
+  animation: lora-spin 0.8s linear infinite;
+}
+
+@keyframes lora-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.lora-custom-details {
+  margin-top: 10px;
+  font-size: 0.85rem;
+}
+
+.lora-custom-details summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.8rem;
+  user-select: none;
+}
+
+.lora-custom-details summary:hover {
+  color: var(--text);
+}
+
+.lora-custom-help {
+  margin: 8px 0 10px;
+}
+
+.lora-custom-help code {
+  font-size: 0.78rem;
+}
+
+.lora-custom-grid {
+  margin-top: 0;
+}
+
+.lora-custom-wide {
+  grid-column: 1 / -1;
+}
+
+.lora-custom-action {
+  justify-content: flex-end;
+}
+
+.lora-custom-action-spacer {
+  visibility: hidden;
+  height: 0;
+  overflow: hidden;
 }
 
 .lora-remove {
@@ -614,17 +694,9 @@ body {
   color: var(--text);
 }
 
-.lora-custom-form {
-  display: grid;
-  grid-template-columns: 1fr minmax(80px, 120px) 64px auto;
-  gap: 8px;
-  align-items: center;
-}
-
-@media (max-width: 720px) {
-  .lora-custom-form {
-    grid-template-columns: 1fr;
-  }
+.lora-remove:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 
 .media-panel {
