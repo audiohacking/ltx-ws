@@ -5,6 +5,7 @@ import type { Clip, Config, LoraPreset, ProgressState } from "./types";
 
 const API = "";
 const MODEL_PREF_KEY = "ltx-ws-preferred-model";
+const LORA_SEL_KEY = "ltx-ws-lora-preset-ids";
 const BLOB_VIDEO_PREFIX = "blob:";
 
 type LoraActivity =
@@ -109,7 +110,7 @@ function ChainMethodPicker({
 }) {
   return (
     <div className={`chain-method-panel${className ? ` ${className}` : ""}`}>
-      <span className="media-panel-title">Continue longer clips via</span>
+      <span className="chain-method-label">Chain</span>
       <div className="chain-method-radios">
         <label className="check chain-method-option">
           <input
@@ -119,12 +120,7 @@ function ChainMethodPicker({
             checked={chainMethod === "autocontinue"}
             onChange={() => onChange("autocontinue")}
           />
-          <span>
-            <strong>Autocontinue</strong>
-            <span className="chain-method-desc">
-              Last frame → start image for the next clip (standard i2v chain)
-            </span>
-          </span>
+          Autocontinue
         </label>
         <label className="check chain-method-option">
           <input
@@ -134,14 +130,89 @@ function ChainMethodPicker({
             checked={chainMethod === "native_extend"}
             onChange={() => onChange("native_extend")}
           />
-          <span>
-            <strong>Extend video</strong>
-            <span className="chain-method-desc">
-              Clip 1 t2v/i2v; clips 2+ native ltx-2-mlx extend on the prior MP4
-            </span>
-          </span>
+          Extend video
         </label>
       </div>
+    </div>
+  );
+}
+
+function LoraMultiSelect({
+  presets,
+  selectedIds,
+  disabled,
+  onToggle,
+  onRemoveCustom,
+}: {
+  presets: LoraPreset[];
+  selectedIds: string[];
+  disabled?: boolean;
+  onToggle: (id: string, checked: boolean) => void;
+  onRemoveCustom: (id: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e: MouseEvent) => {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [open]);
+
+  const selected = presets.filter((p) => selectedIds.includes(p.id));
+  const summary =
+    selected.length === 0
+      ? "None"
+      : selected.length === 1
+        ? selected[0].label
+        : `${selected.length} selected`;
+
+  return (
+    <div className="multi-select" ref={rootRef}>
+      <button
+        type="button"
+        className="multi-select-trigger"
+        disabled={disabled}
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+      >
+        {summary}
+      </button>
+      {open && (
+        <div className="multi-select-menu" role="listbox">
+          {presets.map((p) => (
+            <label key={p.id} className="multi-select-item">
+              <input
+                type="checkbox"
+                checked={selectedIds.includes(p.id)}
+                disabled={disabled}
+                onChange={(e) => onToggle(p.id, e.target.checked)}
+              />
+              <span className="multi-select-item-label">{p.label}</span>
+              {p.custom ? (
+                <button
+                  type="button"
+                  className="lora-remove"
+                  title="Remove"
+                  disabled={disabled}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    onRemoveCustom(p.id);
+                  }}
+                >
+                  ×
+                </button>
+              ) : null}
+            </label>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -186,7 +257,6 @@ export default function App() {
   const [loraPresetIds, setLoraPresetIds] = useState<string[]>([]);
   const [loraActivity, setLoraActivity] = useState<LoraActivity>({ phase: "idle" });
   const [loraBusy, setLoraBusy] = useState(false);
-  const [showCustomLora, setShowCustomLora] = useState(false);
   const [customLoraUrl, setCustomLoraUrl] = useState("");
   const [customLoraLabel, setCustomLoraLabel] = useState("");
   const [customLoraScale, setCustomLoraScale] = useState("1.0");
@@ -298,12 +368,26 @@ export default function App() {
       setModel(preferredModel);
       localStorage.setItem(MODEL_PREF_KEY, preferredModel);
       setNumSteps(cfg.defaults.num_steps);
-      const loraIds =
-        cfg.preferred_lora_preset_ids?.length
-          ? cfg.preferred_lora_preset_ids
-          : cfg.default_lora_preset_id && cfg.default_lora_preset_id !== "none"
-            ? [cfg.default_lora_preset_id]
-            : [];
+      let loraIds: string[] = [];
+      try {
+        const stored = localStorage.getItem(LORA_SEL_KEY);
+        if (stored) {
+          const parsed = JSON.parse(stored) as unknown;
+          if (Array.isArray(parsed)) {
+            loraIds = parsed.map(String).filter(Boolean);
+          }
+        }
+      } catch {
+        /* ignore */
+      }
+      if (!loraIds.length) {
+        loraIds =
+          cfg.preferred_lora_preset_ids?.length
+            ? cfg.preferred_lora_preset_ids
+            : cfg.default_lora_preset_id && cfg.default_lora_preset_id !== "none"
+              ? [cfg.default_lora_preset_id]
+              : [];
+      }
       setLoraPresetIds(loraIds);
       if (loraIds.length) {
         void ensureLoraPresets(loraIds, cfg.lora_presets);
@@ -318,6 +402,11 @@ export default function App() {
   }, [ensureLoraPresets]);
 
   const persistLoraSelection = useCallback(async (ids: string[]) => {
+    try {
+      localStorage.setItem(LORA_SEL_KEY, JSON.stringify(ids));
+    } catch {
+      /* ignore */
+    }
     try {
       await fetch(`${API}/api/config/loras`, {
         method: "POST",
@@ -387,7 +476,6 @@ export default function App() {
       setCustomLoraUrl("");
       setCustomLoraLabel("");
       setCustomLoraScale("1.0");
-      setShowCustomLora(false);
       if (data.id) {
         await ensureLoraPresets([data.id], nextPresets);
       }
@@ -1158,8 +1246,8 @@ export default function App() {
                 {config.model_note}
               </p>
 
-              <div className="options-grid">
-                <label>
+              <div className="options-grid options-grid-compact">
+                <label className="opt-mode">
                   Mode
                   <select
                     value={mode}
@@ -1174,7 +1262,7 @@ export default function App() {
                     ))}
                   </select>
                 </label>
-                <label>
+                <label className="opt-resolution">
                   Resolution
                   <select
                     value={resolutionId}
@@ -1185,7 +1273,7 @@ export default function App() {
                     ))}
                   </select>
                 </label>
-                <label>
+                <label className="opt-narrow">
                   Duration
                   <select
                     value={durationId}
@@ -1194,14 +1282,14 @@ export default function App() {
                     {config.duration_presets.map((d) => (
                       <option key={d.id} value={d.id} title={d.label}>
                         {d.label.includes("(test)")
-                          ? `~${d.seconds}s (test)`
+                          ? `~${d.seconds}s*`
                           : `~${d.seconds}s`}
                       </option>
                     ))}
                   </select>
                 </label>
-                <label>
-                  Clips (× duration)
+                <label className="opt-narrow">
+                  Clips
                   <select
                     value={clipMultiplier}
                     onChange={(e) => setClipMultiplier(Number(e.target.value))}
@@ -1216,7 +1304,7 @@ export default function App() {
                     ))}
                   </select>
                 </label>
-                <label>
+                <label className="opt-narrow">
                   Steps
                   <input
                     type="number"
@@ -1226,7 +1314,7 @@ export default function App() {
                     onChange={(e) => setNumSteps(Number(e.target.value))}
                   />
                 </label>
-                <label>
+                <label className="opt-seed">
                   Seed
                   <input
                     type="text"
@@ -1250,8 +1338,8 @@ export default function App() {
                       <span className="lora-status-spinner" aria-hidden />
                       <span>
                         {loraActivity.downloading
-                          ? `Downloading LoRA: ${loraActivity.label}`
-                          : `Verifying cached LoRA: ${loraActivity.label}`}
+                          ? `Downloading: ${loraActivity.label}`
+                          : `Verifying: ${loraActivity.label}`}
                         {loraActivity.total > 1
                           ? ` (${loraActivity.index}/${loraActivity.total})`
                           : ""}
@@ -1264,112 +1352,59 @@ export default function App() {
                 </div>
               )}
 
-              <div className="options-checks lora-presets-row">
-                <span className="lora-presets-title">LoRA presets</span>
-                {(config.lora_presets ?? [])
-                  .filter((p) => p.id !== "none")
-                  .map((p) => (
-                    <label key={p.id} className="check lora-check">
-                      <input
-                        type="checkbox"
-                        checked={loraPresetIds.includes(p.id)}
-                        disabled={loraBusy || addingCustomLora}
-                        onChange={(e) => toggleLoraPreset(p.id, e.target.checked)}
-                      />
-                      <span>
-                        {p.label}
-                        {p.custom ? (
-                          <button
-                            type="button"
-                            className="lora-remove"
-                            title="Remove custom LoRA"
-                            disabled={loraBusy}
-                            onClick={(e) => {
-                              e.preventDefault();
-                              void removeCustomLora(p.id);
-                            }}
-                          >
-                            ×
-                          </button>
-                        ) : null}
-                      </span>
-                    </label>
-                  ))}
+              <div className="lora-row">
+                <label className="lora-row-select">
+                  LoRA
+                  <LoraMultiSelect
+                    presets={(config.lora_presets ?? []).filter((p) => p.id !== "none")}
+                    selectedIds={loraPresetIds}
+                    disabled={loraBusy || addingCustomLora}
+                    onToggle={(id, checked) => toggleLoraPreset(id, checked)}
+                    onRemoveCustom={(id) => void removeCustomLora(id)}
+                  />
+                </label>
+                <div className="lora-row-add">
+                  <input
+                    type="text"
+                    className="lora-add-url"
+                    placeholder="HF URL or .safetensors path"
+                    value={customLoraUrl}
+                    disabled={addingCustomLora}
+                    onChange={(e) => setCustomLoraUrl(e.target.value)}
+                  />
+                  <input
+                    type="text"
+                    className="lora-add-name"
+                    placeholder="Name"
+                    value={customLoraLabel}
+                    disabled={addingCustomLora}
+                    onChange={(e) => setCustomLoraLabel(e.target.value)}
+                  />
+                  <input
+                    type="number"
+                    className="lora-add-scale"
+                    min={0}
+                    max={2}
+                    step={0.05}
+                    title="Strength"
+                    value={customLoraScale}
+                    disabled={addingCustomLora}
+                    onChange={(e) => setCustomLoraScale(e.target.value)}
+                  />
+                  <button
+                    type="button"
+                    className="btn-secondary btn-compact"
+                    disabled={!customLoraUrl.trim() || addingCustomLora || loraBusy}
+                    onClick={() => void addCustomLora()}
+                  >
+                    {addingCustomLora ? "…" : "Add"}
+                  </button>
+                </div>
               </div>
 
-              {loraActivity.phase === "ready" && (
-                <p className="hint lora-ready-hint">{loraActivity.message}</p>
-              )}
-
-              <details
-                className="lora-custom-details"
-                open={showCustomLora}
-                onToggle={(e) => setShowCustomLora(e.currentTarget.open)}
-              >
-                <summary>Add custom LoRA from Hugging Face…</summary>
-                <p className="hint lora-custom-help">
-                  Paste a Hugging Face <code>resolve</code> URL or a local{" "}
-                  <code>.safetensors</code> path. Strength controls how strongly the
-                  LoRA affects generation (1.0 = default).
-                </p>
-                <div className="options-grid lora-custom-grid">
-                  <label className="lora-custom-wide">
-                    Hugging Face URL or file path
-                    <input
-                      type="url"
-                      placeholder="https://huggingface.co/…/resolve/main/….safetensors"
-                      value={customLoraUrl}
-                      disabled={addingCustomLora}
-                      onChange={(e) => setCustomLoraUrl(e.target.value)}
-                    />
-                  </label>
-                  <label>
-                    Display name (optional)
-                    <input
-                      type="text"
-                      placeholder="My style LoRA"
-                      value={customLoraLabel}
-                      disabled={addingCustomLora}
-                      onChange={(e) => setCustomLoraLabel(e.target.value)}
-                    />
-                  </label>
-                  <label>
-                    Strength (0–2)
-                    <input
-                      type="number"
-                      min={0}
-                      max={2}
-                      step={0.05}
-                      value={customLoraScale}
-                      disabled={addingCustomLora}
-                      onChange={(e) => setCustomLoraScale(e.target.value)}
-                    />
-                  </label>
-                  <label className="lora-custom-action">
-                    <span className="lora-custom-action-spacer">&nbsp;</span>
-                    <button
-                      type="button"
-                      className="btn-secondary"
-                      disabled={!customLoraUrl.trim() || addingCustomLora || loraBusy}
-                      onClick={() => void addCustomLora()}
-                    >
-                      {addingCustomLora ? "Adding…" : "Add to presets"}
-                    </button>
-                  </label>
-                </div>
-              </details>
-
               {isMultiClip && !audiocontinue && (
-                <p className="hint duration-total">
-                  ~{durationSeconds}s × {clipMultiplier} clips ≈ ~{totalDurationSeconds}s
-                  merged ({chainMethodLabel} + autoconcat)
-                </p>
-              )}
-
-              {audiocontinue && (
-                <p className="hint duration-total">
-                  Music video: splits audio into {clipMultiplier} segment(s) (~
-                  {durationSeconds}s each), autocontinue + autoconcat + compact merge
+                <p className="hint hint-inline">
+                  ~{totalDurationSeconds}s total · {chainMethodLabel}
                 </p>
               )}
 
@@ -1395,13 +1430,11 @@ export default function App() {
                       }}
                       disabled={!audioPath || !config?.ffmpeg_available}
                     />
-                    Audiocontinue (music video — split audio per clip)
+                    Audiocontinue
                   </label>
                 )}
                 {mode === "a2v" && !config?.ffmpeg_available && (
-                  <p className="hint">
-                    Audiocontinue requires ffmpeg on the server PATH.
-                  </p>
+                  <p className="hint hint-inline">Requires ffmpeg.</p>
                 )}
                 <label className="check">
                   <input
@@ -1409,7 +1442,7 @@ export default function App() {
                     checked={enhancePrompt}
                     onChange={(e) => setEnhancePrompt(e.target.checked)}
                   />
-                  Enhance prompt (Gemma)
+                  Enhance prompt
                 </label>
                 {!isMultiClip && !audiocontinue && (
                   <label className="check">
@@ -1418,7 +1451,7 @@ export default function App() {
                       checked={autocontinue}
                       onChange={(e) => setAutocontinue(e.target.checked)}
                     />
-                    Chain clips (continue from prior clip)
+                    Chain clips
                   </label>
                 )}
                 <label className="check">
@@ -1428,10 +1461,10 @@ export default function App() {
                     onChange={(e) => setAutoconcat(e.target.checked)}
                     disabled={isMultiClip || audiocontinue}
                   />
-                  Autoconcat (merge clips with ffmpeg)
+                  Autoconcat
                 </label>
-                <label>
-                  Pipeline profile
+                <label className="opt-profile">
+                  Profile
                   <select
                     value={pipelineProfile}
                     onChange={(e) => setPipelineProfile(e.target.value)}
@@ -1447,13 +1480,6 @@ export default function App() {
                   </select>
                 </label>
               </div>
-
-              {chainMethod === "native_extend" && showChainMethodChoice && (
-                <p className="hint">
-                  Extend video: each segment after clip 1 adds ~{durationSeconds}s via native
-                  extend (latent frames match your duration preset). Autoconcat merges into one file.
-                </p>
-              )}
 
               {mode === "extend" && (
                 <div className="options-grid">
