@@ -321,9 +321,6 @@ def _clip_settings_from_body(body: dict[str, Any]) -> dict[str, Any]:
     audiocontinue = bool(body.get("audiocontinue", False))
     autocontinue = bool(body.get("autocontinue", False)) or clip_count > 1 or audiocontinue
     autoconcat = bool(body.get("autoconcat", False)) or clip_count > 1 or audiocontinue
-    chain_method = str(body.get("chain_method") or "autocontinue").strip().lower()
-    if chain_method not in ("autocontinue", "native_extend"):
-        chain_method = "autocontinue"
     return {
         "num_frames": body.get("num_frames") or duration_to_frames(duration_s),
         "width": body.get("width"),
@@ -335,7 +332,6 @@ def _clip_settings_from_body(body: dict[str, Any]) -> dict[str, Any]:
         "autocontinue": autocontinue,
         "autoconcat": autoconcat,
         "audiocontinue": audiocontinue,
-        "chain_method": chain_method,
     }
 
 
