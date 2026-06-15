@@ -1434,6 +1434,9 @@ class LocalVideoGenerator:
         steps = max(1, requested_steps)
         if steps != requested_steps:
             log.warning("LTX steps must be >=1; adjusted steps %s → %s", requested_steps, steps)
+        effective_steps = steps
+        if mode in ("extend", "retake"):
+            effective_steps = max(steps, RETAKE_EXTEND_DEFAULT_STEPS)
         requested_seed = int(req.seed)
         seed = requested_seed
         if seed < 0:
@@ -1531,7 +1534,7 @@ class LocalVideoGenerator:
                 height,
                 width,
                 nf,
-                steps,
+                effective_steps if mode in ("extend", "retake") else steps,
                 float(self.fps),
                 requested_height,
                 requested_width,
@@ -1612,7 +1615,7 @@ class LocalVideoGenerator:
                         end_frame = int(req.retake_end if req.retake_end is not None else start_frame)
                         pipe = self._get_pipe("retake")
                         last_pipe = pipe
-                        retake_steps = max(steps, RETAKE_EXTEND_DEFAULT_STEPS)
+                        retake_steps = effective_steps
                         retake_kwargs = dict(
                             prompt=effective_prompt,
                             output_path=out_path,
@@ -1635,20 +1638,22 @@ class LocalVideoGenerator:
                             fps=float(self.fps),
                         )
                         _apply_optional_generate_kwargs(retake_kwargs, req)
-                        if hasattr(pipe, "generate_and_save"):
-                            _invoke_generate_and_save(
-                                pipe,
-                                **common_gen_kwargs,
-                                video_path=tmp_video,
-                                start_frame=start_frame,
-                                end_frame=end_frame,
+                        if not callable(getattr(pipe, "retake_from_video", None)):
+                            raise RuntimeError(
+                                f"{type(pipe).__name__} has no retake_from_video(); "
+                                "update ltx-2-mlx"
                             )
-                        else:
-                            _invoke_retake_and_save(
-                                pipe,
-                                default_fps=float(self.fps),
-                                **retake_kwargs,
-                            )
+                        log.info(
+                            "Retake via retake_from_video (frames %s-%s, steps=%s)",
+                            start_frame,
+                            end_frame,
+                            retake_steps,
+                        )
+                        _invoke_retake_and_save(
+                            pipe,
+                            default_fps=float(self.fps),
+                            **retake_kwargs,
+                        )
                     elif mode == "extend":
                         if not tmp_video:
                             raise RuntimeError("extend mode requires source video input")
@@ -1656,7 +1661,7 @@ class LocalVideoGenerator:
                         direction = (req.extend_direction or "after").strip().lower()
                         pipe = self._get_pipe("extend")
                         last_pipe = pipe
-                        extend_steps = max(steps, RETAKE_EXTEND_DEFAULT_STEPS)
+                        extend_steps = effective_steps
                         extend_kwargs = dict(
                             prompt=effective_prompt,
                             output_path=out_path,
@@ -1679,20 +1684,22 @@ class LocalVideoGenerator:
                             fps=float(self.fps),
                         )
                         _apply_optional_generate_kwargs(extend_kwargs, req)
-                        if hasattr(pipe, "generate_and_save"):
-                            _invoke_generate_and_save(
-                                pipe,
-                                **common_gen_kwargs,
-                                video_path=tmp_video,
-                                extend_frames=ext_frames,
-                                direction=direction,
+                        if not callable(getattr(pipe, "extend_from_video", None)):
+                            raise RuntimeError(
+                                f"{type(pipe).__name__} has no extend_from_video(); "
+                                "update ltx-2-mlx"
                             )
-                        else:
-                            _invoke_extend_and_save(
-                                pipe,
-                                default_fps=float(self.fps),
-                                **extend_kwargs,
-                            )
+                        log.info(
+                            "Extend via extend_from_video (extend_frames=%s, direction=%s, steps=%s)",
+                            ext_frames,
+                            direction,
+                            extend_steps,
+                        )
+                        _invoke_extend_and_save(
+                            pipe,
+                            default_fps=float(self.fps),
+                            **extend_kwargs,
+                        )
                     elif mode == "keyframe":
                         if not tmp_image or not tmp_end_image:
                             raise RuntimeError("keyframe mode requires start and end images")
