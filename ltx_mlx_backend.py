@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import concurrent.futures
 import functools
 import inspect
 import logging
@@ -22,7 +21,6 @@ import subprocess
 import tempfile
 import threading
 import time
-import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -917,41 +915,7 @@ class _ModelProgressStore:
 
 
 class GenerationCancelledError(RuntimeError):
-    """Raised when generation is cancelled via ``request_cancel()`` or SIGINT."""
-
-
-class _DaemonThreadPoolExecutor(concurrent.futures.ThreadPoolExecutor):
-    """Thread pool whose workers are daemon threads so SIGINT can exit the process."""
-
-    def _adjust_thread_count(self) -> None:
-        # Mirror stdlib ThreadPoolExecutor but set daemon=True before start().
-        # Setting daemon after super()._adjust_thread_count() raises:
-        # RuntimeError: cannot set daemon status of active thread
-        if self._idle_semaphore.acquire(timeout=0):
-            return
-
-        def weakref_cb(_, q=self._work_queue):
-            q.put(None)
-
-        num_threads = len(self._threads)
-        if num_threads < self._max_workers:
-            from concurrent.futures.thread import _threads_queues, _worker
-
-            thread_name = "%s_%d" % (self._thread_name_prefix or self, num_threads)
-            t = threading.Thread(
-                name=thread_name,
-                target=_worker,
-                args=(
-                    weakref.ref(self, weakref_cb),
-                    self._work_queue,
-                    self._initializer,
-                    self._initargs,
-                ),
-                daemon=True,
-            )
-            t.start()
-            self._threads.add(t)
-            _threads_queues[t] = self._work_queue
+    """Raised when generation is cancelled via ``request_cancel()``."""
 
 
 def _stage_from_tqdm_desc(desc: str) -> str:
@@ -1007,10 +971,6 @@ class LocalVideoGenerator:
         self._lpm_module: Any | None = None
         self._model_progress = _ModelProgressStore()
         self._cancel_requested = threading.Event()
-        self._executor = _DaemonThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix="ltx-mlx-gen",
-        )
 
     def clear_cancel(self) -> None:
         self._cancel_requested.clear()
@@ -1392,7 +1352,7 @@ class LocalVideoGenerator:
         self.clear_cancel()
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(
-            self._executor,
+            None,
             functools.partial(
                 self._generate_sync,
                 GenerationRequest(
