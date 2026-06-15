@@ -274,17 +274,14 @@ async def _save_upload_file(
 
 
 def local_hostname() -> str:
-    """Resolve this machine's hostname for startup log hints."""
+    """Short machine hostname (like ``hostname -s``)."""
     try:
-        fqdn = socket.getfqdn().strip()
-        if fqdn and fqdn not in ("localhost", "localhost.localdomain"):
-            return fqdn
+        name = socket.gethostname().strip().split(".")[0]
+        if name:
+            return name
     except OSError:
         pass
-    try:
-        return socket.gethostname().strip() or "localhost"
-    except OSError:
-        return "localhost"
+    return "localhost"
 
 
 def public_host(bind_host: str) -> str:
