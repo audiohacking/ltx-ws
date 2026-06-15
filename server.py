@@ -48,6 +48,7 @@ import mimetypes
 import os
 import re
 import shutil
+import signal
 import sys
 import subprocess
 import tempfile
@@ -987,6 +988,25 @@ class VideoServer:
         self.chunk_size  = chunk_size
         self.spill_dir    = spill_dir
         self.scheduler   = GenerationScheduler()
+        self._sigint_count: int = 0
+        self._sigint_last_ts: float = 0.0
+
+    def on_console_interrupt(self) -> None:
+        """First Ctrl+C cancels MLX work; a second within 2s force-exits the process."""
+        now = time.monotonic()
+        if now - self._sigint_last_ts > 2.0:
+            self._sigint_count = 0
+        self._sigint_last_ts = now
+        self._sigint_count += 1
+        self.generator.request_cancel()
+        if self._sigint_count == 1:
+            log.warning(
+                "Interrupt received — cancelling active generation "
+                "(press Ctrl+C again within 2s to force quit)"
+            )
+        else:
+            log.warning("Force quit")
+            os._exit(130)
 
     async def handle_ws_connection(self, ws: Any) -> None:
         """Handle one WebSocket client (websockets or WsProtocolAdapter)."""
@@ -1019,6 +1039,12 @@ class VideoServer:
         if web_state is not None:
             await self._serve_with_web_ui(web_state)
             return
+        loop = asyncio.get_running_loop()
+        try:
+            loop.add_signal_handler(signal.SIGINT, self.on_console_interrupt)
+            loop.add_signal_handler(signal.SIGTERM, self.on_console_interrupt)
+        except (NotImplementedError, RuntimeError):
+            pass
         url = f"ws://{self.host}:{self.port}/ws"
         async with websockets.serve(
             self._handle_client,

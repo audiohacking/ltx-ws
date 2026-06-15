@@ -561,6 +561,29 @@ class AppState:
         self._worker_started = False
         self._cancelled_runs: set[str] = set()
         self._active_run_id: str | None = None
+        self._sigint_count: int = 0
+        self._sigint_last_ts: float = 0.0
+
+    def on_console_interrupt(self) -> None:
+        """First Ctrl+C cancels MLX work; a second within 2s force-exits the process."""
+        now = time.monotonic()
+        if now - self._sigint_last_ts > 2.0:
+            self._sigint_count = 0
+        self._sigint_last_ts = now
+        self._sigint_count += 1
+
+        self._signal_generator_cancel()
+        if self._active_run_id:
+            self._cancelled_runs.add(self._active_run_id)
+
+        if self._sigint_count == 1:
+            log.warning(
+                "Interrupt received — cancelling active generation "
+                "(press Ctrl+C again within 2s to force quit)"
+            )
+        else:
+            log.warning("Force quit")
+            os._exit(130)
 
     def set_active_run(self, run_id: str | None) -> None:
         self._active_run_id = run_id
@@ -590,15 +613,13 @@ class AppState:
         ):
             return False
         self._cancelled_runs.add(run_id)
-        if self._active_run_id == run_id:
-            self._signal_generator_cancel()
+        self._signal_generator_cancel()
         return True
 
     def cancel_active_generation(self) -> None:
+        self._signal_generator_cancel()
         if self._active_run_id:
-            self.request_cancel_run(self._active_run_id)
-        else:
-            self._signal_generator_cancel()
+            self._cancelled_runs.add(self._active_run_id)
 
     def apply_saved_settings(self) -> None:
         """Load persisted UI settings; default model preference favors local weights."""
@@ -1916,8 +1937,7 @@ def create_app(
         loop = asyncio.get_running_loop()
 
         def _on_interrupt() -> None:
-            log.warning("Interrupt received — cancelling active generation")
-            state.cancel_active_generation()
+            state.on_console_interrupt()
 
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
