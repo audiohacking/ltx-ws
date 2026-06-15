@@ -76,6 +76,7 @@ export default function App() {
   const [seed, setSeed] = useState<string>("");
   const [autocontinue, setAutocontinue] = useState(true);
   const [autoconcat, setAutoconcat] = useState(false);
+  const [audiocontinue, setAudiocontinue] = useState(false);
   const [imagePath, setImagePath] = useState<string | null>(null);
   const [imageName, setImageName] = useState<string | null>(null);
   const [audioPath, setAudioPath] = useState<string | null>(null);
@@ -175,6 +176,19 @@ export default function App() {
     }
   }, [clipMultiplier]);
 
+  useEffect(() => {
+    if (audiocontinue) {
+      setAutocontinue(true);
+      setAutoconcat(true);
+    }
+  }, [audiocontinue]);
+
+  useEffect(() => {
+    if (mode !== "a2v") {
+      setAudiocontinue(false);
+    }
+  }, [mode]);
+
   const resolution = useMemo(() => {
     if (!config) return { width: 704, height: 480 };
     const p = config.resolution_presets.find((r) => r.id === resolutionId);
@@ -208,6 +222,7 @@ export default function App() {
     setSeed(snap.seed);
     setAutocontinue(snap.autocontinue);
     setAutoconcat(snap.autoconcat);
+    setAudiocontinue(snap.audiocontinue);
     setShowOptions(true);
     setError(null);
   }
@@ -240,13 +255,19 @@ export default function App() {
     setSelectedClipId(null);
     setPrompt("");
     setClipMultiplier(1);
+    setAudiocontinue(false);
     setError(null);
     setLoraPresetId(config?.default_lora_preset_id ?? "default");
   }
 
   const needsImageUpload = mode === "i2v";
-  const needsAudioUpload = mode === "a2v";
+  const isA2v = mode === "a2v";
   const needsVideoUpload = mode === "retake" || mode === "extend";
+  const showStartImageOptional = mode === "generate";
+  const showChainedImageHint =
+    isA2v &&
+    (audiocontinue || autocontinue || isMultiClip) &&
+    Boolean(imagePath);
 
   async function uploadFile(file: File, kind: string): Promise<string> {
     const fd = new FormData();
@@ -255,7 +276,17 @@ export default function App() {
       method: "POST",
       body: fd,
     });
-    if (!r.ok) throw new Error(`Upload failed: ${kind}`);
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      const detail = err.detail;
+      const message =
+        typeof detail === "string"
+          ? detail
+          : Array.isArray(detail)
+            ? detail.map((d: { msg?: string }) => d.msg).join("; ")
+            : `Upload failed: ${kind}`;
+      throw new Error(message);
+    }
     const data = await r.json();
     return data.path as string;
   }
@@ -277,6 +308,7 @@ export default function App() {
   async function subscribeRun(runId: string, runChainId: string) {
     let closed = false;
     let autoconcatRun = false;
+    let audiocontinueRun = false;
     const es = new EventSource(`${API}/api/runs/${runId}/events`);
 
     const finishRun = async () => {
@@ -318,11 +350,14 @@ export default function App() {
       const msg = JSON.parse(ev.data);
       if (msg.type === "run_started") {
         autoconcatRun = Boolean(msg.autoconcat);
+        audiocontinueRun = Boolean(msg.audiocontinue);
         setProgress({
           phase: "queued",
-          message: autoconcatRun
-            ? `Generating ${msg.clip_count ?? "?"} clips (autoconcat)…`
-            : "Generation queued…",
+          message: audiocontinueRun
+            ? `Music video: ${msg.clip_count ?? "?"} clips (audiocontinue)…`
+            : autoconcatRun
+              ? `Generating ${msg.clip_count ?? "?"} clips (autoconcat)…`
+              : "Generation queued…",
         });
       } else if (msg.type === "clip_started") {
         const idx = typeof msg.index === "number" ? msg.index + 1 : "?";
@@ -330,8 +365,10 @@ export default function App() {
         setProgress({
           phase: "running",
           message:
-            autoconcatRun && total !== "?"
-              ? `Generating clip ${idx}/${total}…`
+            (autoconcatRun || audiocontinueRun) && total !== "?"
+              ? audiocontinueRun
+                ? `Music video clip ${idx}/${total}…`
+                : `Generating clip ${idx}/${total}…`
               : "Starting clip…",
         });
       } else if (msg.type === "generation_progress") {
@@ -446,8 +483,9 @@ export default function App() {
       duration_seconds: durationSeconds,
       clip_count: clipMultiplier,
       num_steps: numSteps,
-      autocontinue: autocontinue || isMultiClip,
-      autoconcat: autoconcat || isMultiClip,
+      autocontinue: autocontinue || isMultiClip || audiocontinue,
+      autoconcat: autoconcat || isMultiClip || audiocontinue,
+      audiocontinue: audiocontinue && mode === "a2v",
       chain_id: isChainEdit ? chainId : undefined,
       continue_from: isChainEdit ? activeClip?.id : undefined,
       image_path: imagePath,
@@ -510,6 +548,7 @@ export default function App() {
     const continuing = editingChain && autocontinue;
     if (mode === "i2v" && !imagePath && !continuing) return false;
     if (mode === "a2v" && !audioPath) return false;
+    if (audiocontinue && !config?.ffmpeg_available) return false;
     if ((mode === "retake" || mode === "extend") && !videoPath) return false;
     return true;
   }, [
@@ -519,6 +558,9 @@ export default function App() {
     mode,
     imagePath,
     audioPath,
+    audiocontinue,
+    clipMultiplier,
+    config?.ffmpeg_available,
     videoPath,
     autocontinue,
     activeClip,
@@ -755,20 +797,49 @@ export default function App() {
                 <p className="hint">{loraStatus}</p>
               )}
 
-              {isMultiClip && (
+              {isMultiClip && !audiocontinue && (
                 <p className="hint duration-total">
                   ~{durationSeconds}s × {clipMultiplier} clips ≈ ~{totalDurationSeconds}s
                   merged (autocontinue + autoconcat on)
                 </p>
               )}
 
+              {audiocontinue && (
+                <p className="hint duration-total">
+                  Music video: splits audio into {clipMultiplier} segment(s) (~
+                  {durationSeconds}s each), autocontinue + autoconcat + compact merge
+                </p>
+              )}
+
               <div className="options-checks">
+                {mode === "a2v" && (
+                  <label className="check">
+                    <input
+                      type="checkbox"
+                      checked={audiocontinue}
+                      onChange={(e) => {
+                        const on = e.target.checked;
+                        setAudiocontinue(on);
+                        if (on && clipMultiplier < 2) {
+                          setClipMultiplier(2);
+                        }
+                      }}
+                      disabled={!audioPath || !config?.ffmpeg_available}
+                    />
+                    Audiocontinue (music video — split audio per clip)
+                  </label>
+                )}
+                {mode === "a2v" && !config?.ffmpeg_available && (
+                  <p className="hint">
+                    Audiocontinue requires ffmpeg on the server PATH.
+                  </p>
+                )}
                 <label className="check">
                   <input
                     type="checkbox"
                     checked={autocontinue}
                     onChange={(e) => setAutocontinue(e.target.checked)}
-                    disabled={isMultiClip}
+                    disabled={isMultiClip || audiocontinue}
                   />
                   Autocontinue (last frame → next clip)
                 </label>
@@ -777,17 +848,71 @@ export default function App() {
                     type="checkbox"
                     checked={autoconcat}
                     onChange={(e) => setAutoconcat(e.target.checked)}
-                    disabled={isMultiClip}
+                    disabled={isMultiClip || audiocontinue}
                   />
                   Autoconcat (merge clips with ffmpeg)
                 </label>
               </div>
 
-              {(needsImageUpload || needsAudioUpload || needsVideoUpload || mode === "generate") && (
+              {(isA2v || needsImageUpload || showStartImageOptional || needsVideoUpload) && (
                 <div className="media-panel">
-                  <span className="media-panel-title">Source media</span>
-                  {(needsImageUpload || mode === "generate") && (
-                    <label className="media-upload">
+                  {isA2v && (
+                    <>
+                      <span className="media-panel-title">Audio to video inputs</span>
+                      <div className="media-upload-row">
+                        <label className="media-upload">
+                          <span className="media-upload-label">
+                            Start image (optional, clip 1 only)
+                          </span>
+                          <input
+                            ref={imageRef}
+                            type="file"
+                            accept="image/*"
+                            onChange={async (e) => {
+                              const f = e.target.files?.[0];
+                              if (f) {
+                                setImagePath(await uploadFile(f, "image"));
+                                setImageName(f.name);
+                              }
+                            }}
+                          />
+                          <span className="media-upload-hint">
+                            {imageName ?? "Choose image file…"}
+                          </span>
+                        </label>
+                        <label className="media-upload">
+                          <span className="media-upload-label">
+                            Source audio (required)
+                          </span>
+                          <input
+                            ref={audioRef}
+                            type="file"
+                            accept="audio/*"
+                            onChange={async (e) => {
+                              const f = e.target.files?.[0];
+                              if (f) {
+                                setAudioPath(await uploadFile(f, "audio"));
+                                setAudioName(f.name);
+                              }
+                            }}
+                          />
+                          <span className="media-upload-hint">
+                            {audioName ?? "Choose audio file…"}
+                          </span>
+                        </label>
+                      </div>
+                      {showChainedImageHint && (
+                        <p className="hint">
+                          With autocontinue / audiocontinue, the start image is used for
+                          clip 1 only; later clips use the last frame of the prior clip.
+                        </p>
+                      )}
+                    </>
+                  )}
+                  {!isA2v && (needsImageUpload || showStartImageOptional) && (
+                    <>
+                      <span className="media-panel-title">Source media</span>
+                      <label className="media-upload">
                       <span className="media-upload-label">
                         {needsImageUpload
                           ? "Source image (required)"
@@ -809,45 +934,29 @@ export default function App() {
                         {imageName ?? "Choose image file…"}
                       </span>
                     </label>
-                  )}
-                  {needsAudioUpload && (
-                    <label className="media-upload">
-                      <span className="media-upload-label">
-                        Source audio {needsAudioUpload ? "(required)" : ""}
-                      </span>
-                      <input
-                        ref={audioRef}
-                        type="file"
-                        accept="audio/*"
-                        onChange={async (e) => {
-                          const f = e.target.files?.[0];
-                          if (f) {
-                            setAudioPath(await uploadFile(f, "audio"));
-                            setAudioName(f.name);
-                          }
-                        }}
-                      />
-                      <span className="media-upload-hint">
-                        {audioName ?? "Choose audio file…"}
-                      </span>
-                    </label>
+                    </>
                   )}
                   {needsVideoUpload && (
-                    <label className="media-upload">
-                      <span className="media-upload-label">Source video (required)</span>
-                      <input
-                        ref={videoRef}
-                        type="file"
-                        accept="video/*"
-                        onChange={async (e) => {
-                          const f = e.target.files?.[0];
-                          if (f) setVideoPath(await uploadFile(f, "video"));
-                        }}
-                      />
-                      <span className="media-upload-hint">
-                        {videoPath ? "✓ uploaded" : "Choose video file…"}
-                      </span>
-                    </label>
+                    <>
+                      {!isA2v && (
+                        <span className="media-panel-title">Source media</span>
+                      )}
+                      <label className="media-upload">
+                        <span className="media-upload-label">Source video (required)</span>
+                        <input
+                          ref={videoRef}
+                          type="file"
+                          accept="video/*"
+                          onChange={async (e) => {
+                            const f = e.target.files?.[0];
+                            if (f) setVideoPath(await uploadFile(f, "video"));
+                          }}
+                        />
+                        <span className="media-upload-hint">
+                          {videoPath ? "✓ uploaded" : "Choose video file…"}
+                        </span>
+                      </label>
+                    </>
                   )}
                 </div>
               )}

@@ -17,6 +17,7 @@ import os
 import random
 import re
 import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -73,6 +74,7 @@ class GenerationRequest:
     lora_specs: list[tuple[str, float]] | None = None
     video_conditioning_specs: list[tuple[dict | str, float]] | None = None
     job_id: str | None = None
+    a2v_visual_i2v_continue: bool = False
 
 
 def looks_like_hf_repo_id(model: str) -> bool:
@@ -469,6 +471,10 @@ def _decode_media_input(
         data_url = str(media_data.get("data_url") or "").strip()
         if not data_url:
             return None, None
+        name_hint = str(
+            media_data.get("name") or media_data.get("filename") or ""
+        ).strip()
+        name_suffix = Path(name_hint).suffix if name_hint else ""
         if data_url.startswith(("http://", "https://")):
             tmp = _download_remote_to_temp(data_url, temp_prefix, default_suffix)
             return tmp, tmp
@@ -485,7 +491,7 @@ def _decode_media_input(
         else:
             mime = str(media_data.get("mime_type") or "")
             encoded = data_url
-        ext = mimetypes.guess_extension(mime) or default_suffix
+        ext = name_suffix or mimetypes.guess_extension(mime) or default_suffix
         if ext == ".jpe":
             ext = ".jpg"
         fd, path = tempfile.mkstemp(prefix=temp_prefix, suffix=ext)
@@ -655,6 +661,48 @@ def _invoke_generate_and_save(pipe: Any, **kwargs: Any) -> None:
         call_kwargs = {k: v for k, v in call_kwargs.items() if k in accepted}
 
     fn(**call_kwargs)
+
+
+def _mux_audio_into_video(
+    video_path: str,
+    audio_path: str,
+    output_path: str,
+    *,
+    duration_s: float,
+) -> None:
+    """Mux an audio track into a silent video (a2v chain visual continuation)."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError(
+            "ffmpeg is required to mux audio into a2v autocontinue clips"
+        )
+    cmd = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        video_path,
+        "-i",
+        audio_path,
+        "-t",
+        f"{max(0.1, duration_s):.6f}",
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-c:v",
+        "copy",
+        "-c:a",
+        "aac",
+        "-shortest",
+        output_path,
+    ]
+    cp = subprocess.run(cmd, capture_output=True, text=True)
+    if cp.returncode != 0:
+        err = (cp.stderr or cp.stdout or "unknown ffmpeg error").strip()
+        raise RuntimeError(f"ffmpeg audio mux failed: {err}")
 
 
 class _ModelProgressStore:
@@ -1070,6 +1118,7 @@ class LocalVideoGenerator:
         video_conditioning_specs: list[tuple[dict | str, float]] | None = None,
         *,
         job_id: str | None = None,
+        a2v_visual_i2v_continue: bool = False,
     ) -> str:
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(
@@ -1095,6 +1144,7 @@ class LocalVideoGenerator:
                     lora_specs=lora_specs,
                     video_conditioning_specs=video_conditioning_specs,
                     job_id=job_id,
+                    a2v_visual_i2v_continue=a2v_visual_i2v_continue,
                 ),
             ),
         )
@@ -1270,13 +1320,36 @@ class LocalVideoGenerator:
                         lora_paths=resolved_loras,
                     )
                     if mode == "a2v":
-                        pipe = self._get_pipe("a2v")
-                        _invoke_generate_and_save(
-                            pipe,
-                            **common_gen_kwargs,
-                            audio_path=tmp_audio,
-                            image=tmp_image,
-                        )
+                        if not tmp_audio:
+                            raise RuntimeError("a2v mode requires audio input")
+                        video_duration_s = nf / float(self.fps)
+                        if req.a2v_visual_i2v_continue and tmp_image:
+                            log.info(
+                                "A2V chain continue: i2v visual + audio mux "
+                                "(avoids A2V re-conditioning on autocontinue frame)"
+                            )
+                            silent_path = os.path.join(tmpdir, "output_silent.mp4")
+                            pipe = self._get_pipe("i2v")
+                            _invoke_generate_and_save(
+                                pipe,
+                                **common_gen_kwargs,
+                                output_path=silent_path,
+                                image=tmp_image,
+                            )
+                            _mux_audio_into_video(
+                                silent_path,
+                                tmp_audio,
+                                out_path,
+                                duration_s=video_duration_s,
+                            )
+                        else:
+                            pipe = self._get_pipe("a2v")
+                            _invoke_generate_and_save(
+                                pipe,
+                                **common_gen_kwargs,
+                                audio_path=tmp_audio,
+                                image=tmp_image,
+                            )
                     elif mode == "retake":
                         if not tmp_video:
                             raise RuntimeError("retake mode requires source video input")

@@ -41,6 +41,7 @@ export interface Config {
   active_model?: string;
   lora_presets?: LoraPreset[];
   default_lora_preset_id?: string;
+  ffmpeg_available?: boolean;
 }
 
 export interface Clip {
@@ -66,6 +67,7 @@ export interface Clip {
   clip_count?: number;
   autocontinue?: boolean;
   autoconcat?: boolean;
+  audiocontinue?: boolean;
 }
 
 export interface ModelProgress {
