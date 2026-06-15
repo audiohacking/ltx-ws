@@ -582,9 +582,36 @@ class AppState:
         self._active_run_id: str | None = None
         self._sigint_count: int = 0
         self._sigint_last_ts: float = 0.0
+        self._uvicorn_server: Any | None = None
+
+    def is_generation_active(self) -> bool:
+        vs = self.video_server
+        if vs is not None:
+            sched = getattr(vs, "scheduler", None)
+            if sched is not None and sched.running_generation_id:
+                return True
+        return False
+
+    def request_shutdown(self) -> None:
+        uv = self._uvicorn_server
+        if uv is not None:
+            uv.should_exit = True
+
+    def _force_exit(self) -> None:
+        vs = self.video_server
+        if vs is not None:
+            gen = getattr(vs, "generator", None)
+            if gen is not None and hasattr(gen, "shutdown"):
+                gen.shutdown(wait=False)
+        os._exit(130)
 
     def on_console_interrupt(self) -> None:
-        """First Ctrl+C cancels MLX work; a second within 2s force-exits the process."""
+        """Idle: graceful shutdown. During MLX work: cancel, then force-quit on repeat."""
+        if not self.is_generation_active():
+            log.info("Shutting down…")
+            self.request_shutdown()
+            return
+
         now = time.monotonic()
         if now - self._sigint_last_ts > 2.0:
             self._sigint_count = 0
@@ -597,12 +624,12 @@ class AppState:
 
         if self._sigint_count == 1:
             log.warning(
-                "Interrupt received — cancelling active generation "
+                "Interrupt received — cancelling generation "
                 "(press Ctrl+C again within 2s to force quit)"
             )
         else:
             log.warning("Force quit")
-            os._exit(130)
+            self._force_exit()
 
     def set_active_run(self, run_id: str | None) -> None:
         self._active_run_id = run_id
@@ -1979,6 +2006,11 @@ def create_app(
             except (NotImplementedError, RuntimeError):
                 pass
         yield
+        vs = state.video_server
+        if vs is not None:
+            gen = getattr(vs, "generator", None)
+            if gen is not None and hasattr(gen, "shutdown"):
+                gen.shutdown(wait=True)
         if state.server_process:
             state.server_process.terminate()
 
@@ -2494,12 +2526,14 @@ def build_combined_application(
     return create_app(state, mount_static=True, ws_handler=ws_handler)
 
 
-async def run_uvicorn(app: Any, host: str, port: int) -> None:
+async def run_uvicorn(app: Any, host: str, port: int, state: AppState | None = None) -> None:
     _ensure_web_deps()
     import uvicorn
 
     config = uvicorn.Config(app, host=host, port=port, log_level="info")
     server = uvicorn.Server(config)
+    if state is not None:
+        state._uvicorn_server = server
     await server.serve()
 
 

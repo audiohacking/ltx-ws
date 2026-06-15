@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import concurrent.futures
 import functools
 import inspect
 import logging
@@ -977,6 +978,19 @@ class LocalVideoGenerator:
         self._lpm_module: Any | None = None
         self._model_progress = _ModelProgressStore()
         self._cancel_requested = threading.Event()
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="ltx-gen",
+        )
+        self._executor_shutdown = False
+
+    def shutdown(self, *, wait: bool = False) -> None:
+        """Release the generation thread pool (call on server exit)."""
+        self.request_cancel()
+        if self._executor_shutdown:
+            return
+        self._executor.shutdown(wait=wait, cancel_futures=True)
+        self._executor_shutdown = True
 
     def clear_cancel(self) -> None:
         self._cancel_requested.clear()
@@ -1367,7 +1381,7 @@ class LocalVideoGenerator:
         self.clear_cancel()
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(
-            None,
+            self._executor,
             functools.partial(
                 self._generate_sync,
                 GenerationRequest(

@@ -990,9 +990,18 @@ class VideoServer:
         self.scheduler   = GenerationScheduler()
         self._sigint_count: int = 0
         self._sigint_last_ts: float = 0.0
+        self._shutdown = asyncio.Event()
+
+    def is_generation_active(self) -> bool:
+        return self.scheduler.running_generation_id is not None
 
     def on_console_interrupt(self) -> None:
-        """First Ctrl+C cancels MLX work; a second within 2s force-exits the process."""
+        """Idle: graceful shutdown. During MLX work: cancel, then force-quit on repeat."""
+        if not self.is_generation_active():
+            log.info("Shutting down…")
+            self._shutdown.set()
+            return
+
         now = time.monotonic()
         if now - self._sigint_last_ts > 2.0:
             self._sigint_count = 0
@@ -1001,11 +1010,12 @@ class VideoServer:
         self.generator.request_cancel()
         if self._sigint_count == 1:
             log.warning(
-                "Interrupt received — cancelling active generation "
+                "Interrupt received — cancelling generation "
                 "(press Ctrl+C again within 2s to force quit)"
             )
         else:
             log.warning("Force quit")
+            self.generator.shutdown(wait=False)
             os._exit(130)
 
     async def handle_ws_connection(self, ws: Any) -> None:
@@ -1060,7 +1070,7 @@ class VideoServer:
             close_timeout=5,
         ):
             log.info("WebSocket server listening on %s", url)
-            await asyncio.Future()
+            await self._shutdown.wait()
 
     async def _serve_with_web_ui(self, web_state: Any) -> None:
         from web_ui import build_combined_application, build_server_urls, run_uvicorn
@@ -1081,7 +1091,7 @@ class VideoServer:
         app = build_combined_application(starlette_ws_handler, web_state)
         log.info("Web UI       : %s", http_url)
         log.info("WebSocket    : %s", ws_url)
-        await run_uvicorn(app, self.host, self.port)
+        await run_uvicorn(app, self.host, self.port, web_state)
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
@@ -1450,6 +1460,9 @@ def main() -> None:
     try:
         asyncio.run(server.serve(web_state))
     except KeyboardInterrupt:
+        pass
+    finally:
+        server.generator.shutdown(wait=True)
         if web_state is not None:
             web_state.cancel_active_generation()
         print("\n\nServer stopped.")
