@@ -1025,7 +1025,11 @@ export default function App() {
     if ((mode === "retake" || mode === "extend" || mode === "lipdub") && videoPath) {
       body.video_path = videoPath;
     }
-    if (seed.trim()) body.seed = parseInt(seed, 10);
+    if (seed.trim()) {
+      body.seed = parseInt(seed, 10);
+    } else {
+      body.seed = -1;
+    }
 
     const selectedLoras = (config?.lora_presets ?? []).filter(
       (p) => loraPresetIds.includes(p.id) && p.spec,

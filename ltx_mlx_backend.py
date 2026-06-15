@@ -74,7 +74,7 @@ class GenerationRequest:
     image_data: dict | str | None = None
     audio_data: dict | str | None = None
     source_video_data: dict | str | None = None
-    seed: int = 1024
+    seed: int = -1
     num_frames: int | None = None
     height: int | None = None
     width: int | None = None
@@ -1338,7 +1338,7 @@ class LocalVideoGenerator:
         image_data: dict | str | None = None,
         audio_data: dict | str | None = None,
         source_video_data: dict | str | None = None,
-        seed: int = 1024,
+        seed: int = -1,
         num_frames: int | None = None,
         height: int | None = None,
         width: int | None = None,

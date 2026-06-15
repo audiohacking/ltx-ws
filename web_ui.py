@@ -926,6 +926,13 @@ def _api_mode(mode: str) -> str:
     return m
 
 
+def _resolve_seed(raw: Any) -> int:
+    """LTX uses seed < 0 (typically -1) for random; None → random."""
+    if raw is None:
+        return -1
+    return int(raw)
+
+
 def _build_params_from_request(body: dict[str, Any]) -> Any:
     (
         GenerationParams,
@@ -969,7 +976,7 @@ def _build_params_from_request(body: dict[str, Any]) -> Any:
         single_clip_mode=True,
         initial_image=image_payload,
         end_image=end_image_payload,
-        seed=body.get("seed"),
+        seed=_resolve_seed(body.get("seed")),
         num_frames=num_frames,
         height=body.get("height"),
         width=body.get("width"),
@@ -1122,7 +1129,7 @@ async def _run_clip_inprocess(
                         image_data=params.initial_image,
                         audio_data=params.audio_input,
                         source_video_data=params.source_video,
-                        seed=int(params.seed or 1024),
+                        seed=_resolve_seed(params.seed),
                         num_frames=params.num_frames,
                         height=params.height,
                         width=params.width,

@@ -720,7 +720,7 @@ class RequestHandler:
             except (TypeError, ValueError):
                 return default
 
-        gen_seed = _msg_int("seed", 1024)
+        gen_seed = _msg_int("seed", -1)
         gen_num_frames = _msg_int("num_frames", self.generator.num_frames)
         gen_height = _msg_int("height", self.generator.height)
         gen_width = _msg_int("width", self.generator.width)
