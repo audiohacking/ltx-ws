@@ -35,7 +35,6 @@ LTX2_MLX_GIT_TAG = "v0.14.9"
 
 CHAIN_METHOD_AUTOCONTINUE = "autocontinue"
 CHAIN_METHOD_NATIVE_EXTEND = "native_extend"
-RETAKE_EXTEND_DEFAULT_STEPS = 30
 RETAKE_EXTEND_DEFAULT_CFG = 3.0
 RETAKE_EXTEND_DEFAULT_STG = 1.0
 VALID_CHAIN_METHODS = frozenset({CHAIN_METHOD_AUTOCONTINUE, CHAIN_METHOD_NATIVE_EXTEND})
@@ -1434,9 +1433,6 @@ class LocalVideoGenerator:
         steps = max(1, requested_steps)
         if steps != requested_steps:
             log.warning("LTX steps must be >=1; adjusted steps %s → %s", requested_steps, steps)
-        effective_steps = steps
-        if mode in ("extend", "retake"):
-            effective_steps = max(steps, RETAKE_EXTEND_DEFAULT_STEPS)
         requested_seed = int(req.seed)
         seed = requested_seed
         if seed < 0:
@@ -1534,7 +1530,7 @@ class LocalVideoGenerator:
                 height,
                 width,
                 nf,
-                effective_steps if mode in ("extend", "retake") else steps,
+                steps,
                 float(self.fps),
                 requested_height,
                 requested_width,
@@ -1615,7 +1611,7 @@ class LocalVideoGenerator:
                         end_frame = int(req.retake_end if req.retake_end is not None else start_frame)
                         pipe = self._get_pipe("retake")
                         last_pipe = pipe
-                        retake_steps = effective_steps
+                        retake_steps = steps
                         retake_kwargs = dict(
                             prompt=effective_prompt,
                             output_path=out_path,
@@ -1661,7 +1657,7 @@ class LocalVideoGenerator:
                         direction = (req.extend_direction or "after").strip().lower()
                         pipe = self._get_pipe("extend")
                         last_pipe = pipe
-                        extend_steps = effective_steps
+                        extend_steps = steps
                         extend_kwargs = dict(
                             prompt=effective_prompt,
                             output_path=out_path,
