@@ -152,6 +152,43 @@ def _write_custom_loras(output_dir: Path, entries: list[dict[str, Any]]) -> None
     write_web_settings(output_dir, data)
 
 
+def _read_hidden_lora_ids(output_dir: Path) -> set[str]:
+    raw = read_web_settings(output_dir).get("hidden_lora_preset_ids")
+    if not isinstance(raw, list):
+        return set()
+    return {str(x).strip() for x in raw if str(x).strip()}
+
+
+def _persist_hidden_lora_ids(output_dir: Path, ids: set[str]) -> None:
+    data = read_web_settings(output_dir)
+    data["hidden_lora_preset_ids"] = sorted(ids)
+    write_web_settings(output_dir, data)
+
+
+def _remove_lora_preset_entry(output_dir: Path, preset_id: str) -> None:
+    """Drop a custom LoRA entry or hide a built-in/env preset from the Web UI."""
+    lid = (preset_id or "").strip()
+    if not lid or lid == "none":
+        raise ValueError("cannot remove the none preset")
+    if lid.startswith("custom_"):
+        kept = [e for e in _read_custom_loras(output_dir) if e["id"] != lid]
+        if len(kept) == len(_read_custom_loras(output_dir)):
+            raise LookupError("LoRA preset not found")
+        _write_custom_loras(
+            output_dir,
+            [
+                {"id": e["id"], "label": e["label"], "spec": e["spec"], "scale": e["scale"]}
+                for e in kept
+            ],
+        )
+        return
+    hidden = _read_hidden_lora_ids(output_dir)
+    if lid in hidden:
+        raise LookupError("LoRA preset not found")
+    hidden.add(lid)
+    _persist_hidden_lora_ids(output_dir, hidden)
+
+
 def _lora_catalog(output_dir: Path | None = None) -> tuple[list[dict[str, Any]], str]:
     """
     LoRA presets for the Web UI (default from LTX_WS_DEFAULT_LORA / server defaults).
@@ -222,6 +259,13 @@ def _lora_catalog(output_dir: Path | None = None) -> tuple[list[dict[str, Any]],
                 float(entry["scale"]),
             )
             presets[-1]["custom"] = True
+
+    if output_dir is not None:
+        hidden = _read_hidden_lora_ids(output_dir)
+        if hidden:
+            presets = [presets[0]] + [p for p in presets[1:] if p.get("id") not in hidden]
+            if default_id in hidden:
+                default_id = "none"
 
     return presets, default_id
 
@@ -2215,21 +2259,17 @@ def create_app(
             "preferred_lora_preset_ids": state.preferred_lora_preset_ids(),
         }
 
-    @app.delete("/api/loras/custom/{lora_id}")
-    async def delete_custom_lora(lora_id: str):
+    @app.delete("/api/loras/preset/{lora_id}")
+    async def remove_lora_preset(lora_id: str):
         lid = (lora_id or "").strip()
-        if not lid.startswith("custom_"):
-            raise HTTPException(400, "only custom_* presets can be deleted")
-        kept = [e for e in _read_custom_loras(state.output_dir) if e["id"] != lid]
-        if len(kept) == len(_read_custom_loras(state.output_dir)):
-            raise HTTPException(404, "custom LoRA not found")
-        _write_custom_loras(
-            state.output_dir,
-            [
-                {"id": e["id"], "label": e["label"], "spec": e["spec"], "scale": e["scale"]}
-                for e in kept
-            ],
-        )
+        if not lid or lid == "none":
+            raise HTTPException(400, "cannot remove the none preset")
+        try:
+            _remove_lora_preset_entry(state.output_dir, lid)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from exc
         state.persist_preferred_loras(
             [x for x in state.preferred_lora_preset_ids() if x != lid]
         )
@@ -2241,6 +2281,11 @@ def create_app(
             "default_lora_preset_id": default_lora_preset_id,
             "preferred_lora_preset_ids": state.preferred_lora_preset_ids(),
         }
+
+    @app.delete("/api/loras/custom/{lora_id}")
+    async def delete_custom_lora(lora_id: str):
+        """Backward-compatible alias for custom LoRA removal."""
+        return await remove_lora_preset(lora_id)
 
     @app.post("/api/loras/ensure")
     async def ensure_lora(body: dict[str, Any]):

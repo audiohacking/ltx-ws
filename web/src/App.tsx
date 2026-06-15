@@ -31,6 +31,17 @@ function persistEnsuredLoraSpec(spec: string) {
   }
 }
 
+function removeEnsuredLoraSpec(spec: string) {
+  if (!spec) return;
+  const next = readEnsuredLoraSpecs();
+  next.delete(spec);
+  try {
+    sessionStorage.setItem(LORA_ENSURED_KEY, JSON.stringify([...next]));
+  } catch {
+    /* ignore quota / private mode */
+  }
+}
+
 type LoraActivity =
   | { phase: "idle" }
   | {
@@ -181,13 +192,13 @@ function LoraMultiSelect({
   selectedIds,
   disabled,
   onToggle,
-  onRemoveCustom,
+  onRemovePreset,
 }: {
   presets: LoraPreset[];
   selectedIds: string[];
   disabled?: boolean;
   onToggle: (id: string, checked: boolean) => void;
-  onRemoveCustom: (id: string) => void;
+  onRemovePreset: (preset: LoraPreset) => void;
 }) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -229,21 +240,19 @@ function LoraMultiSelect({
                 onChange={(e) => onToggle(p.id, e.target.checked)}
               />
               <span className="multi-select-item-label">{p.label}</span>
-              {p.custom ? (
-                <button
-                  type="button"
-                  className="lora-remove"
-                  title="Remove"
-                  disabled={disabled}
-                  onClick={(e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    onRemoveCustom(p.id);
-                  }}
-                >
-                  ×
-                </button>
-              ) : null}
+              <button
+                type="button"
+                className="lora-remove"
+                title="Remove from list"
+                disabled={disabled}
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  onRemovePreset(p);
+                }}
+              >
+                ×
+              </button>
             </label>
           ))}
         </div>
@@ -549,16 +558,22 @@ export default function App() {
     }
   }
 
-  async function removeCustomLora(presetId: string) {
-    if (!presetId.startsWith("custom_") || loraBusy) return;
+  async function removeLoraPreset(preset: LoraPreset) {
+    if (loraBusy) return;
+    const msg = preset.custom
+      ? `Remove custom LoRA "${preset.label}"?`
+      : `Hide "${preset.label}" from the LoRA list?`;
+    if (!confirm(msg)) return;
     try {
-      const r = await fetch(`${API}/api/loras/custom/${encodeURIComponent(presetId)}`, {
+      const r = await fetch(`${API}/api/loras/preset/${encodeURIComponent(preset.id)}`, {
         method: "DELETE",
       });
       if (!r.ok) throw new Error("Delete failed");
       const data = await r.json();
       const nextPresets = data.lora_presets ?? [];
       loraPresetsRef.current = nextPresets;
+      ensuredLoraSpecsRef.current.delete(preset.spec);
+      removeEnsuredLoraSpec(preset.spec);
       setConfig((c) =>
         c
           ? {
@@ -639,25 +654,23 @@ export default function App() {
   }
 
   async function deleteGeneration(clip: Clip) {
-    const siblings = clips.filter((c) => c.chain_id === clip.chain_id);
-    const deleteChain = siblings.length > 1;
-    const msg = deleteChain
-      ? "Delete this entire generation (all clips in the chain)?"
-      : "Delete this video?";
-    if (!confirm(msg)) return;
+    if (!confirm("Delete this video from the library?")) return;
 
-    const url = deleteChain
-      ? `${API}/api/chains/${encodeURIComponent(clip.chain_id)}`
-      : `${API}/api/clips/${encodeURIComponent(clip.id)}`;
-    const r = await fetch(url, { method: "DELETE" });
+    const r = await fetch(`${API}/api/clips/${encodeURIComponent(clip.id)}`, {
+      method: "DELETE",
+    });
     if (!r.ok) {
       setError("Could not delete");
       return;
     }
     const all = await fetchClips();
-    setClips(all);
-    if (selectedClipId === clip.id || deleteChain) {
-      startNewProject();
+    setClips((prev) => preserveBlobVideoUrls(prev, all));
+    if (selectedClipId === clip.id) {
+      setSelectedClipId(null);
+      setChainId(null);
+    }
+    if (sourceClipId === clip.id) {
+      setSourceClipId(null);
     }
   }
 
@@ -1436,7 +1449,7 @@ export default function App() {
                     selectedIds={loraPresetIds}
                     disabled={loraBusy || addingCustomLora}
                     onToggle={(id, checked) => toggleLoraPreset(id, checked)}
-                    onRemoveCustom={(id) => void removeCustomLora(id)}
+                    onRemovePreset={(preset) => void removeLoraPreset(preset)}
                   />
                 </label>
                 <div className="lora-row-add">
