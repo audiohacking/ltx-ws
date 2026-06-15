@@ -1048,34 +1048,13 @@ class LocalVideoGenerator:
 
         tqdm_mod.tqdm = _TrackingTqdm
         tqdm_mod.auto.tqdm = _TrackingTqdm
-        patched_modules: list[tuple[Any, Any]] = []
         samplers_mod: Any | None = None
+        orig_samplers_tqdm: Any = None
         try:
             import ltx_pipelines_mlx.utils.samplers as samplers_mod
 
-            patched_modules.append((samplers_mod, getattr(samplers_mod, "tqdm", None)))
+            orig_samplers_tqdm = getattr(samplers_mod, "tqdm", None)
             samplers_mod.tqdm = _TrackingTqdm
-        except ImportError:
-            pass
-        try:
-            import importlib
-            import pkgutil
-
-            import ltx_pipelines_mlx as lpm_root
-
-            prefix = lpm_root.__name__ + "."
-            for _finder, modname, _ispkg in pkgutil.walk_packages(
-                lpm_root.__path__, prefix
-            ):
-                if modname.endswith(".samplers"):
-                    continue
-                try:
-                    mod = importlib.import_module(modname)
-                except ImportError:
-                    continue
-                if hasattr(mod, "tqdm"):
-                    patched_modules.append((mod, getattr(mod, "tqdm", None)))
-                    mod.tqdm = _TrackingTqdm
         except ImportError:
             pass
         try:
@@ -1083,9 +1062,8 @@ class LocalVideoGenerator:
         finally:
             tqdm_mod.tqdm = orig_tqdm
             tqdm_mod.auto.tqdm = orig_auto
-            for mod, orig in patched_modules:
-                if orig is not None:
-                    mod.tqdm = orig
+            if samplers_mod is not None and orig_samplers_tqdm is not None:
+                samplers_mod.tqdm = orig_samplers_tqdm
             self._model_progress.clear()
 
     def _resolve_model_dir(self) -> str:
