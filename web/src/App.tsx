@@ -26,6 +26,15 @@ function preserveBlobVideoUrls(prev: Clip[], incoming: Clip[]): Clip[] {
   });
 }
 
+function revokeBlobVideoUrls(clips: Clip[]) {
+  for (const clip of clips) {
+    const url = clip.video_url;
+    if (url?.startsWith(BLOB_VIDEO_PREFIX)) {
+      URL.revokeObjectURL(url);
+    }
+  }
+}
+
 async function fetchConfig(): Promise<Config> {
   const r = await fetch(`${API}/api/config`);
   if (!r.ok) throw new Error("Failed to load config");
@@ -303,11 +312,17 @@ export default function App() {
   }
 
   function startNewProject() {
+    setClips((prev) => {
+      revokeBlobVideoUrls(prev);
+      return [];
+    });
     setChainId(null);
     setSelectedClipId(null);
     setPrompt("");
     setClipMultiplier(1);
     setAudiocontinue(false);
+    setBusy(false);
+    setProgress(null);
     setError(null);
     setLoraPresetId(config?.default_lora_preset_id ?? "default");
     clearAllMedia();
@@ -368,9 +383,16 @@ export default function App() {
   function cacheClipVideoLocally(clipId: string, serverUrl: string) {
     cacheVideoAsBlobUrl(serverUrl)
       .then((blobUrl) => {
-        setClips((prev) =>
-          prev.map((c) => (c.id === clipId ? { ...c, video_url: blobUrl } : c)),
-        );
+        setClips((prev) => {
+          const existing = prev.find((c) => c.id === clipId);
+          const oldUrl = existing?.video_url;
+          if (oldUrl?.startsWith(BLOB_VIDEO_PREFIX)) {
+            URL.revokeObjectURL(oldUrl);
+          }
+          return prev.map((c) =>
+            c.id === clipId ? { ...c, video_url: blobUrl } : c,
+          );
+        });
       })
       .catch((err) => {
         console.warn("Failed to cache clip video locally", err);
