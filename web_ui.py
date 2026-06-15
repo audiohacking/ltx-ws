@@ -350,6 +350,18 @@ def _cleanup_run_uploads(state: AppState, gen_body: dict[str, Any]) -> None:
         _delete_upload_paths(paths)
 
 
+def _is_output_protected_for_autoconcat(state: AppState, filename: str) -> bool:
+    """Fragment MP4s must stay on disk until ffmpeg autoconcat finishes."""
+    for run in state.runs.values():
+        if run.status != RunStatus.RUNNING.value or not run.autoconcat:
+            continue
+        for clip_id in run.clip_ids:
+            clip = state.clips.get(clip_id)
+            if clip and clip.filename == filename:
+                return True
+    return False
+
+
 class RunStatus(str, Enum):
     QUEUED = "queued"
     RUNNING = "running"
@@ -1816,16 +1828,19 @@ def create_app(
             raise HTTPException(404, "Video not found")
 
         def _unlink_after_stream() -> None:
+            if _is_output_protected_for_autoconcat(state, filename):
+                return
             try:
                 path.unlink(missing_ok=True)
             except OSError as exc:
                 log.warning("Could not delete streamed video %s: %s", path, exc)
 
+        delete_after_stream = not _is_output_protected_for_autoconcat(state, filename)
         return FileResponse(
             path,
             media_type="video/mp4",
             filename=filename,
-            background=BackgroundTask(_unlink_after_stream),
+            background=BackgroundTask(_unlink_after_stream) if delete_after_stream else None,
         )
 
     if ws_handler is not None:

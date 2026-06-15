@@ -464,12 +464,8 @@ export default function App() {
                 ? `Clip ${idx}/${total} done — ${idx === total ? "merging…" : "continuing…"}`
                 : "Clip saved — continuing…",
           });
-          if (msg.clip_id && msg.video_url) {
-            cacheClipVideoLocally(
-              msg.clip_id as string,
-              msg.video_url as string,
-            );
-          }
+          // Do not fetch fragment MP4s during autoconcat — serve_video deletes after
+          // stream and ffmpeg needs every fragment on disk until merge completes.
         } else {
           setProgress({ phase: "clip_done", message: "Clip saved" });
           if (msg.clip_id && msg.video_url) {
