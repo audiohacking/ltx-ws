@@ -386,23 +386,6 @@ def _build_clip_done_event(
     return event
 
 
-def _is_chain_fragment_protected(state: AppState, filename: str) -> bool:
-    """Keep fragment MP4s on disk while a multi-clip chain run is in progress."""
-    for run in state.runs.values():
-        if run.status != RunStatus.RUNNING.value:
-            continue
-        total = _chain_clip_count(run)
-        if total <= 1:
-            continue
-        if not (run.autoconcat or run.autocontinue):
-            continue
-        for clip_id in run.clip_ids:
-            clip = state.clips.get(clip_id)
-            if clip and clip.filename == filename:
-                return True
-    return False
-
-
 class RunStatus(str, Enum):
     QUEUED = "queued"
     RUNNING = "running"
@@ -574,10 +557,51 @@ class AppState:
         self.save_index()
         return removed
 
+    def clear_session(self) -> dict[str, int]:
+        """Remove all generated outputs and index entries (Web UI session reset)."""
+        deleted_files = 0
+        seen: set[Path] = set()
+        for clip in list(self.clips.values()):
+            if clip.filename:
+                path = self.output_dir / clip.filename
+                if path.is_file() and path not in seen:
+                    try:
+                        path.unlink()
+                        deleted_files += 1
+                        seen.add(path)
+                    except OSError as exc:
+                        log.warning("Could not delete clip file %s: %s", path, exc)
+        for path in self.output_dir.glob("*.mp4"):
+            if path.is_file() and path not in seen:
+                try:
+                    path.unlink()
+                    deleted_files += 1
+                except OSError as exc:
+                    log.warning("Could not delete output %s: %s", path, exc)
+        clip_count = len(self.clips)
+        self.clips.clear()
+        self.runs.clear()
+        self.event_queues.clear()
+        self.save_index()
+        return {"deleted_clips": clip_count, "deleted_files": deleted_files}
+
     async def emit(self, run_id: str, event: dict[str, Any]) -> None:
         q = self.event_queues.get(run_id)
         if q:
             await q.put(event)
+
+
+def _clip_for_api(state: AppState, clip: ClipRecord) -> dict[str, Any]:
+    """Serialize a clip; omit video_url when the output file is no longer on disk."""
+    data = asdict(clip)
+    filename = str(data.get("filename") or "").strip()
+    if filename:
+        if (state.output_dir / filename).is_file():
+            if not data.get("video_url"):
+                data["video_url"] = state.clip_url(filename)
+        else:
+            data["video_url"] = ""
+    return data
 
 
 def _ensure_web_deps() -> None:
@@ -1648,7 +1672,12 @@ def create_app(
         if chain_id:
             clips = [c for c in clips if c.chain_id == chain_id]
         clips.sort(key=lambda c: c.created_at)
-        return {"clips": [asdict(c) for c in clips]}
+        return {"clips": [_clip_for_api(state, c) for c in clips]}
+
+    @app.post("/api/session/clear")
+    async def clear_session():
+        summary = state.clear_session()
+        return {"ok": True, **summary}
 
     @app.delete("/api/clips/{clip_id}")
     async def delete_clip(clip_id: str):
@@ -1858,27 +1887,10 @@ def create_app(
 
     @app.get("/api/videos/{filename}")
     async def serve_video(filename: str):
-        from starlette.background import BackgroundTask
-
         path = state.output_dir / filename
         if not path.is_file():
             raise HTTPException(404, "Video not found")
-
-        def _unlink_after_stream() -> None:
-            if _is_chain_fragment_protected(state, filename):
-                return
-            try:
-                path.unlink(missing_ok=True)
-            except OSError as exc:
-                log.warning("Could not delete streamed video %s: %s", path, exc)
-
-        delete_after_stream = not _is_chain_fragment_protected(state, filename)
-        return FileResponse(
-            path,
-            media_type="video/mp4",
-            filename=filename,
-            background=BackgroundTask(_unlink_after_stream) if delete_after_stream else None,
-        )
+        return FileResponse(path, media_type="video/mp4", filename=filename)
 
     if ws_handler is not None:
         @app.websocket("/ws")

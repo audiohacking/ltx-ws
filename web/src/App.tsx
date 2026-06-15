@@ -311,7 +311,7 @@ export default function App() {
     }
   }
 
-  function startNewProject() {
+  async function startNewProject() {
     setClips((prev) => {
       revokeBlobVideoUrls(prev);
       return [];
@@ -326,6 +326,11 @@ export default function App() {
     setError(null);
     setLoraPresetId(config?.default_lora_preset_id ?? "default");
     clearAllMedia();
+    try {
+      await fetch(`${API}/api/session/clear`, { method: "POST" });
+    } catch (err) {
+      console.warn("Session clear failed", err);
+    }
   }
 
   const needsImageUpload = mode === "i2v";
