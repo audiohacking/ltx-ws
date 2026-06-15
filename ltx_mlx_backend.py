@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import concurrent.futures
 import functools
 import inspect
 import logging
@@ -914,6 +915,19 @@ class _ModelProgressStore:
         return snap
 
 
+class GenerationCancelledError(RuntimeError):
+    """Raised when generation is cancelled via ``request_cancel()`` or SIGINT."""
+
+
+class _DaemonThreadPoolExecutor(concurrent.futures.ThreadPoolExecutor):
+    """Thread pool whose workers are daemon threads so SIGINT can exit the process."""
+
+    def _adjust_thread_count(self) -> None:
+        super()._adjust_thread_count()
+        for thread in self._threads:
+            thread.daemon = True
+
+
 def _stage_from_tqdm_desc(desc: str) -> str:
     d = (desc or "").strip().lower()
     if "denois" in d:
@@ -966,6 +980,21 @@ class LocalVideoGenerator:
         self._resolved_default_loras: list[tuple[str, float]] | None = None
         self._lpm_module: Any | None = None
         self._model_progress = _ModelProgressStore()
+        self._cancel_requested = threading.Event()
+        self._executor = _DaemonThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="ltx-mlx-gen",
+        )
+
+    def clear_cancel(self) -> None:
+        self._cancel_requested.clear()
+
+    def request_cancel(self) -> None:
+        self._cancel_requested.set()
+
+    def _check_cancel(self) -> None:
+        if self._cancel_requested.is_set():
+            raise GenerationCancelledError("Generation cancelled")
 
     @contextmanager
     def _track_model_progress(self):
@@ -986,6 +1015,8 @@ class LocalVideoGenerator:
                 self._publish(generator)
 
             def update(self, n: float = 1) -> bool | None:
+                if generator._cancel_requested.is_set():
+                    raise GenerationCancelledError("Generation cancelled")
                 result = super().update(n)
                 self._publish(generator)
                 return result
@@ -1332,9 +1363,10 @@ class LocalVideoGenerator:
         no_regen_audio: bool = False,
         reference_strength: float | None = None,
     ) -> str:
+        self.clear_cancel()
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(
-            None,
+            self._executor,
             functools.partial(
                 self._generate_sync,
                 GenerationRequest(
@@ -1402,7 +1434,9 @@ class LocalVideoGenerator:
 
     def _generate_sync(self, req: GenerationRequest) -> str:
         del req.negative_prompt  # reserved for future CFG-enabled variants
+        self._check_cancel()
         self.load()
+        self._check_cancel()
 
         assert self._model_path is not None
         requested_height = int(req.height or self.height)
@@ -1557,6 +1591,7 @@ class LocalVideoGenerator:
                     self.default_lora_count(),
                 )
 
+            self._check_cancel()
             try:
                 with self._track_model_progress():
                     common_gen_kwargs = dict(

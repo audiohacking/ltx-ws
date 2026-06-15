@@ -300,6 +300,29 @@ body {
   font-size: 0.85rem;
 }
 
+.progress-overlay-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.btn-cancel {
+  flex-shrink: 0;
+  padding: 4px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.45);
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.35);
+  color: #fff;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.btn-cancel:hover {
+  background: rgba(220, 38, 38, 0.75);
+  border-color: rgba(255, 255, 255, 0.6);
+}
+
 .progress-bar {
   height: 3px;
   background: rgba(255, 255, 255, 0.2);

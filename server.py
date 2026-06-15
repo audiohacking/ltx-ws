@@ -890,11 +890,18 @@ class RequestHandler:
                         )
                     video_path = await gen_task
                 except Exception as exc:
-                    log.error("Generation %s failed: %s", generation_id, exc)
+                    from ltx_mlx_backend import GenerationCancelledError
+
+                    if isinstance(exc, GenerationCancelledError):
+                        log.warning("Generation %s cancelled", generation_id)
+                        error_code = "cancelled"
+                    else:
+                        log.error("Generation %s failed: %s", generation_id, exc)
+                        error_code = "generation_failed"
                     try:
                         await self._send_json(
                             type="error",
-                            error_code="generation_failed",
+                            error_code=error_code,
                             message=str(exc),
                         )
                     except Exception:
@@ -1412,6 +1419,8 @@ def main() -> None:
     try:
         asyncio.run(server.serve(web_state))
     except KeyboardInterrupt:
+        if web_state is not None:
+            web_state.cancel_active_generation()
         print("\n\nServer stopped.")
 
 

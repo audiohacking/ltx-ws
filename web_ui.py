@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -480,6 +481,7 @@ class RunStatus(str, Enum):
     RUNNING = "running"
     DONE = "done"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 @dataclass
@@ -557,6 +559,46 @@ class AppState:
         self.event_queues: dict[str, asyncio.Queue[dict[str, Any]]] = {}
         self._pending: asyncio.Queue[str] = asyncio.Queue()
         self._worker_started = False
+        self._cancelled_runs: set[str] = set()
+        self._active_run_id: str | None = None
+
+    def set_active_run(self, run_id: str | None) -> None:
+        self._active_run_id = run_id
+
+    def is_run_cancelled(self, run_id: str) -> bool:
+        return run_id in self._cancelled_runs
+
+    def clear_run_cancelled(self, run_id: str) -> None:
+        self._cancelled_runs.discard(run_id)
+
+    def _signal_generator_cancel(self) -> None:
+        vs = self.video_server
+        if vs is None:
+            return
+        gen = getattr(vs, "generator", None)
+        if gen is not None and hasattr(gen, "request_cancel"):
+            gen.request_cancel()
+
+    def request_cancel_run(self, run_id: str) -> bool:
+        run = self.runs.get(run_id)
+        if not run:
+            return False
+        if run.status in (
+            RunStatus.DONE.value,
+            RunStatus.FAILED.value,
+            RunStatus.CANCELLED.value,
+        ):
+            return False
+        self._cancelled_runs.add(run_id)
+        if self._active_run_id == run_id:
+            self._signal_generator_cancel()
+        return True
+
+    def cancel_active_generation(self) -> None:
+        if self._active_run_id:
+            self.request_cancel_run(self._active_run_id)
+        else:
+            self._signal_generator_cancel()
 
     def apply_saved_settings(self) -> None:
         """Load persisted UI settings; default model preference favors local weights."""
@@ -988,13 +1030,20 @@ async def _run_clip_inprocess(
     video_server: Any,
     job: Any,
     on_event: Any,
+    *,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> bool:
     """Run one clip via the embedded VideoServer (no WebSocket round-trip)."""
+    from ltx_mlx_backend import GenerationCancelledError
     from videofentanyl import JobStatus
 
+    cancel_check = should_cancel or (lambda: False)
     params = job.params
     vs = video_server
     t0 = time.time()
+    gen = getattr(vs, "generator", None)
+    if gen is not None and hasattr(gen, "clear_cancel"):
+        gen.clear_cancel()
 
     async def notify(**kwargs: Any) -> None:
         await _emit_protocol(on_event, kwargs)
@@ -1033,42 +1082,49 @@ async def _run_clip_inprocess(
                 _generation_progress_loop(vs, on_event, t0, generation_id, progress_stop)
             )
             try:
-                video_path = await vs.generator.generate(
-                    prompt=params.prompt,
-                    image_data=params.initial_image,
-                    audio_data=params.audio_input,
-                    source_video_data=params.source_video,
-                    seed=int(params.seed or 1024),
-                    num_frames=params.num_frames,
-                    height=params.height,
-                    width=params.width,
-                    mode=params.generation_mode,
-                    num_steps=params.num_steps,
-                    retake_start=params.retake_start,
-                    retake_end=params.retake_end,
-                    extend_frames=params.extend_frames,
-                    extend_direction=params.extend_direction or "after",
-                    lora_specs=list(params.lora_specs) if params.lora_specs else None,
-                    video_conditioning_specs=(
-                        list(params.video_conditioning_specs)
-                        if params.video_conditioning_specs
-                        else None
-                    ),
-                    job_id=generation_id,
-                    a2v_visual_i2v_continue=bool(
-                        getattr(params, "a2v_visual_i2v_continue", False)
-                    ),
-                    end_image_data=getattr(params, "end_image", None),
-                    enhance_prompt=bool(getattr(params, "enhance_prompt", False)),
-                    pipeline_profile=str(
-                        getattr(params, "pipeline_profile", None) or "distilled"
-                    ),
-                    cfg_scale=getattr(params, "cfg_scale", None),
-                    stg_scale=getattr(params, "stg_scale", None),
-                    stage2_steps=getattr(params, "stage2_steps", None),
-                    no_regen_audio=bool(getattr(params, "no_regen_audio", False)),
-                    reference_strength=getattr(params, "reference_strength", None),
+                gen_task = asyncio.create_task(
+                    vs.generator.generate(
+                        prompt=params.prompt,
+                        image_data=params.initial_image,
+                        audio_data=params.audio_input,
+                        source_video_data=params.source_video,
+                        seed=int(params.seed or 1024),
+                        num_frames=params.num_frames,
+                        height=params.height,
+                        width=params.width,
+                        mode=params.generation_mode,
+                        num_steps=params.num_steps,
+                        retake_start=params.retake_start,
+                        retake_end=params.retake_end,
+                        extend_frames=params.extend_frames,
+                        extend_direction=params.extend_direction or "after",
+                        lora_specs=list(params.lora_specs) if params.lora_specs else None,
+                        video_conditioning_specs=(
+                            list(params.video_conditioning_specs)
+                            if params.video_conditioning_specs
+                            else None
+                        ),
+                        job_id=generation_id,
+                        a2v_visual_i2v_continue=bool(
+                            getattr(params, "a2v_visual_i2v_continue", False)
+                        ),
+                        end_image_data=getattr(params, "end_image", None),
+                        enhance_prompt=bool(getattr(params, "enhance_prompt", False)),
+                        pipeline_profile=str(
+                            getattr(params, "pipeline_profile", None) or "distilled"
+                        ),
+                        cfg_scale=getattr(params, "cfg_scale", None),
+                        stg_scale=getattr(params, "stg_scale", None),
+                        stage2_steps=getattr(params, "stage2_steps", None),
+                        no_regen_audio=bool(getattr(params, "no_regen_audio", False)),
+                        reference_strength=getattr(params, "reference_strength", None),
+                    )
                 )
+                while not gen_task.done():
+                    if cancel_check() and gen is not None and hasattr(gen, "request_cancel"):
+                        gen.request_cancel()
+                    await asyncio.sleep(0.2)
+                video_path = await gen_task
             finally:
                 progress_stop.set()
                 progress_task.cancel()
@@ -1113,6 +1169,19 @@ async def _run_clip_inprocess(
             job.finished_at = time.time()
             job.status = JobStatus.DONE
             return True
+    except GenerationCancelledError:
+        job.finished_at = time.time()
+        job.error = "Cancelled"
+        job.status = JobStatus.FAILED
+        await _emit_protocol(
+            on_event,
+            {
+                "type": "error",
+                "error_code": "cancelled",
+                "message": "Generation cancelled",
+            },
+        )
+        return False
     except Exception as exc:
         job.finished_at = time.time()
         job.error = str(exc)
@@ -1187,6 +1256,41 @@ async def _fail_run_early(
             clip.error = message
     state.save_index()
     await state.emit(run_id, {"type": "error", "message": message})
+
+
+async def _abort_run_cancelled(state: AppState, run_id: str) -> None:
+    run = state.runs.get(run_id)
+    if not run:
+        return
+    if run.status == RunStatus.CANCELLED.value:
+        return
+    run.status = RunStatus.CANCELLED.value
+    run.error = "Cancelled by user"
+    for clip_id in run.clip_ids:
+        clip = state.clips.get(clip_id)
+        if clip and clip.status not in (RunStatus.DONE.value,):
+            clip.status = RunStatus.CANCELLED.value
+    state.save_index()
+    await state.emit(
+        run_id,
+        {
+            "type": "run_cancelled",
+            "run_id": run_id,
+            "message": "Generation cancelled",
+        },
+    )
+    state.clear_run_cancelled(run_id)
+
+
+def _is_cancelled_clip_failure(
+    ok: bool,
+    job: Any,
+    state: AppState,
+    run_id: str,
+) -> bool:
+    if ok:
+        return False
+    return state.is_run_cancelled(run_id) or getattr(job, "error", "") == "Cancelled"
 
 
 def _clip_request_body(
@@ -1369,6 +1473,10 @@ async def _execute_run(state: AppState, run_id: str) -> None:
 
 async def _execute_run_embedded(state: AppState, run_id: str) -> None:
     log.info("Web UI: executing run %s (in-process)", run_id)
+    if state.is_run_cancelled(run_id):
+        await _abort_run_cancelled(state, run_id)
+        return
+
     (
         _GenerationParams,
         Job,
@@ -1383,6 +1491,7 @@ async def _execute_run_embedded(state: AppState, run_id: str) -> None:
     ) = _import_videofentanyl()
 
     run = state.runs[run_id]
+    state.set_active_run(run_id)
     run.status = RunStatus.RUNNING.value
     await state.emit(
         run_id,
@@ -1407,17 +1516,18 @@ async def _execute_run_embedded(state: AppState, run_id: str) -> None:
 
     audio_segments: list[dict[str, Any]] | None = None
     temp_audio_dir: Path | None = None
-    if gen_body.get("audiocontinue"):
-        try:
-            audio_segments, temp_audio_dir = _prepare_audiocontinue_segments(
-                gen_body, len(prompts)
-            )
-        except Exception as exc:
-            log.exception("Web UI: audiocontinue setup failed")
-            await _fail_run_early(state, run_id, str(exc))
-            return
 
     try:
+        if gen_body.get("audiocontinue"):
+            try:
+                audio_segments, temp_audio_dir = _prepare_audiocontinue_segments(
+                    gen_body, len(prompts)
+                )
+            except Exception as exc:
+                log.exception("Web UI: audiocontinue setup failed")
+                await _fail_run_early(state, run_id, str(exc))
+                return
+
         continue_from = gen_body.get("continue_from")
         initial_image = None
         if continue_from:
@@ -1428,6 +1538,10 @@ async def _execute_run_embedded(state: AppState, run_id: str) -> None:
                     initial_image = extract_last_frame(parent_path)
 
         for i, prompt in enumerate(prompts):
+            if state.is_run_cancelled(run_id):
+                await _abort_run_cancelled(state, run_id)
+                return
+
             clip_id = run.clip_ids[i]
             clip = state.clips[clip_id]
             clip.status = RunStatus.RUNNING.value
@@ -1493,8 +1607,16 @@ async def _execute_run_embedded(state: AppState, run_id: str) -> None:
                 event["clip_id"] = _clip_id
                 await state.emit(run_id, event)
 
-            ok = await _run_clip_inprocess(state.video_server, job, on_event)
+            ok = await _run_clip_inprocess(
+                state.video_server,
+                job,
+                on_event,
+                should_cancel=lambda rid=run_id: state.is_run_cancelled(rid),
+            )
 
+            if _is_cancelled_clip_failure(ok, job, state, run_id):
+                await _abort_run_cancelled(state, run_id)
+                return
             if ok:
                 clip.status = RunStatus.DONE.value
                 clip.elapsed_s = round(job.elapsed, 2)
@@ -1543,12 +1665,22 @@ async def _execute_run_embedded(state: AppState, run_id: str) -> None:
             {"type": "run_done", "run_id": run_id, "chain_id": run.chain_id},
         )
     finally:
+        state.set_active_run(None)
+        vs = state.video_server
+        if vs is not None:
+            gen = getattr(vs, "generator", None)
+            if gen is not None and hasattr(gen, "clear_cancel"):
+                gen.clear_cancel()
         if temp_audio_dir is not None:
             shutil.rmtree(temp_audio_dir, ignore_errors=True)
 
 
 async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
     log.info("Web UI: executing run %s", run_id)
+    if state.is_run_cancelled(run_id):
+        await _abort_run_cancelled(state, run_id)
+        return
+
     (
         _GenerationParams,
         Job,
@@ -1563,6 +1695,7 @@ async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
     ) = _import_videofentanyl()
 
     run = state.runs[run_id]
+    state.set_active_run(run_id)
     run.status = RunStatus.RUNNING.value
     await state.emit(
         run_id,
@@ -1588,17 +1721,18 @@ async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
 
     audio_segments: list[dict[str, Any]] | None = None
     temp_audio_dir: Path | None = None
-    if gen_body.get("audiocontinue"):
-        try:
-            audio_segments, temp_audio_dir = _prepare_audiocontinue_segments(
-                gen_body, len(prompts)
-            )
-        except Exception as exc:
-            log.exception("Web UI: audiocontinue setup failed")
-            await _fail_run_early(state, run_id, str(exc))
-            return
 
     try:
+        if gen_body.get("audiocontinue"):
+            try:
+                audio_segments, temp_audio_dir = _prepare_audiocontinue_segments(
+                    gen_body, len(prompts)
+                )
+            except Exception as exc:
+                log.exception("Web UI: audiocontinue setup failed")
+                await _fail_run_early(state, run_id, str(exc))
+                return
+
         continue_from = gen_body.get("continue_from")
         initial_image = None
         if continue_from:
@@ -1609,6 +1743,10 @@ async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
                     initial_image = extract_last_frame(parent_path)
 
         for i, prompt in enumerate(prompts):
+            if state.is_run_cancelled(run_id):
+                await _abort_run_cancelled(state, run_id)
+                return
+
             clip_id = run.clip_ids[i]
             clip = state.clips[clip_id]
             clip.status = RunStatus.RUNNING.value
@@ -1679,6 +1817,9 @@ async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
             )
             ok = await session.run(idle_timeout=None)
 
+            if state.is_run_cancelled(run_id):
+                await _abort_run_cancelled(state, run_id)
+                return
             if ok:
                 clip.status = RunStatus.DONE.value
                 clip.elapsed_s = round(job.elapsed, 2)
@@ -1727,6 +1868,7 @@ async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
             {"type": "run_done", "run_id": run_id, "chain_id": run.chain_id},
         )
     finally:
+        state.set_active_run(None)
         if temp_audio_dir is not None:
             shutil.rmtree(temp_audio_dir, ignore_errors=True)
 
@@ -1738,7 +1880,7 @@ async def _worker_loop(state: AppState) -> None:
             await _execute_run(state, run_id)
         except Exception as exc:
             run = state.runs.get(run_id)
-            if run:
+            if run and run.status != RunStatus.CANCELLED.value:
                 run.status = RunStatus.FAILED.value
                 run.error = str(exc)
                 state.save_index()
@@ -1771,6 +1913,17 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         state.ensure_worker()
+        loop = asyncio.get_running_loop()
+
+        def _on_interrupt() -> None:
+            log.warning("Interrupt received — cancelling active generation")
+            state.cancel_active_generation()
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, _on_interrupt)
+            except (NotImplementedError, RuntimeError):
+                pass
         yield
         if state.server_process:
             state.server_process.terminate()
@@ -2031,6 +2184,20 @@ def create_app(
         if not run:
             raise HTTPException(404, "Run not found")
         return asdict(run)
+
+    @app.post("/api/runs/{run_id}/cancel")
+    async def cancel_run(run_id: str):
+        if run_id not in state.runs:
+            raise HTTPException(404, "Run not found")
+        run = state.runs[run_id]
+        if run.status == RunStatus.CANCELLED.value:
+            return {"ok": True, "status": "cancelled"}
+        if not state.request_cancel_run(run_id):
+            raise HTTPException(
+                409,
+                f"Cannot cancel run in state {run.status}",
+            )
+        return {"ok": True, "status": "cancelling"}
 
     @app.post("/api/generate")
     async def generate(body: dict[str, Any]):

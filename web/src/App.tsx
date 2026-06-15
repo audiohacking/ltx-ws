@@ -153,6 +153,7 @@ export default function App() {
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
   const [prompt, setPrompt] = useState("");
   const [busy, setBusy] = useState(false);
+  const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [progress, setProgress] = useState<ProgressState | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -654,7 +655,18 @@ export default function App() {
       });
   }
 
+  async function cancelActiveRun() {
+    if (!activeRunId) return;
+    try {
+      await fetch(`${API}/api/runs/${activeRunId}/cancel`, { method: "POST" });
+      setProgress({ phase: "cancelled", message: "Cancelling…" });
+    } catch (err) {
+      console.warn("Cancel request failed", err);
+    }
+  }
+
   async function subscribeRun(runId: string, runChainId: string) {
+    setActiveRunId(runId);
     let closed = false;
     let autoconcatRun = false;
     let audiocontinueRun = false;
@@ -665,6 +677,7 @@ export default function App() {
       if (closed) return;
       closed = true;
       es.close();
+      setActiveRunId(null);
       setBusy(false);
       setProgress(null);
       setChainId(runChainId);
@@ -839,11 +852,18 @@ export default function App() {
           setClips((prev) => replaceChainClips(prev, runChainId, chainClips));
           setSelectedClipId(pickPlaybackClip(chainClips, runChainId) ?? clipId ?? null);
         });
+      } else if (msg.type === "run_cancelled") {
+        setProgress({
+          phase: "cancelled",
+          message: String(msg.message || "Generation cancelled"),
+        });
+        finishRun();
       } else if (msg.type === "run_complete" || msg.type === "run_done") {
         finishRun();
       } else if (msg.type === "error" || msg.type === "clip_failed") {
         setError(msg.error || msg.message || "Failed");
         es.close();
+        setActiveRunId(null);
         setBusy(false);
       }
     };
@@ -1033,7 +1053,18 @@ export default function App() {
                     <div className="progress-pulse" />
                   )}
                 </div>
-                <span>{progress?.message ?? "Working…"}</span>
+                <div className="progress-overlay-row">
+                  <span>{progress?.message ?? "Working…"}</span>
+                  {activeRunId && progress?.phase !== "cancelled" && (
+                    <button
+                      type="button"
+                      className="btn-cancel"
+                      onClick={() => void cancelActiveRun()}
+                    >
+                      Cancel
+                    </button>
+                  )}
+                </div>
               </div>
             )}
           </div>
