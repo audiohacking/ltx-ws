@@ -296,6 +296,18 @@ def resolve_web_dist() -> Path:
     return REPO_ROOT / "web" / "dist"
 
 
+def resolve_favicon_path() -> Path | None:
+    """Locate favicon for embedded Web UI (built dist, then source public/)."""
+    for candidate in (
+        resolve_web_dist() / "favicon.ico",
+        REPO_ROOT / "web" / "public" / "favicon.ico",
+        REPO_ROOT / "web" / "favicon.ico",
+    ):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def _upload_extension(kind: str, filename: str | None) -> str:
     """Pick a safe suffix for an uploaded file."""
     ext = Path(filename or "").suffix.lower()
@@ -2615,6 +2627,13 @@ def create_app(
         if not path.is_file():
             raise HTTPException(404, "Video not found")
         return FileResponse(path, media_type="video/mp4", filename=filename)
+
+    @app.get("/favicon.ico", include_in_schema=False)
+    async def favicon():
+        path = resolve_favicon_path()
+        if path is None:
+            raise HTTPException(404, "Favicon not found")
+        return FileResponse(path, media_type="image/x-icon")
 
     if ws_handler is not None:
         @app.websocket("/ws")
