@@ -459,6 +459,44 @@ def _cleanup_run_uploads(state: AppState, gen_body: dict[str, Any]) -> None:
         _delete_upload_paths(paths)
 
 
+def resolve_source_video_path(state: AppState, body: dict[str, Any]) -> str | None:
+    """Resolve ``source_clip_id`` (library) or ``video_path`` (upload) to a local MP4 path."""
+    clip_id = str(body.get("source_clip_id") or "").strip()
+    if clip_id:
+        clip = state.clips.get(clip_id)
+        if not clip:
+            raise ValueError(f"Source clip not found: {clip_id}")
+        if clip.status != RunStatus.DONE.value:
+            raise ValueError(f"Source clip is not ready (status={clip.status})")
+        if not clip.filename:
+            raise ValueError("Source clip has no video file")
+        path = state.output_dir / clip.filename
+        if not path.is_file():
+            raise ValueError(f"Source clip file missing on disk: {clip.filename}")
+        return str(path.resolve())
+
+    raw = body.get("video_path")
+    if not raw:
+        return None
+    path = Path(str(raw)).expanduser()
+    if not path.is_file():
+        raise ValueError(f"Video file not found: {raw}")
+    return str(path.resolve())
+
+
+def _validate_source_video_request(state: AppState, body: dict[str, Any], ui_mode: str) -> None:
+    if ui_mode not in ("retake", "extend", "lipdub"):
+        return
+    if not body.get("video_path") and not body.get("source_clip_id"):
+        raise HTTPException(400, f"{ui_mode} mode requires a source video (upload or library clip)")
+    try:
+        resolved = resolve_source_video_path(state, body)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if not resolved:
+        raise HTTPException(400, f"{ui_mode} mode requires a source video (upload or library clip)")
+
+
 def _chain_clip_count(run: RunRecord) -> int:
     return len(run.prompts) or len(run.clip_ids)
 
@@ -966,7 +1004,7 @@ def _resolve_seed(raw: Any) -> int:
     return int(raw)
 
 
-def _build_params_from_request(body: dict[str, Any]) -> Any:
+def _build_params_from_request(body: dict[str, Any], *, state: AppState | None = None) -> Any:
     (
         GenerationParams,
         *_,
@@ -976,7 +1014,12 @@ def _build_params_from_request(body: dict[str, Any]) -> Any:
     image_path = body.get("image_path") if ui_mode in ("i2v", "a2v", "generate", "keyframe") else None
     end_image_path = body.get("end_image_path") if ui_mode == "keyframe" else None
     audio_path = body.get("audio_path") if ui_mode in ("a2v", "lipdub") else None
-    video_path = body.get("video_path") if ui_mode in ("retake", "extend", "lipdub") else None
+    video_path: str | None = None
+    if ui_mode in ("retake", "extend", "lipdub"):
+        if state is not None:
+            video_path = resolve_source_video_path(state, body)
+        else:
+            video_path = body.get("video_path")
     load_image_payload, load_media_payload = _import_videofentanyl()[5:7]
 
     image_payload = load_image_payload(image_path) if image_path else None
@@ -1638,7 +1681,7 @@ async def _execute_run_embedded(state: AppState, run_id: str) -> None:
             )
 
             body = _clip_request_body(gen_body, prompt, i, chaining_enabled, chain_method)
-            params = _build_params_from_request(body)
+            params = _build_params_from_request(body, state=state)
             _apply_audiocontinue_audio(params, i, audio_segments)
             if i == 0 and initial_image:
                 _apply_chain_continuation(
@@ -1843,7 +1886,7 @@ async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
             )
 
             body = _clip_request_body(gen_body, prompt, i, chaining_enabled, chain_method)
-            params = _build_params_from_request(body)
+            params = _build_params_from_request(body, state=state)
             _apply_audiocontinue_audio(params, i, audio_segments)
             if i == 0 and initial_image:
                 _apply_chain_continuation(
@@ -2310,9 +2353,7 @@ def create_app(
             raise HTTPException(400, "i2v mode requires an image upload")
         if ui_mode == "a2v" and not body.get("audio_path"):
             raise HTTPException(400, "a2v mode requires an audio upload")
-        api_mode = _api_mode(ui_mode)
-        if api_mode in ("retake", "extend") and not body.get("video_path"):
-            raise HTTPException(400, f"{ui_mode} mode requires video")
+        _validate_source_video_request(state, body, ui_mode)
         if ui_mode == "ic_lora":
             if not body.get("lora_specs"):
                 raise HTTPException(400, "ic_lora requires lora_specs")
@@ -2321,8 +2362,6 @@ def create_app(
         if ui_mode == "keyframe" and (not body.get("image_path") or not body.get("end_image_path")):
             raise HTTPException(400, "keyframe mode requires start and end image uploads")
         if ui_mode == "lipdub":
-            if not body.get("video_path"):
-                raise HTTPException(400, "lipdub mode requires reference video upload")
             lora_items = body.get("lora_specs") or []
             if len(lora_items) != 1:
                 raise HTTPException(400, "lipdub requires exactly one LoRA preset")

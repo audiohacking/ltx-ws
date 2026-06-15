@@ -948,3 +948,25 @@ body {
   font-size: 0.75rem;
   color: var(--muted);
 }
+
+.clip-source-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.clip-source-picker select {
+  font-size: 0.8rem;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  max-width: 100%;
+}
+
+.media-source-note {
+  margin: 0;
+  font-size: 0.75rem;
+  color: var(--muted);
+}

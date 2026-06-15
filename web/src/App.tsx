@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { snapshotFromClip } from "./clipEditor";
+import { clipDisplayPrompt, snapshotFromClip } from "./clipEditor";
 import { applyProgressEvent } from "./progress";
 import type { Clip, Config, LoraPreset, ProgressState } from "./types";
 
@@ -261,6 +261,7 @@ export default function App() {
   const [audioPath, setAudioPath] = useState<string | null>(null);
   const [audioName, setAudioName] = useState<string | null>(null);
   const [videoPath, setVideoPath] = useState<string | null>(null);
+  const [sourceClipId, setSourceClipId] = useState<string | null>(null);
   const [retakeStart, setRetakeStart] = useState(1);
   const [retakeEnd, setRetakeEnd] = useState(1);
   const [extendFrames, setExtendFrames] = useState(2);
@@ -283,10 +284,17 @@ export default function App() {
 
   const libraryClips = useMemo(() => {
     return clips
-      .filter((c) => c.status === "done" && c.video_url)
+      .filter((c) => c.status === "done" && (c.video_url || c.filename))
       .sort((a, b) => b.created_at.localeCompare(a.created_at))
       .slice(0, 48);
   }, [clips]);
+
+  const videoLibraryClips = useMemo(
+    () => libraryClips.filter((c) => c.filename),
+    [libraryClips],
+  );
+
+  const hasVideoSource = Boolean(videoPath || sourceClipId);
 
   const chainParts = useMemo(() => {
     if (!chainId || !selectedClipId) return [];
@@ -618,6 +626,7 @@ export default function App() {
     setAudioPath(null);
     setAudioName(null);
     setVideoPath(null);
+    setSourceClipId(null);
     if (imageRef.current) imageRef.current.value = "";
     if (endImageRef.current) endImageRef.current.value = "";
     if (audioRef.current) audioRef.current.value = "";
@@ -643,6 +652,7 @@ export default function App() {
     }
     if (!["retake", "extend", "lipdub"].includes(nextMode)) {
       setVideoPath(null);
+      setSourceClipId(null);
       if (videoRef.current) videoRef.current.value = "";
     }
     if (nextMode === "a2v") {
@@ -1025,7 +1035,9 @@ export default function App() {
     if ((mode === "a2v" || mode === "lipdub") && audioPath) {
       body.audio_path = audioPath;
     }
-    if ((mode === "retake" || mode === "extend" || mode === "lipdub") && videoPath) {
+    if ((mode === "retake" || mode === "extend" || mode === "lipdub") && sourceClipId) {
+      body.source_clip_id = sourceClipId;
+    } else if ((mode === "retake" || mode === "extend" || mode === "lipdub") && videoPath) {
       body.video_path = videoPath;
     }
     if (seed.trim()) {
@@ -1093,7 +1105,9 @@ export default function App() {
     if (mode === "i2v" && !imagePath && !continuing) return false;
     if (mode === "a2v" && !audioPath) return false;
     if (audiocontinue && !config?.ffmpeg_available) return false;
-    if ((mode === "retake" || mode === "extend") && !videoPath) return false;
+    if ((mode === "retake" || mode === "extend" || mode === "lipdub") && !hasVideoSource) {
+      return false;
+    }
     return true;
   }, [
     prompt,
@@ -1106,6 +1120,8 @@ export default function App() {
     clipMultiplier,
     config?.ffmpeg_available,
     videoPath,
+    sourceClipId,
+    hasVideoSource,
     autocontinue,
     activeClip,
     chainId,
@@ -1633,23 +1649,63 @@ export default function App() {
                   {needsVideoUpload && (
                     <>
                       {!isA2v && (
-                        <span className="media-panel-title">Source media</span>
+                        <span className="media-panel-title">Source video</span>
                       )}
                       <label className="media-upload">
-                        <span className="media-upload-label">Source video (required)</span>
+                        <span className="media-upload-label">Upload from disk</span>
                         <input
                           ref={videoRef}
                           type="file"
                           accept="video/*"
                           onChange={async (e) => {
                             const f = e.target.files?.[0];
-                            if (f) setVideoPath(await uploadFile(f, "video"));
+                            if (f) {
+                              setSourceClipId(null);
+                              setVideoPath(await uploadFile(f, "video"));
+                            }
                           }}
                         />
                         <span className="media-upload-hint">
-                          {videoPath ? "✓ uploaded" : "Choose video file…"}
+                          {videoPath ? "✓ file selected" : "Choose video file…"}
                         </span>
                       </label>
+                      {videoLibraryClips.length > 0 && (
+                        <label className="clip-source-picker">
+                          <span className="media-upload-label">Or from library</span>
+                          <select
+                            value={sourceClipId ?? ""}
+                            onChange={(e) => {
+                              const id = e.target.value || null;
+                              setSourceClipId(id);
+                              if (id) {
+                                setVideoPath(null);
+                                if (videoRef.current) videoRef.current.value = "";
+                              }
+                            }}
+                          >
+                            <option value="">Select a clip…</option>
+                            {videoLibraryClips.map((c) => {
+                              const label = clipDisplayPrompt(c.prompt);
+                              const meta = [
+                                c.label,
+                                c.width && c.height ? `${c.width}×${c.height}` : null,
+                              ]
+                                .filter(Boolean)
+                                .join(" · ");
+                              return (
+                                <option key={c.id} value={c.id}>
+                                  {meta ? `${label} (${meta})` : label}
+                                </option>
+                              );
+                            })}
+                          </select>
+                        </label>
+                      )}
+                      {hasVideoSource && (
+                        <p className="media-source-note">
+                          {sourceClipId ? "Using library clip as source video." : "Using uploaded file as source video."}
+                        </p>
+                      )}
                     </>
                   )}
                 </div>
