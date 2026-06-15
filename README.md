@@ -1,21 +1,8 @@
 # ltx-ws
 
-**Local LTX-2.3 video over WebSocket on Apple Silicon (MLX).** This repository provides:
+**Local LTX-2.3 video over WebSocket on Apple Silicon (MLX)**
 
-| Component | Role |
-|-----------|------|
-| [`server.py`](server.py) | WebSocket server: loads [ltx-2-mlx](https://github.com/dgrauet/ltx-2-mlx), runs **T2V/I2V/A2V/retake/extend**, streams **MP4** to clients. |
-| [`videofentanyl.py`](videofentanyl.py) | CLI client: queues jobs, speaks the same JSON + binary protocol (`--mode ltx` + `--server`). |
-| [`mcp_server.py`](mcp_server.py) | MCP server exposing standardized tools for LTX generation (`ltx_generate_video`, `ltx_server_healthcheck`). |
-| [`web_ui.py`](web_ui.py) | Web UI API + static assets; embedded in `server.py` by default (`--web-ui`). |
-| [`web/`](web/) | React frontend — **LTX-WS Videofentanyl** (player, library, multi-clip autocontinue/autoconcat, LoRA picker). |
-| [`web_server.py`](web_server.py) | Optional standalone UI when attaching to a remote WebSocket server. |
-| [`ltx_mlx_backend.py`](ltx_mlx_backend.py) | MLX pipeline adapter, Hugging Face weight resolution, frame/spatial alignment. |
-| [`scripts/benchmark_local_generation.py`](scripts/benchmark_local_generation.py) | Spawns (or attaches to) `server.py`, runs one client job, prints timings + `BENCHMARK_JSON:…`. |
-
-Everything below is **local-only**: your Mac, Metal / MLX, and optional Hugging Face downloads. No hosted inference is required.
-
----
+<img width="800" height="776" alt="image" src="https://github.com/user-attachments/assets/4b9c967d-cc42-44a6-964d-3f24be3aa173" />
 
 ## Features
 
