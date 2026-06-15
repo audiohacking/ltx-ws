@@ -1023,54 +1023,6 @@ export default function App() {
             </button>
           </div>
 
-          {config && isT2vLike && (
-            <div className="composer-chain">
-              <div className="options-grid composer-chain-grid">
-                <label>
-                  Duration
-                  <select
-                    value={durationId}
-                    onChange={(e) => setDurationId(e.target.value)}
-                  >
-                    {config.duration_presets.map((d) => (
-                      <option key={d.id} value={d.id}>{d.label}</option>
-                    ))}
-                  </select>
-                </label>
-                <label>
-                  Clips (× duration)
-                  <select
-                    value={clipMultiplier}
-                    onChange={(e) => setClipMultiplier(Number(e.target.value))}
-                  >
-                    {Array.from(
-                      { length: config.clip_multiplier_max ?? 10 },
-                      (_, i) => i + 1,
-                    ).map((n) => (
-                      <option key={n} value={n}>
-                        ×{n}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-              </div>
-
-              {showChainMethodChoice && !showOptions && (
-                <ChainMethodPicker
-                  chainMethod={chainMethod}
-                  onChange={setChainMethod}
-                />
-              )}
-
-              {isMultiClip && !audiocontinue && (
-                <p className="hint duration-total">
-                  ~{durationSeconds}s × {clipMultiplier} clips ≈ ~{totalDurationSeconds}s
-                  merged ({chainMethodLabel} + autoconcat)
-                </p>
-              )}
-            </div>
-          )}
-
           <button
             type="button"
             className="options-toggle"
@@ -1136,10 +1088,60 @@ export default function App() {
                     ))}
                   </select>
                 </label>
+                <label>
+                  Duration
+                  <select
+                    value={durationId}
+                    onChange={(e) => setDurationId(e.target.value)}
+                  >
+                    {config.duration_presets.map((d) => (
+                      <option key={d.id} value={d.id} title={d.label}>
+                        {d.label.includes("(test)")
+                          ? `~${d.seconds}s (test)`
+                          : `~${d.seconds}s`}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  Clips (× duration)
+                  <select
+                    value={clipMultiplier}
+                    onChange={(e) => setClipMultiplier(Number(e.target.value))}
+                  >
+                    {Array.from(
+                      { length: config.clip_multiplier_max ?? 10 },
+                      (_, i) => i + 1,
+                    ).map((n) => (
+                      <option key={n} value={n}>
+                        ×{n}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  Steps
+                  <input
+                    type="number"
+                    min={1}
+                    max={50}
+                    value={numSteps}
+                    onChange={(e) => setNumSteps(Number(e.target.value))}
+                  />
+                </label>
+                <label>
+                  Seed
+                  <input
+                    type="text"
+                    placeholder="random"
+                    value={seed}
+                    onChange={(e) => setSeed(e.target.value)}
+                  />
+                </label>
               </div>
 
-              <div className="lora-panel">
-                <span className="media-panel-title">LoRA presets (multi-select)</span>
+              <div className="lora-row">
+                <span className="lora-row-label">LoRA</span>
                 <div className="lora-checklist">
                   {(config.lora_presets ?? [])
                     .filter((p) => p.id !== "none")
@@ -1172,13 +1174,13 @@ export default function App() {
                 <div className="lora-custom-form">
                   <input
                     type="url"
-                    placeholder="Hugging Face resolve URL or .safetensors path"
+                    placeholder="HF URL or .safetensors path"
                     value={customLoraUrl}
                     onChange={(e) => setCustomLoraUrl(e.target.value)}
                   />
                   <input
                     type="text"
-                    placeholder="Label (optional)"
+                    placeholder="Label"
                     value={customLoraLabel}
                     onChange={(e) => setCustomLoraLabel(e.target.value)}
                   />
@@ -1197,35 +1199,20 @@ export default function App() {
                     disabled={!customLoraUrl.trim() || addingCustomLora}
                     onClick={() => void addCustomLora()}
                   >
-                    Add LoRA
+                    Add
                   </button>
                 </div>
               </div>
 
-              <div className="options-grid">
-                <label>
-                  Steps
-                  <input
-                    type="number"
-                    min={1}
-                    max={50}
-                    value={numSteps}
-                    onChange={(e) => setNumSteps(Number(e.target.value))}
-                  />
-                </label>
-                <label>
-                  Seed
-                  <input
-                    type="text"
-                    placeholder="random"
-                    value={seed}
-                    onChange={(e) => setSeed(e.target.value)}
-                  />
-                </label>
-              </div>
-
               {loraStatus && (
                 <p className="hint">{loraStatus}</p>
+              )}
+
+              {isMultiClip && !audiocontinue && (
+                <p className="hint duration-total">
+                  ~{durationSeconds}s × {clipMultiplier} clips ≈ ~{totalDurationSeconds}s
+                  merged ({chainMethodLabel} + autoconcat)
+                </p>
               )}
 
               {audiocontinue && (
@@ -1239,7 +1226,6 @@ export default function App() {
                 <ChainMethodPicker
                   chainMethod={chainMethod}
                   onChange={setChainMethod}
-                  className="options-chain-method"
                 />
               )}
 

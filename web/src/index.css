@@ -545,39 +545,23 @@ body {
   margin-top: 8px;
 }
 
-.composer-chain {
-  margin-top: 12px;
-  padding: 12px 0 4px;
-  border-top: 1px solid var(--border);
-}
-
-.composer-chain-grid {
-  margin-bottom: 0;
-}
-
 .chain-method-panel {
-  margin-top: 10px;
-  padding-top: 0;
-  border-top: none;
-}
-
-.options-chain-method {
-  margin-top: 14px;
-  padding: 12px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--surface-2, rgba(0, 0, 0, 0.02));
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
 }
 
 .chain-method-radios {
   display: flex;
-  flex-direction: column;
-  gap: 10px;
+  flex-wrap: wrap;
+  gap: 16px 24px;
   margin-top: 8px;
 }
 
 .chain-method-option {
   align-items: flex-start !important;
+  flex: 1 1 220px;
+  max-width: 100%;
 }
 
 .chain-method-option span {
@@ -592,17 +576,22 @@ body {
   font-weight: normal;
 }
 
-.lora-panel {
-  margin-top: 14px;
-  padding-top: 12px;
-  border-top: 1px solid var(--border);
+.lora-row {
+  margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.lora-row-label {
+  font-size: 0.75rem;
+  color: var(--muted);
 }
 
 .lora-checklist {
   display: flex;
-  flex-direction: column;
-  gap: 6px;
-  margin: 8px 0 10px;
+  flex-wrap: wrap;
+  gap: 8px 16px;
 }
 
 .lora-check span {
@@ -627,7 +616,7 @@ body {
 
 .lora-custom-form {
   display: grid;
-  grid-template-columns: 1fr auto auto auto;
+  grid-template-columns: 1fr minmax(80px, 120px) 64px auto;
   gap: 8px;
   align-items: center;
 }
