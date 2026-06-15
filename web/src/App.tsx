@@ -137,6 +137,22 @@ function ChainMethodPicker({
   );
 }
 
+function loraSelectionSummary(presets: LoraPreset[], selectedIds: string[]) {
+  const selected = presets.filter((p) => selectedIds.includes(p.id));
+  if (selected.length === 0) return "None";
+  if (selected.length === 1) {
+    const raw = selected[0].label.replace(/\s*\(default\)\s*$/i, "").trim();
+    return raw.length > 20 ? `${raw.slice(0, 19)}…` : raw;
+  }
+  return `${selected.length} LoRAs`;
+}
+
+function loraSelectionTitle(presets: LoraPreset[], selectedIds: string[]) {
+  const selected = presets.filter((p) => selectedIds.includes(p.id));
+  if (!selected.length) return "No LoRA selected";
+  return selected.map((p) => p.label).join(", ");
+}
+
 function LoraMultiSelect({
   presets,
   selectedIds,
@@ -164,27 +180,23 @@ function LoraMultiSelect({
     return () => document.removeEventListener("mousedown", onDoc);
   }, [open]);
 
-  const selected = presets.filter((p) => selectedIds.includes(p.id));
-  const summary =
-    selected.length === 0
-      ? "None"
-      : selected.length === 1
-        ? selected[0].label
-        : `${selected.length} selected`;
+  const summary = loraSelectionSummary(presets, selectedIds);
+  const title = loraSelectionTitle(presets, selectedIds);
 
   return (
-    <div className="multi-select" ref={rootRef}>
+    <div className={`multi-select${open ? " is-open" : ""}`} ref={rootRef}>
       <button
         type="button"
         className="multi-select-trigger"
         disabled={disabled}
         aria-expanded={open}
+        title={title}
         onClick={() => setOpen((v) => !v)}
       >
-        {summary}
+        <span className="multi-select-trigger-text">{summary}</span>
       </button>
       {open && (
-        <div className="multi-select-menu" role="listbox">
+        <div className="multi-select-menu" role="listbox" aria-label="LoRA presets">
           {presets.map((p) => (
             <label key={p.id} className="multi-select-item">
               <input
@@ -1367,7 +1379,8 @@ export default function App() {
                   <input
                     type="text"
                     className="lora-add-url"
-                    placeholder="HF URL or .safetensors path"
+                    placeholder="URL or path"
+                    aria-label="LoRA URL or file path"
                     value={customLoraUrl}
                     disabled={addingCustomLora}
                     onChange={(e) => setCustomLoraUrl(e.target.value)}
@@ -1375,7 +1388,8 @@ export default function App() {
                   <input
                     type="text"
                     className="lora-add-name"
-                    placeholder="Name"
+                    placeholder="Label"
+                    aria-label="LoRA display name"
                     value={customLoraLabel}
                     disabled={addingCustomLora}
                     onChange={(e) => setCustomLoraLabel(e.target.value)}
@@ -1386,14 +1400,16 @@ export default function App() {
                     min={0}
                     max={2}
                     step={0.05}
-                    title="Strength"
+                    aria-label="LoRA strength"
+                    title="Strength (0–2)"
+                    placeholder="1.0"
                     value={customLoraScale}
                     disabled={addingCustomLora}
                     onChange={(e) => setCustomLoraScale(e.target.value)}
                   />
                   <button
                     type="button"
-                    className="btn-secondary btn-compact"
+                    className="btn-secondary btn-compact lora-add-btn"
                     disabled={!customLoraUrl.trim() || addingCustomLora || loraBusy}
                     onClick={() => void addCustomLora()}
                   >
