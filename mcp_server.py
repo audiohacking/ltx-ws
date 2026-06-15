@@ -30,6 +30,7 @@ from videofentanyl import (
     load_media_payload,
     sanitize_filename,
     try_autoconcat_clips,
+    try_finalize_native_extend_chain,
 )
 
 DEFAULT_SERVER_URL = "ws://127.0.0.1:8765/ws"
@@ -499,15 +500,23 @@ async def ltx_generate_sequence(
                         )
                     nxt.initial_image = next_frame
         if autoconcat:
-            # Reuse existing ffmpeg concat helper.
-            await asyncio.to_thread(
-                try_autoconcat_clips,
-                jobs,
-                output_prefix,
-                "mp4",
-                _VERBOSE,
-                False,
-            )
+            if method == CHAIN_METHOD_NATIVE_EXTEND:
+                await asyncio.to_thread(
+                    try_finalize_native_extend_chain,
+                    jobs,
+                    output_prefix,
+                    "mp4",
+                    _VERBOSE,
+                )
+            else:
+                await asyncio.to_thread(
+                    try_autoconcat_clips,
+                    jobs,
+                    output_prefix,
+                    "mp4",
+                    _VERBOSE,
+                    False,
+                )
             merged_candidates = sorted(_OUTPUT_DIR.glob(f"{output_prefix}_merged_*.mp4"))
             merged_path = str(merged_candidates[-1].resolve()) if merged_candidates else None
         else:

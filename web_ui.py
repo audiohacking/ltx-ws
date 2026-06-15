@@ -750,6 +750,7 @@ def _import_videofentanyl():
         load_media_payload,
         sanitize_filename,
         try_autoconcat_clips,
+        try_finalize_native_extend_chain,
     )
     return (
         GenerationParams,
@@ -761,6 +762,7 @@ def _import_videofentanyl():
         load_media_payload,
         sanitize_filename,
         try_autoconcat_clips,
+        try_finalize_native_extend_chain,
     )
 
 
@@ -1302,11 +1304,16 @@ async def _finish_autoconcat(
     prompts: list[str],
     gen_body: dict[str, Any],
     try_autoconcat_clips: Any,
+    try_finalize_native_extend_chain: Any,
 ) -> None:
     if not run.autoconcat or len(jobs) < 2:
         return
-    autocompact = bool(gen_body.get("autocompact", False))
-    try_autoconcat_clips(jobs, prefix, "mp4", verbose=False, compact=autocompact)
+    chain_method = getattr(run, "chain_method", None) or gen_body.get("chain_method") or "autocontinue"
+    if chain_method == "native_extend":
+        try_finalize_native_extend_chain(jobs, prefix, "mp4", verbose=False)
+    else:
+        autocompact = bool(gen_body.get("autocompact", False))
+        try_autoconcat_clips(jobs, prefix, "mp4", verbose=False, compact=autocompact)
     merged_files = sorted(state.output_dir.glob(f"{prefix}_merged_*.mp4"))
     if not merged_files:
         return
@@ -1372,6 +1379,7 @@ async def _execute_run_embedded(state: AppState, run_id: str) -> None:
         load_media_payload,
         sanitize_filename,
         try_autoconcat_clips,
+        try_finalize_native_extend_chain,
     ) = _import_videofentanyl()
 
     run = state.runs[run_id]
@@ -1517,7 +1525,15 @@ async def _execute_run_embedded(state: AppState, run_id: str) -> None:
                 return
 
         await _finish_autoconcat(
-            state, run, run_id, jobs, prefix, prompts, gen_body, try_autoconcat_clips
+            state,
+            run,
+            run_id,
+            jobs,
+            prefix,
+            prompts,
+            gen_body,
+            try_autoconcat_clips,
+            try_finalize_native_extend_chain,
         )
 
         run.status = RunStatus.DONE.value
@@ -1543,6 +1559,7 @@ async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
         load_media_payload,
         sanitize_filename,
         try_autoconcat_clips,
+        try_finalize_native_extend_chain,
     ) = _import_videofentanyl()
 
     run = state.runs[run_id]
@@ -1692,7 +1709,15 @@ async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
                 return
 
         await _finish_autoconcat(
-            state, run, run_id, jobs, prefix, prompts, gen_body, try_autoconcat_clips
+            state,
+            run,
+            run_id,
+            jobs,
+            prefix,
+            prompts,
+            gen_body,
+            try_autoconcat_clips,
+            try_finalize_native_extend_chain,
         )
 
         run.status = RunStatus.DONE.value

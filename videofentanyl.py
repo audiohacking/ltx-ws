@@ -1027,6 +1027,58 @@ def _ffmpeg_concat_list_line(path: Path) -> str:
     return f"file '{p}'"
 
 
+def try_finalize_native_extend_chain(
+    jobs: list[Job],
+    file_prefix: str,
+    ext: str,
+    verbose: bool,
+) -> None:
+    """Promote the last native-extend output as the merged deliverable.
+
+    ltx-2-mlx ``extend_from_video`` returns source footage plus new frames in a
+    single MP4. Concatenating segment files would duplicate the source at each
+    join; the cumulative result is always the last successful clip.
+    """
+    done = sorted(
+        (j for j in jobs if j.status == JobStatus.DONE),
+        key=lambda j: j.id,
+    )
+    if not done:
+        print("\n  [native_extend] finalize skipped — no successful clips.")
+        return
+
+    final = done[-1]
+    out_dir = final.output_path.parent
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    merged = out_dir / f"{file_prefix}_merged_{ts}.{ext}"
+
+    try:
+        shutil.copy2(final.output_path, merged)
+    except OSError as exc:
+        print(f"\n  [native_extend] could not copy final clip to merged: {exc}")
+        return
+
+    removed = 0
+    for j in done:
+        try:
+            if j.output_path.exists():
+                j.output_path.unlink()
+                removed += 1
+        except OSError as exc:
+            print(f"  [native_extend] warning: could not remove {j.output_path}: {exc}")
+
+    kb = merged.stat().st_size / 1024
+    if verbose:
+        print(
+            f"\n  [native_extend] finalized {len(done)} segment(s) → {merged}  ({kb:.0f} KB)"
+        )
+    else:
+        print(
+            f"\n  [native_extend] finalized chain → {merged}  ({kb:.0f} KB)"
+        )
+    print(f"  [native_extend] removed {removed} fragment file(s).")
+
+
 def try_autoconcat_clips(
     jobs: list[Job],
     file_prefix: str,

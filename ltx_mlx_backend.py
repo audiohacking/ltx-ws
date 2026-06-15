@@ -35,6 +35,9 @@ LTX2_MLX_GIT_TAG = "v0.14.9"
 
 CHAIN_METHOD_AUTOCONTINUE = "autocontinue"
 CHAIN_METHOD_NATIVE_EXTEND = "native_extend"
+RETAKE_EXTEND_DEFAULT_STEPS = 30
+RETAKE_EXTEND_DEFAULT_CFG = 3.0
+RETAKE_EXTEND_DEFAULT_STG = 1.0
 VALID_CHAIN_METHODS = frozenset({CHAIN_METHOD_AUTOCONTINUE, CHAIN_METHOD_NATIVE_EXTEND})
 
 PIPE_PROFILE_DISTILLED = "distilled"
@@ -1512,7 +1515,7 @@ class LocalVideoGenerator:
                 req.prompt,
                 mode=mode,
                 model_dir=str(self._model_path),
-                enabled=bool(req.enhance_prompt),
+                enabled=bool(req.enhance_prompt) and mode not in ("extend", "retake"),
             )
             profile = _normalize_pipeline_profile(req.pipeline_profile)
             log.info(
@@ -1609,6 +1612,7 @@ class LocalVideoGenerator:
                         end_frame = int(req.retake_end if req.retake_end is not None else start_frame)
                         pipe = self._get_pipe("retake")
                         last_pipe = pipe
+                        retake_steps = max(steps, RETAKE_EXTEND_DEFAULT_STEPS)
                         retake_kwargs = dict(
                             prompt=effective_prompt,
                             output_path=out_path,
@@ -1616,7 +1620,17 @@ class LocalVideoGenerator:
                             start_frame=start_frame,
                             end_frame=end_frame,
                             seed=seed,
-                            num_steps=steps,
+                            num_steps=retake_steps,
+                            cfg_scale=float(
+                                req.cfg_scale
+                                if req.cfg_scale is not None
+                                else RETAKE_EXTEND_DEFAULT_CFG
+                            ),
+                            stg_scale=float(
+                                req.stg_scale
+                                if req.stg_scale is not None
+                                else RETAKE_EXTEND_DEFAULT_STG
+                            ),
                             lora_paths=resolved_loras,
                             fps=float(self.fps),
                         )
@@ -1642,6 +1656,7 @@ class LocalVideoGenerator:
                         direction = (req.extend_direction or "after").strip().lower()
                         pipe = self._get_pipe("extend")
                         last_pipe = pipe
+                        extend_steps = max(steps, RETAKE_EXTEND_DEFAULT_STEPS)
                         extend_kwargs = dict(
                             prompt=effective_prompt,
                             output_path=out_path,
@@ -1649,7 +1664,17 @@ class LocalVideoGenerator:
                             extend_frames=ext_frames,
                             direction=direction,
                             seed=seed,
-                            num_steps=steps,
+                            num_steps=extend_steps,
+                            cfg_scale=float(
+                                req.cfg_scale
+                                if req.cfg_scale is not None
+                                else RETAKE_EXTEND_DEFAULT_CFG
+                            ),
+                            stg_scale=float(
+                                req.stg_scale
+                                if req.stg_scale is not None
+                                else RETAKE_EXTEND_DEFAULT_STG
+                            ),
                             lora_paths=resolved_loras,
                             fps=float(self.fps),
                         )
