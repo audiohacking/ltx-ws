@@ -75,11 +75,26 @@ function preserveBlobVideoUrls(prev: Clip[], incoming: Clip[]): Clip[] {
 
 function revokeBlobVideoUrls(clips: Clip[]) {
   for (const clip of clips) {
-    const url = clip.video_url;
-    if (url?.startsWith(BLOB_VIDEO_PREFIX)) {
-      URL.revokeObjectURL(url);
+    revokeClipBlob(clip);
+  }
+}
+
+function revokeClipBlob(clip: Clip) {
+  const url = clip.video_url;
+  if (url?.startsWith(BLOB_VIDEO_PREFIX)) {
+    URL.revokeObjectURL(url);
+  }
+}
+
+function replaceClipsFromServer(prev: Clip[], incoming: Clip[]): Clip[] {
+  const next = preserveBlobVideoUrls(prev, incoming);
+  const nextIds = new Set(next.map((c) => c.id));
+  for (const clip of prev) {
+    if (!nextIds.has(clip.id)) {
+      revokeClipBlob(clip);
     }
   }
+  return next;
 }
 
 async function fetchConfig(): Promise<Config> {
@@ -314,6 +329,7 @@ export default function App() {
   const ensuredLoraSpecsRef = useRef<Set<string>>(readEnsuredLoraSpecs());
   const loraPresetsRef = useRef<LoraPreset[]>([]);
   const ensurePromisesRef = useRef<Map<string, Promise<void>>>(new Map());
+  const runEventSourceRef = useRef<EventSource | null>(null);
 
   const libraryClips = useMemo(() => {
     return clips
@@ -342,6 +358,73 @@ export default function App() {
     if (!selectedClipId) return null;
     return clips.find((x) => x.id === selectedClipId) ?? null;
   }, [clips, selectedClipId]);
+
+  const closeRunSubscription = useCallback(() => {
+    runEventSourceRef.current?.close();
+    runEventSourceRef.current = null;
+  }, []);
+
+  /** Drop chain/clip editor context after library removal so generate stays usable. */
+  const releaseClipContext = useCallback(() => {
+    setSelectedClipId(null);
+    setChainId(null);
+    setSourceClipId(null);
+    setMode((current) => {
+      if (["retake", "extend", "lipdub"].includes(current)) return "generate";
+      if (current === "i2v" && !imagePath) return "generate";
+      if (current === "a2v" && !audioPath) return "generate";
+      if (current === "keyframe" && (!imagePath || !endImagePath)) return "generate";
+      return current;
+    });
+    setAutocontinue(false);
+    setAutoconcat(false);
+    setAudiocontinue(false);
+    setClipMultiplier(1);
+  }, [audioPath, endImagePath, imagePath]);
+
+  const syncClipSelection = useCallback(
+    (all: Clip[], deleted?: Clip) => {
+      const ids = new Set(all.map((c) => c.id));
+      let nextSelected = selectedClipId;
+      let nextChain = chainId;
+
+      if (nextSelected && !ids.has(nextSelected)) {
+        nextSelected = null;
+      }
+      if (sourceClipId && !ids.has(sourceClipId)) {
+        setSourceClipId(null);
+      }
+      if (nextChain && !all.some((c) => c.chain_id === nextChain)) {
+        nextChain = null;
+        nextSelected = null;
+      } else if (deleted && selectedClipId === deleted.id && nextChain) {
+        const chainClips = all.filter(
+          (c) => c.chain_id === nextChain && c.status === "done" && c.video_url,
+        );
+        nextSelected = nextChain ? pickPlaybackClip(chainClips, nextChain) : null;
+        if (!nextSelected) {
+          nextChain = null;
+        }
+      }
+
+      setSelectedClipId(nextSelected);
+      setChainId(nextChain);
+
+      const lostActive =
+        Boolean(deleted && selectedClipId === deleted.id) ||
+        Boolean(selectedClipId && !ids.has(selectedClipId)) ||
+        Boolean(chainId && !all.some((c) => c.chain_id === chainId));
+
+      if (lostActive && !nextSelected) {
+        releaseClipContext();
+      } else if (deleted && sourceClipId === deleted.id) {
+        setMode((current) =>
+          ["retake", "extend", "lipdub"].includes(current) ? "generate" : current,
+        );
+      }
+    },
+    [chainId, releaseClipContext, selectedClipId, sourceClipId],
+  );
 
   const ensureLoraPresets = useCallback(async (
     presetIds: string[],
@@ -593,7 +676,19 @@ export default function App() {
 
   useEffect(() => {
     load();
-  }, [load]);
+    return () => {
+      closeRunSubscription();
+    };
+  }, [load, closeRunSubscription]);
+
+  useEffect(() => {
+    if (!selectedClipId) return;
+    if (!clips.some((c) => c.id === selectedClipId)) {
+      releaseClipContext();
+    } else if (chainId && !clips.some((c) => c.chain_id === chainId)) {
+      releaseClipContext();
+    }
+  }, [clips, chainId, releaseClipContext, selectedClipId]);
 
   useEffect(() => {
     if (clipMultiplier > 1) {
@@ -654,23 +749,25 @@ export default function App() {
   }
 
   async function deleteGeneration(clip: Clip) {
+    if (busy) return;
     if (!confirm("Delete this video from the library?")) return;
 
-    const r = await fetch(`${API}/api/clips/${encodeURIComponent(clip.id)}`, {
-      method: "DELETE",
-    });
-    if (!r.ok) {
-      setError("Could not delete");
-      return;
-    }
-    const all = await fetchClips();
-    setClips((prev) => preserveBlobVideoUrls(prev, all));
-    if (selectedClipId === clip.id) {
-      setSelectedClipId(null);
-      setChainId(null);
-    }
-    if (sourceClipId === clip.id) {
-      setSourceClipId(null);
+    try {
+      const r = await fetch(`${API}/api/clips/${encodeURIComponent(clip.id)}`, {
+        method: "DELETE",
+      });
+      if (!r.ok) {
+        setError("Could not delete");
+        return;
+      }
+
+      revokeClipBlob(clip);
+      const all = await fetchClips();
+      setClips((prev) => replaceClipsFromServer(prev, all));
+      syncClipSelection(all, clip);
+      setError(null);
+    } catch (e) {
+      setError(String(e));
     }
   }
 
@@ -832,16 +929,21 @@ export default function App() {
   }
 
   async function subscribeRun(runId: string, runChainId: string) {
+    closeRunSubscription();
     setActiveRunId(runId);
     let closed = false;
     let autoconcatRun = false;
     let audiocontinueRun = false;
     let streamFinalOnly = false;
     const es = new EventSource(`${API}/api/runs/${runId}/events`);
+    runEventSourceRef.current = es;
 
     const finishRun = async () => {
       if (closed) return;
       closed = true;
+      if (runEventSourceRef.current === es) {
+        runEventSourceRef.current = null;
+      }
       es.close();
       setActiveRunId(null);
       setBusy(false);
@@ -1028,6 +1130,9 @@ export default function App() {
         finishRun();
       } else if (msg.type === "error" || msg.type === "clip_failed") {
         setError(msg.error || msg.message || "Failed");
+        if (runEventSourceRef.current === es) {
+          runEventSourceRef.current = null;
+        }
         es.close();
         setActiveRunId(null);
         setBusy(false);
@@ -1036,6 +1141,9 @@ export default function App() {
     es.onerror = () => {
       if (closed) return;
       closed = true;
+      if (runEventSourceRef.current === es) {
+        runEventSourceRef.current = null;
+      }
       es.close();
       setBusy(false);
       setProgress(null);
@@ -1044,7 +1152,7 @@ export default function App() {
   }
 
   async function handleGenerate() {
-    if (!prompt.trim() || busy) return;
+    if (!canSubmit || !prompt.trim() || busy) return;
     setError(null);
     setBusy(true);
     setProgress({ phase: "starting", message: "Submitting…" });
@@ -1286,7 +1394,12 @@ export default function App() {
               }
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && handleGenerate()}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  void handleGenerate();
+                }
+              }}
               disabled={busy}
             />
             <button
@@ -1863,9 +1976,10 @@ export default function App() {
                   type="button"
                   className="library-delete"
                   title="Delete"
+                  disabled={busy}
                   onClick={(e) => {
                     e.stopPropagation();
-                    deleteGeneration(clip);
+                    void deleteGeneration(clip);
                   }}
                 >
                   ×

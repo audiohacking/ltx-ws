@@ -877,6 +877,9 @@ class AppState:
             except OSError as exc:
                 log.warning("Could not delete clip file %s: %s", path, exc)
         del self.clips[clip_id]
+        for run in self.runs.values():
+            if clip_id in run.clip_ids:
+                run.clip_ids = [cid for cid in run.clip_ids if cid != clip_id]
         return True
 
     def delete_chain(self, chain_id: str) -> int:
