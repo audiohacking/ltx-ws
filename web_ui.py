@@ -165,6 +165,51 @@ def _persist_hidden_lora_ids(output_dir: Path, ids: set[str]) -> None:
     write_web_settings(output_dir, data)
 
 
+def _frames_dir(output_dir: Path) -> Path:
+    return output_dir / "frames"
+
+
+def _read_frame_library(output_dir: Path) -> list[dict[str, Any]]:
+    raw = read_web_settings(output_dir).get("frame_library")
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or "").strip()
+        if not path:
+            continue
+        fid = str(item.get("id") or "").strip() or f"frame_{uuid.uuid4().hex[:8]}"
+        label = str(item.get("label") or "").strip() or "Frame"
+        filename = str(item.get("filename") or Path(path).name)
+        entry: dict[str, Any] = {
+            "id": fid,
+            "label": label,
+            "path": path,
+            "filename": filename,
+            "created_at": str(item.get("created_at") or datetime.now().isoformat()),
+        }
+        for key in ("width", "height", "source_clip_id", "time_s"):
+            if item.get(key) is not None:
+                entry[key] = item[key]
+        out.append(entry)
+    return out
+
+
+def _write_frame_library(output_dir: Path, entries: list[dict[str, Any]]) -> None:
+    data = read_web_settings(output_dir)
+    data["frame_library"] = entries
+    write_web_settings(output_dir, data)
+
+
+def _frame_for_api(entry: dict[str, Any]) -> dict[str, Any]:
+    filename = str(entry.get("filename") or Path(str(entry.get("path") or "")).name)
+    out = dict(entry)
+    out["image_url"] = f"/api/frames/files/{filename}"
+    return out
+
+
 def _remove_lora_preset_entry(output_dir: Path, preset_id: str) -> None:
     """Drop a custom LoRA entry or hide a built-in/env preset from the Web UI."""
     lid = (preset_id or "").strip()
@@ -2623,6 +2668,96 @@ def create_app(
         except Exception as exc:
             log.exception("Upload failed for kind=%s", kind)
             raise HTTPException(500, f"Upload failed: {exc}") from exc
+
+    @app.get("/api/frames")
+    async def list_frames():
+        entries = _read_frame_library(state.output_dir)
+        entries.sort(key=lambda e: e.get("created_at") or "", reverse=True)
+        return {"frames": [_frame_for_api(e) for e in entries]}
+
+    @app.post("/api/frames")
+    async def save_frame(request: Request):
+        form = await request.form()
+        upload_file = form.get("file")
+        if upload_file is None:
+            raise HTTPException(400, "file is required")
+        read = getattr(upload_file, "read", None)
+        if read is None:
+            raise HTTPException(400, "file is required")
+        content = await read()
+        if not content:
+            raise HTTPException(400, "empty frame file")
+
+        label = str(form.get("label") or "").strip()
+        source_clip_id = str(form.get("source_clip_id") or "").strip() or None
+        time_raw = form.get("time_s")
+        time_s: float | None = None
+        if time_raw is not None and str(time_raw).strip():
+            try:
+                time_s = float(time_raw)
+            except (TypeError, ValueError):
+                raise HTTPException(400, "time_s must be a number") from None
+
+        frames_root = _frames_dir(state.output_dir)
+        frames_root.mkdir(parents=True, exist_ok=True)
+        fid = f"frame_{uuid.uuid4().hex[:8]}"
+        filename = f"{fid}.png"
+        dest = frames_root / filename
+        dest.write_bytes(content)
+
+        if not label:
+            label = f"Frame @ {time_s:.1f}s" if time_s is not None else "Saved frame"
+
+        entry = {
+            "id": fid,
+            "label": label,
+            "path": str(dest.resolve()),
+            "filename": filename,
+            "created_at": datetime.now().isoformat(),
+        }
+        if source_clip_id:
+            entry["source_clip_id"] = source_clip_id
+        if time_s is not None:
+            entry["time_s"] = round(time_s, 3)
+
+        entries = _read_frame_library(state.output_dir)
+        entries.append(entry)
+        _write_frame_library(state.output_dir, entries)
+        return {"ok": True, "frame": _frame_for_api(entry)}
+
+    @app.delete("/api/frames/{frame_id}")
+    async def delete_frame(frame_id: str):
+        fid = (frame_id or "").strip()
+        if not fid:
+            raise HTTPException(400, "frame id is required")
+        entries = _read_frame_library(state.output_dir)
+        kept: list[dict[str, Any]] = []
+        removed: dict[str, Any] | None = None
+        for entry in entries:
+            if entry.get("id") == fid:
+                removed = entry
+            else:
+                kept.append(entry)
+        if removed is None:
+            raise HTTPException(404, "Frame not found")
+        path = Path(str(removed.get("path") or ""))
+        if path.is_file():
+            try:
+                path.unlink()
+            except OSError as exc:
+                log.warning("Could not delete frame file %s: %s", path, exc)
+        _write_frame_library(state.output_dir, kept)
+        return {"ok": True, "deleted": fid, "frames": [_frame_for_api(e) for e in kept]}
+
+    @app.get("/api/frames/files/{filename}")
+    async def serve_frame_file(filename: str):
+        safe = Path(filename).name
+        if safe != filename:
+            raise HTTPException(400, "invalid filename")
+        path = _frames_dir(state.output_dir) / safe
+        if not path.is_file():
+            raise HTTPException(404, "Frame not found")
+        return FileResponse(path, media_type="image/png", filename=safe)
 
     @app.get("/api/videos/{filename}")
     async def serve_video(filename: str):

@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { clipDisplayPrompt, snapshotFromClip } from "./clipEditor";
 import { applyProgressEvent } from "./progress";
-import type { Clip, Config, LoraPreset, ProgressState } from "./types";
+import { captureVideoFrame, formatVideoTime } from "./frameCapture";
+import type { Clip, Config, LibraryFrame, LoraPreset, ProgressState } from "./types";
 
 const API = "";
 const MODEL_PREF_KEY = "ltx-ws-preferred-model";
@@ -110,6 +111,15 @@ async function fetchClips(chainId?: string): Promise<Clip[]> {
   const data = await r.json();
   return data.clips as Clip[];
 }
+
+async function fetchFrames(): Promise<LibraryFrame[]> {
+  const r = await fetch(`${API}/api/frames`);
+  if (!r.ok) throw new Error("Failed to load frames");
+  const data = await r.json();
+  return (data.frames ?? []) as LibraryFrame[];
+}
+
+const IMAGE_INPUT_MODES = new Set(["generate", "i2v", "a2v", "keyframe"]);
 
 /** Merge server clip lists into local state (by id); used when refreshing one chain. */
 function mergeClips(prev: Clip[], incoming: Clip[]): Clip[] {
@@ -279,6 +289,7 @@ function LoraMultiSelect({
 export default function App() {
   const [config, setConfig] = useState<Config | null>(null);
   const [clips, setClips] = useState<Clip[]>([]);
+  const [frameLibrary, setFrameLibrary] = useState<LibraryFrame[]>([]);
   const [chainId, setChainId] = useState<string | null>(null);
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
   const [prompt, setPrompt] = useState("");
@@ -321,8 +332,11 @@ export default function App() {
   const [customLoraLabel, setCustomLoraLabel] = useState("");
   const [customLoraScale, setCustomLoraScale] = useState("1.0");
   const [addingCustomLora, setAddingCustomLora] = useState(false);
+  const [savingFrame, setSavingFrame] = useState(false);
+  const [playerTime, setPlayerTime] = useState(0);
 
   const imageRef = useRef<HTMLInputElement>(null);
+  const playerVideoRef = useRef<HTMLVideoElement>(null);
   const endImageRef = useRef<HTMLInputElement>(null);
   const audioRef = useRef<HTMLInputElement>(null);
   const videoRef = useRef<HTMLInputElement>(null);
@@ -558,6 +572,8 @@ export default function App() {
       }
       const all = await fetchClips();
       setClips(all);
+      const frames = await fetchFrames();
+      setFrameLibrary(frames);
     } catch (e) {
       setError(String(e));
     }
@@ -733,6 +749,75 @@ export default function App() {
     releaseClipContext();
     setPrompt("");
     setError(null);
+  }
+
+  function applyFrameAsInput(frame: LibraryFrame, target: "start" | "end" = "start") {
+    if (target === "end") {
+      setEndImagePath(frame.path);
+      setEndImageName(frame.label);
+      if (mode !== "keyframe") {
+        setMode("keyframe");
+      }
+    } else {
+      setImagePath(frame.path);
+      setImageName(frame.label);
+      if (!IMAGE_INPUT_MODES.has(mode)) {
+        setMode("i2v");
+      }
+    }
+    setError(null);
+  }
+
+  async function saveCurrentFrame() {
+    const video = playerVideoRef.current;
+    if (!video || !activeClip || savingFrame || busy) return;
+    setSavingFrame(true);
+    try {
+      const blob = await captureVideoFrame(video);
+      const timeS = video.currentTime;
+      const fd = new FormData();
+      fd.append("file", blob, `frame_${Date.now()}.png`);
+      fd.append(
+        "label",
+        `${formatVideoTime(timeS)} · ${activeClip.label || "clip"}`,
+      );
+      fd.append("time_s", String(timeS));
+      fd.append("source_clip_id", activeClip.id);
+      const r = await fetch(`${API}/api/frames`, { method: "POST", body: fd });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        throw new Error(err.detail || "Could not save frame");
+      }
+      const frames = await fetchFrames();
+      setFrameLibrary(frames);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSavingFrame(false);
+    }
+  }
+
+  async function deleteFrame(frame: LibraryFrame) {
+    if (busy) return;
+    if (!confirm(`Delete frame "${frame.label}"?`)) return;
+    try {
+      const r = await fetch(`${API}/api/frames/${encodeURIComponent(frame.id)}`, {
+        method: "DELETE",
+      });
+      if (!r.ok) throw new Error("Could not delete frame");
+      const data = await r.json();
+      setFrameLibrary(data.frames ?? []);
+      if (imagePath === frame.path) {
+        setImagePath(null);
+        setImageName(null);
+      }
+      if (endImagePath === frame.path) {
+        setEndImagePath(null);
+        setEndImageName(null);
+      }
+    } catch (e) {
+      setError(String(e));
+    }
   }
 
   function applyClipSelection(clip: Clip) {
@@ -1330,12 +1415,19 @@ export default function App() {
           <div className="player-wrap">
             {activeClip?.video_url ? (
               <video
+                ref={playerVideoRef}
                 className="player"
                 src={activeClip.video_url}
+                crossOrigin={
+                  activeClip.video_url.startsWith(BLOB_VIDEO_PREFIX)
+                    ? undefined
+                    : "anonymous"
+                }
                 controls
                 autoPlay
                 loop
                 playsInline
+                onTimeUpdate={(e) => setPlayerTime(e.currentTarget.currentTime)}
               />
             ) : (
               <div className="player placeholder">
@@ -1366,6 +1458,22 @@ export default function App() {
                     </button>
                   )}
                 </div>
+              </div>
+            )}
+            {activeClip?.video_url && !busy && (
+              <div className="player-toolbar">
+                <span className="player-toolbar-time">
+                  {formatVideoTime(playerTime)}
+                </span>
+                <button
+                  type="button"
+                  className="btn-secondary btn-player-action"
+                  disabled={savingFrame}
+                  onClick={() => void saveCurrentFrame()}
+                  title="Capture the current frame and add it to the frame library"
+                >
+                  {savingFrame ? "Saving…" : "Save frame to library"}
+                </button>
               </div>
             )}
           </div>
@@ -2024,6 +2132,73 @@ export default function App() {
                 </button>
               </div>
             ))}
+          </div>
+
+          <div className="library-section">
+            <div className="library-header">
+              <span className="library-title">Frames</span>
+              <span className="library-count">{frameLibrary.length}</span>
+            </div>
+            {frameLibrary.length === 0 ? (
+              <p className="library-empty-hint">
+                Pause a video and use <strong>Save frame to library</strong> on the
+                player to capture stills for i2v, a2v, or keyframe inputs.
+              </p>
+            ) : (
+              <div className="frame-library-grid">
+                {frameLibrary.map((frame) => (
+                  <div
+                    key={frame.id}
+                    className={`frame-card-wrap ${
+                      imagePath === frame.path || endImagePath === frame.path
+                        ? "active"
+                        : ""
+                    }`}
+                  >
+                    <button
+                      type="button"
+                      className="frame-card"
+                      title={`Use as start image: ${frame.label}`}
+                      onClick={() => applyFrameAsInput(frame, "start")}
+                    >
+                      <img
+                        className="frame-thumb"
+                        src={frame.image_url}
+                        alt={frame.label}
+                        loading="lazy"
+                      />
+                      <span className="frame-label">{frame.label}</span>
+                    </button>
+                    {mode === "keyframe" && (
+                      <button
+                        type="button"
+                        className="frame-use-end"
+                        title="Use as end image"
+                        disabled={busy}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          applyFrameAsInput(frame, "end");
+                        }}
+                      >
+                        End
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      className="library-delete"
+                      title="Delete frame"
+                      disabled={busy}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        void deleteFrame(frame);
+                      }}
+                    >
+                      ×
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         </aside>
       </div>

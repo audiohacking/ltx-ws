@@ -76,6 +76,19 @@ export interface Clip {
   audiocontinue?: boolean;
 }
 
+export interface LibraryFrame {
+  id: string;
+  label: string;
+  path: string;
+  image_url: string;
+  filename: string;
+  width?: number;
+  height?: number;
+  source_clip_id?: string;
+  time_s?: number;
+  created_at: string;
+}
+
 export interface ModelProgress {
   stage?: string;
   step?: number;
