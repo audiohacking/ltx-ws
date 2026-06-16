@@ -333,7 +333,6 @@ export default function App() {
   const [customLoraScale, setCustomLoraScale] = useState("1.0");
   const [addingCustomLora, setAddingCustomLora] = useState(false);
   const [savingFrame, setSavingFrame] = useState(false);
-  const [playerTime, setPlayerTime] = useState(0);
 
   const imageRef = useRef<HTMLInputElement>(null);
   const playerVideoRef = useRef<HTMLVideoElement>(null);
@@ -1427,7 +1426,6 @@ export default function App() {
                 autoPlay
                 loop
                 playsInline
-                onTimeUpdate={(e) => setPlayerTime(e.currentTarget.currentTime)}
               />
             ) : (
               <div className="player placeholder">
@@ -1461,20 +1459,32 @@ export default function App() {
               </div>
             )}
             {activeClip?.video_url && !busy && (
-              <div className="player-toolbar">
-                <span className="player-toolbar-time">
-                  {formatVideoTime(playerTime)}
-                </span>
-                <button
-                  type="button"
-                  className="btn-secondary btn-player-action"
-                  disabled={savingFrame}
-                  onClick={() => void saveCurrentFrame()}
-                  title="Capture the current frame and add it to the frame library"
-                >
-                  {savingFrame ? "Saving…" : "Save frame to library"}
-                </button>
-              </div>
+              <button
+                type="button"
+                className="player-capture-btn"
+                disabled={savingFrame}
+                onClick={() => void saveCurrentFrame()}
+                title="Save frame to library"
+                aria-label="Save frame to library"
+              >
+                {savingFrame ? (
+                  <span className="player-capture-spinner" aria-hidden />
+                ) : (
+                  <svg
+                    className="player-capture-icon"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.75"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    aria-hidden
+                  >
+                    <path d="M4 7h2l2-3h8l2 3h2a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2z" />
+                    <circle cx="12" cy="13" r="4" />
+                  </svg>
+                )}
+              </button>
             )}
           </div>
 
@@ -2141,8 +2151,8 @@ export default function App() {
             </div>
             {frameLibrary.length === 0 ? (
               <p className="library-empty-hint">
-                Pause a video and use <strong>Save frame to library</strong> on the
-                player to capture stills for i2v, a2v, or keyframe inputs.
+                Pause a video and tap the camera icon on the player to capture
+                stills for i2v, a2v, or keyframe inputs.
               </p>
             ) : (
               <div className="frame-library-grid">
