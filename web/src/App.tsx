@@ -295,7 +295,7 @@ export default function App() {
   const [clipMultiplier, setClipMultiplier] = useState(1);
   const [numSteps, setNumSteps] = useState(8);
   const [seed, setSeed] = useState<string>("");
-  const [autocontinue, setAutocontinue] = useState(true);
+  const [autocontinue, setAutocontinue] = useState(false);
   const [autoconcat, setAutoconcat] = useState(false);
   const [audiocontinue, setAudiocontinue] = useState(false);
   const [chainMethod, setChainMethod] = useState("autocontinue");
@@ -727,6 +727,13 @@ export default function App() {
   const editingChain =
     !isMultiClip &&
     Boolean(chainId && activeClip?.status === "done");
+  const willContinueChain = editingChain && autocontinue;
+
+  function beginFreshGeneration() {
+    releaseClipContext();
+    setPrompt("");
+    setError(null);
+  }
 
   function applyClipSelection(clip: Clip) {
     const snap = snapshotFromClip(clip, config, {
@@ -741,8 +748,10 @@ export default function App() {
     setClipMultiplier(snap.clipMultiplier);
     setNumSteps(snap.numSteps);
     setSeed(snap.seed);
-    setAutocontinue(snap.autocontinue);
-    setAutoconcat(snap.autoconcat);
+    // Only restore chain continuation for true multi-clip runs — not passive library preview.
+    const multiClipRun = (clip.clip_count ?? 1) > 1;
+    setAutocontinue(multiClipRun);
+    setAutoconcat(multiClipRun && snap.autoconcat);
     setAudiocontinue(snap.audiocontinue);
     setShowOptions(true);
     setError(null);
@@ -1157,7 +1166,7 @@ export default function App() {
     setBusy(true);
     setProgress({ phase: "starting", message: "Submitting…" });
 
-    const isChainEdit = editingChain && autocontinue;
+    const isChainEdit = willContinueChain;
 
     const durationPreset = config?.duration_presets.find((d) => d.id === durationId);
 
@@ -1265,7 +1274,7 @@ export default function App() {
 
   const canSubmit = useMemo(() => {
     if (!prompt.trim() || busy || !serverOk) return false;
-    const continuing = editingChain && autocontinue;
+    const continuing = willContinueChain;
     if (mode === "i2v" && !imagePath && !continuing) return false;
     if (mode === "a2v" && !audioPath) return false;
     if (audiocontinue && !config?.ffmpeg_available) return false;
@@ -1299,7 +1308,12 @@ export default function App() {
           <span className="brand-sub">Videofentanyl</span>
         </div>
         <div className="header-status">
-          <button type="button" className="btn-secondary" onClick={startNewProject}>
+          <button
+            type="button"
+            className="btn-secondary"
+            title="Clear the library and reset the session"
+            onClick={startNewProject}
+          >
             New project
           </button>
           <span
@@ -1357,28 +1371,52 @@ export default function App() {
           </div>
 
           {error && <div className="error-banner">{error}</div>}
-          {showChainPicker && (
-            <div className="chain-picker">
-              <label className="chain-picker-label">
-                Chain part
-                <select
-                  className="chain-picker-select"
-                  value={selectedClipId ?? ""}
-                  onChange={(e) => {
-                    const c = chainParts.find((x) => x.id === e.target.value);
-                    if (c) applyClipSelection(c);
-                  }}
-                >
-                  {chainParts.map((c) => (
-                    <option key={c.id} value={c.id}>
-                      {c.label}
-                      {c.num_frames
-                        ? ` · ${formatDuration(c.num_frames, config?.defaults.fps ?? 24)}`
-                        : ""}
-                    </option>
-                  ))}
-                </select>
-              </label>
+          {(showChainPicker || willContinueChain) && (
+            <div className="player-context">
+              <div className="player-context-body">
+                {showChainPicker && (
+                  <>
+                    <label className="player-context-label">
+                      Chain clip
+                      <select
+                        className="chain-picker-select"
+                        value={selectedClipId ?? ""}
+                        onChange={(e) => {
+                          const c = chainParts.find((x) => x.id === e.target.value);
+                          if (c) applyClipSelection(c);
+                        }}
+                      >
+                        {chainParts.map((c) => (
+                          <option key={c.id} value={c.id}>
+                            {c.label}
+                            {c.num_frames
+                              ? ` · ${formatDuration(c.num_frames, config?.defaults.fps ?? 24)}`
+                              : ""}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <p className="player-context-hint">
+                      Multiple clips belong to one chained run (for example after
+                      autocontinue or an edit). Pick which to preview.
+                    </p>
+                  </>
+                )}
+                {willContinueChain && (
+                  <p className="player-context-hint player-context-hint-continue">
+                    Autocontinue is on — your next prompt extends the selected clip.
+                    Turn off autocontinue in options, or start a new generation for a
+                    separate video.
+                  </p>
+                )}
+              </div>
+              <button
+                type="button"
+                className="btn-secondary btn-fresh-generation"
+                onClick={beginFreshGeneration}
+              >
+                Start new generation
+              </button>
             </div>
           )}
         </section>
@@ -1388,7 +1426,7 @@ export default function App() {
             <input
               className="prompt-input"
               placeholder={
-                editingChain
+                willContinueChain
                   ? "What do you want to edit?"
                   : "What video do you want to create?"
               }
