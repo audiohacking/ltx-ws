@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { clipDisplayPrompt, snapshotFromClip } from "./clipEditor";
 import { applyProgressEvent } from "./progress";
 import { captureVideoFrame, formatVideoTime } from "./frameCapture";
@@ -335,6 +335,7 @@ export default function App() {
   const [savingFrame, setSavingFrame] = useState(false);
 
   const imageRef = useRef<HTMLInputElement>(null);
+  const promptRef = useRef<HTMLTextAreaElement>(null);
   const playerVideoRef = useRef<HTMLVideoElement>(null);
   const endImageRef = useRef<HTMLInputElement>(null);
   const audioRef = useRef<HTMLInputElement>(null);
@@ -1384,6 +1385,18 @@ export default function App() {
     chainId,
   ]);
 
+  const fitPromptHeight = useCallback(() => {
+    const el = promptRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    const max = 200;
+    el.style.height = `${Math.min(el.scrollHeight, max)}px`;
+  }, []);
+
+  useLayoutEffect(() => {
+    fitPromptHeight();
+  }, [prompt, fitPromptHeight]);
+
   return (
     <div className="app">
       <header className="header">
@@ -1541,8 +1554,10 @@ export default function App() {
 
         <section className="composer">
           <div className="prompt-row">
-            <input
+            <textarea
+              ref={promptRef}
               className="prompt-input"
+              rows={1}
               placeholder={
                 willContinueChain
                   ? "What do you want to edit?"
