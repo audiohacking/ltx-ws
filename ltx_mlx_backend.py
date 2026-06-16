@@ -613,16 +613,40 @@ def _apply_pending_loras(pipe: Any, lora_paths: list[tuple[str, float]] | None) 
         pipe._pending_loras = list(lora_paths or [])
 
 
+def _pipeline_load_state_inconsistent(pipe: Any) -> bool:
+    """True when ``_loaded`` is set but core weights the next job needs were freed."""
+    if not getattr(pipe, "_loaded", False):
+        return False
+    if getattr(pipe, "dit", None) is None:
+        return True
+    if getattr(pipe, "vae_encoder", None) is None:
+        return True
+    return False
+
+
+def _sync_pipeline_load_flag(pipe: Any) -> None:
+    """Clear ``_loaded`` when freed blocks would make :meth:`load` skip a required reload."""
+    if _pipeline_load_state_inconsistent(pipe):
+        pipe._loaded = False
+
+
 def _release_pipe_after_generation(pipe: Any) -> None:
-    """Drop per-request conditioning state so cached pipeline instances do not leak prior inputs."""
+    """Reset per-request state on a cached pipeline instance.
+
+    Always clears request-scoped LoRA specs (``_pending_loras``) so the next job
+    does not inherit the previous clip's adapters.
+
+    When ``low_memory`` is off, leaves DiT / VAE encoder / decoders loaded so
+    back-to-back generations reuse warm weights and fused LoRAs.
+
+    When ``low_memory`` is on, upstream ``generate_and_save`` / decode paths
+    already free blocks between stages; we only reconcile ``_loaded`` if a
+    partial free left the flag set (which would skip ``load()`` and crash on
+    ``assert self.vae_encoder is not None`` on the next job).
+    """
     if hasattr(pipe, "_pending_loras"):
         pipe._pending_loras = []
-    conditioner = getattr(pipe, "image_conditioner", None)
-    if conditioner is not None and hasattr(conditioner, "free"):
-        try:
-            conditioner.free()
-        except Exception:
-            pass
+    _sync_pipeline_load_flag(pipe)
 
 
 def _unlink_fvserver_temp(path: str | None, marker: str) -> None:
@@ -724,7 +748,7 @@ def _decode_latents_to_mp4(
             pipe.prompt_encoder.free()
         if hasattr(pipe, "image_conditioner"):
             pipe.image_conditioner.free()
-        pipe._loaded = False
+        _sync_pipeline_load_flag(pipe)
         try:
             from ltx_core_mlx.utils.memory import aggressive_cleanup
 
