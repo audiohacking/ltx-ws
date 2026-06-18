@@ -185,40 +185,42 @@ Pin tag to `LTX2_MLX_GIT_TAG` in `ltx_mlx_backend.py`.
 
 ### Phase 1 — Foundation (MVP)
 
-- [ ] `training` branch: router + empty `/train` shell + nav
-- [ ] `ltx_train_backend.py`: healthcheck, config templates, subprocess/thread wrapper for **preprocess only**
-- [ ] Dataset upload API + folder layout
-- [ ] Train page: upload videos + captions → preprocess button → log/progress panel
-- [ ] Docs in README: optional trainer install
+- [x] `training` branch: router + `/train` wizard + nav
+- [x] `ltx_train_backend.py`: healthcheck, config templates, full job runner (slice → preprocess → train)
+- [x] Dataset upload API + folder layout (`web_outputs/train/<job_id>/`)
+- [x] Train page: upload videos + captions, wizard steps, live progress panel
+- [x] Docs in README: optional trainer install
 
-**Exit criteria:** User can preprocess clips from Web UI; no training yet.
+**Exit criteria:** User can preprocess clips from Web UI; no training yet. **Done** (training included in Phase 2 delivery).
 
 ### Phase 2 — T2V LoRA training
 
-- [ ] `POST /api/train/runs` wrapping `LtxvTrainer.train(step_callback=...)`
-- [ ] SSE progress (step / total / ETA from `TrainingStats`)
-- [ ] Cancel flag checked between steps
-- [ ] Validation MP4 serving from `output_dir`
-- [ ] **Register LoRA** → existing `/api/loras/custom` flow
+- [x] `POST /api/train/jobs` wrapping `LtxvTrainer.train(step_callback=...)`
+- [x] SSE progress (step / total / ETA / loss)
+- [x] Cancel flag checked between steps
+- [x] Validation MP4 serving from `output_dir`
+- [x] **Register LoRA** → existing `/api/loras/custom` flow
 
-**Exit criteria:** End-to-end T2V LoRA on a toy dataset (≥2 clips); use in generator.
+**Exit criteria:** End-to-end T2V LoRA on a toy dataset (≥2 clips); use in generator. **Ready for manual QA.**
 
 ### Phase 3 — Slice + AV presets
 
-- [ ] Slice API (ffmpeg dependency check)
-- [ ] `with_audio` preprocess toggle
-- [ ] Presets: `lora_av_whisper` simplified form (audio-only target modules hidden behind preset)
-- [ ] RAM warning banners (`--low-ram` → `enable_gradient_checkpointing`)
+- [x] Slice in wizard (ffmpeg dependency check via `/api/train/health`)
+- [x] `with_audio` preprocess toggle (AV preset)
+- [x] AV preset (`lora_av.yaml`) with dev transformer + checkpointing defaults
+- [x] Low RAM toggle → `enable_gradient_checkpointing`
+- [ ] RAM warning banners when preset + free-memory estimate disagree (nice-to-have)
 
 ### Phase 4 — V2V / IC-LoRA training
 
-- [ ] Reference video upload + reference latent preprocess path
-- [ ] `video_to_video` strategy UI
-- [ ] Validation with `reference_videos`
+- [x] Reference video upload + reference latent preprocess path
+- [x] `video_to_video` strategy UI (`v2v` preset + `lora_v2v.yaml`)
+- [x] Validation with `reference_videos` (paths from job `references/`)
 
 ### Phase 5 — Polish
 
-- [ ] Resume from checkpoint (`model.load_checkpoint`)
+- [x] Job persistence (`manifest.json` + `status.json`); resume interrupted/failed jobs (`POST …/resume`)
+- [ ] Resume from training checkpoint (`model.load_checkpoint`)
 - [ ] W&B optional (`wandb` extra)
 - [ ] MCP tool `ltx_train_lora` for agents (optional)
 
@@ -231,8 +233,8 @@ Pin tag to `LTX2_MLX_GIT_TAG` in `ltx_mlx_backend.py`.
 | OOM during train | Default to q8 model path; expose checkpointing; block train if free RAM estimate low |
 | Train + generate concurrent | Global `mlx_busy` lock shared with `LocalVideoGenerator` |
 | Preprocess partial HF download | Use same resolved `model_path` as inference (full snapshot already cached) |
-| V2V reference latents | Defer to Phase 4; document manual preprocess steps until automated |
-| Long jobs lost on server restart | Persist `status.json`; optional resume; warn user |
+| V2V reference latents | Automated in `v2v` preset (`references/` → `reference_latents/`) |
+| Long jobs lost on server restart | `manifest.json` + `status.json`; jobs reloaded on startup; **Resume** for interrupted/failed |
 | Alpha trainer API | Pin v0.14.12; thin adapter layer in `ltx_train_backend.py` |
 
 ---

@@ -19,6 +19,7 @@ Generate text-to-video, image-to-video, audio-to-video, retake, extend, and mult
 | **CLI client** | Scriptable batch runs, autocontinue, optional ffmpeg merge |
 | **MCP tools** | Drive generation from Cursor, Claude, or other MCP clients |
 | **LoRA** | Per-request or server-wide style adapters (optional) |
+| **LoRA training** | `/train` wizard — T2V, AV, and IC-LoRA presets (optional `ltx-trainer-mlx`; see below) |
 
 **Agent docs:** [`DIRECTOR.md`](DIRECTOR.md) (prompting & shot planning), [`AGENTS.md`](AGENTS.md) (MCP & pipelines), [`CLAUDE.md`](CLAUDE.md) (pointer to agent guides).
 
@@ -56,6 +57,17 @@ cd web && npm install && npm run build && cd ..
 For gated Hugging Face models, set [`HF_TOKEN`](https://huggingface.co/docs/huggingface_hub/package_reference/environment_variables) or run `huggingface-cli login`.
 
 Classic **venv + pip**: use `python3.12 -m venv .venv`, `pip install -r requirements.txt`, and the same two `ltx-2-mlx` package lines above.
+
+### Optional: LoRA training (`/train`)
+
+Training is **not** required for generation. To use the **Train LoRA** tab in the Web UI:
+
+```bash
+uv pip install \
+  "ltx-trainer-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@v0.14.12#subdirectory=packages/ltx-trainer"
+```
+
+Then rebuild the Web UI if needed (`cd web && npm run build`), start `python server.py --web-ui` (or embedded `--web-ui`), and open **Train LoRA** in the header. Jobs and artifacts live under `web_outputs/train/<job_id>/`. See [`TRAIN.md`](TRAIN.md) for presets, IC-LoRA pairing, and the Phase 5 backlog (checkpoint resume, W&B, MCP).
 
 ---
 
