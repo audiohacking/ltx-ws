@@ -154,4 +154,8 @@ export interface TrainJob {
   artifact_name?: string | null;
   registered_lora_id?: string | null;
   validation_clips?: TrainValidationClip[];
+  latest_checkpoint?: string | null;
+  latest_checkpoint_step?: number | null;
+  can_resume_from_checkpoint?: boolean;
+  resume_from_step?: number;
 }

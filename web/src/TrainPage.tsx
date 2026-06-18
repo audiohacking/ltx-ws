@@ -823,6 +823,9 @@ export default function TrainPage() {
                       <h3>{activeJob.name}</h3>
                       <p className="job-phase">
                         {phaseLabel(activeJob.phase)} · {activeJob.preset}
+                        {activeJob.latest_checkpoint_step != null && activeJob.latest_checkpoint_step > 0 && (
+                          <> · checkpoint step {activeJob.latest_checkpoint_step}</>
+                        )}
                       </p>
                     </div>
                     <div className="artifact-actions">
@@ -833,7 +836,11 @@ export default function TrainPage() {
                           disabled={resuming || !!health?.generation_active}
                           onClick={() => handleResume()}
                         >
-                          {resuming ? "Resuming…" : "Resume"}
+                          {resuming
+                            ? "Resuming…"
+                            : activeJob.can_resume_from_checkpoint
+                              ? `Resume from checkpoint (step ${activeJob.latest_checkpoint_step})`
+                              : "Resume job"}
                         </button>
                       )}
                       {["queued", "running"].includes(activeJob.status) && (

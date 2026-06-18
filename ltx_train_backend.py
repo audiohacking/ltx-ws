@@ -131,6 +131,10 @@ class TrainJobRequest:
     slice: SliceOptions = field(default_factory=SliceOptions)
     preprocess: PreprocessOptions = field(default_factory=PreprocessOptions)
     train: TrainHyperparams = field(default_factory=TrainHyperparams)
+    resume_from_checkpoint: bool = False
+
+
+CHECKPOINT_STEP_RE = re.compile(r"step_(\d+)", re.IGNORECASE)
 
 
 EventCallback = Callable[[dict[str, Any]], None]
@@ -322,9 +326,92 @@ def job_api_payload(output_dir: Path, job_id: str) -> dict[str, Any] | None:
         if manifest.get("registered_lora_id"):
             data["registered_lora_id"] = manifest["registered_lora_id"]
         data["created_at"] = manifest.get("created_at") or data.get("created_at")
+    enrich_job_checkpoint_info(output_dir, job_id, data)
     if "created_at" not in data:
         data["created_at"] = ""
     return data
+
+
+def _checkpoint_candidates(outputs_dir: Path) -> list[Path]:
+    ckpt_dir = outputs_dir / "checkpoints"
+    found: list[Path] = []
+    if ckpt_dir.is_dir():
+        found.extend(ckpt_dir.rglob("*step_*.safetensors"))
+        found.extend(ckpt_dir.rglob("*step_*.npz"))
+    found.extend(outputs_dir.glob("*step_*.safetensors"))
+    found.extend(outputs_dir.glob("lora_weights_step_*.safetensors"))
+    return found
+
+
+def _checkpoint_step_number(path: Path) -> int:
+    match = CHECKPOINT_STEP_RE.search(path.stem)
+    if not match:
+        return -1
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return -1
+
+
+def find_latest_training_checkpoint(paths: TrainJobPaths) -> tuple[Path | None, int]:
+    """Return the newest intermediate LoRA checkpoint and its training step."""
+    candidates = _checkpoint_candidates(paths.outputs)
+    if not candidates:
+        return None, 0
+    best = max(candidates, key=_checkpoint_step_number)
+    step = _checkpoint_step_number(best)
+    if step < 0:
+        return None, 0
+    return best, step
+
+
+def enrich_job_checkpoint_info(output_dir: Path, job_id: str, data: dict[str, Any]) -> None:
+    paths = training_job_paths(output_dir, job_id)
+    ckpt, step = find_latest_training_checkpoint(paths)
+    total = int(data.get("total_steps") or 0)
+    data["latest_checkpoint"] = str(ckpt) if ckpt else None
+    data["latest_checkpoint_step"] = step if ckpt else None
+    data["can_resume_from_checkpoint"] = bool(
+        ckpt and step > 0 and (total <= 0 or step < total)
+    )
+
+
+def _preprocess_ready(paths: TrainJobPaths, *, v2v: bool) -> bool:
+    pc = paths.preprocessed / ".precomputed"
+    latents = pc / "latents"
+    conditions = pc / "conditions"
+    if not latents.is_dir() or not conditions.is_dir():
+        return False
+    if not any(latents.glob("*.safetensors")):
+        return False
+    if not any(conditions.glob("*.safetensors")):
+        return False
+    if v2v:
+        ref = pc / "reference_latents"
+        if not ref.is_dir() or not any(ref.glob("*.safetensors")):
+            return False
+    return True
+
+
+def _slice_artifacts_ready(paths: TrainJobPaths, req: TrainJobRequest) -> bool:
+    if req.slice.enabled:
+        return bool(_list_videos(paths.clips))
+    return bool(_list_videos(paths.raw))
+
+
+def _resolve_video_dirs(
+    paths: TrainJobPaths,
+    req: TrainJobRequest,
+) -> tuple[Path, Path, str | None]:
+    """Return (videos_dir, references_dir, captions_dir) for training."""
+    videos_dir = paths.clips if req.slice.enabled else paths.raw
+    references_dir = paths.reference_clips if req.slice.enabled else paths.references
+    captions_dir: str | None = None
+    if not req.slice.enabled:
+        txts = list(paths.raw.glob("*.txt"))
+        if txts:
+            captions_dir = str(paths.captions)
+    return videos_dir, references_dir, captions_dir
 
 
 def parse_train_request(body: dict[str, Any]) -> TrainJobRequest:
@@ -381,6 +468,7 @@ def parse_train_request(body: dict[str, Any]) -> TrainJobRequest:
         slice=slice_opts,
         preprocess=preprocess,
         train=train,
+        resume_from_checkpoint=bool(body.get("resume_from_checkpoint", False)),
     )
 
 
@@ -466,7 +554,13 @@ def _preset_yaml_path(preset: str) -> Path:
     return path
 
 
-def build_trainer_config(req: TrainJobRequest, *, paths: TrainJobPaths) -> Any:
+def build_trainer_config(
+    req: TrainJobRequest,
+    *,
+    paths: TrainJobPaths,
+    load_checkpoint: str | Path | None = None,
+    training_steps: int | None = None,
+) -> Any:
     from ltx_trainer_mlx.config import LtxTrainerConfig
 
     raw = yaml.safe_load(_preset_yaml_path(req.preset).read_text(encoding="utf-8"))
@@ -474,12 +568,14 @@ def build_trainer_config(req: TrainJobRequest, *, paths: TrainJobPaths) -> Any:
 
     model_block = dict(raw.get("model") or {})
     model_block["model_path"] = model_path
+    if load_checkpoint:
+        model_block["load_checkpoint"] = str(load_checkpoint)
     raw["model"] = model_block
     raw["data"] = {"preprocessed_data_root": str(paths.preprocessed.resolve())}
     raw["output_dir"] = str(paths.outputs.resolve())
     raw["seed"] = int(req.train.seed)
 
-    raw["optimization"]["steps"] = int(req.train.steps)
+    raw["optimization"]["steps"] = int(training_steps if training_steps is not None else req.train.steps)
     raw["optimization"]["learning_rate"] = float(req.train.learning_rate)
     if req.train.low_ram:
         raw["optimization"]["enable_gradient_checkpointing"] = True
@@ -605,12 +701,43 @@ def run_train_job(
     videos_dir = paths.raw
     references_dir = paths.references
     captions_dir: str | None = None
+    resume_step = 0
+    load_checkpoint: str | Path | None = None
+    training_steps = int(req.train.steps)
+    total_steps_target = int(req.train.steps)
+
+    if req.resume_from_checkpoint:
+        ckpt_path, resume_step = find_latest_training_checkpoint(paths)
+        if ckpt_path and resume_step > 0:
+            if resume_step >= total_steps_target:
+                raise ValueError(
+                    f"Checkpoint is already at step {resume_step} "
+                    f"(target {total_steps_target}); nothing left to train"
+                )
+            load_checkpoint = paths.outputs / "checkpoints"
+            if not load_checkpoint.is_dir():
+                load_checkpoint = ckpt_path.parent
+            training_steps = total_steps_target - resume_step
+            status["resume_from_step"] = resume_step
+            status["load_checkpoint"] = str(ckpt_path)
+            status["step"] = resume_step
+            save_status(output_dir, job_id, status)
+            emit(
+                {
+                    "type": "phase_progress",
+                    "phase": "training",
+                    "message": f"Resuming from checkpoint step {resume_step} "
+                    f"({training_steps} steps remaining)",
+                }
+            )
 
     try:
         if req.preset == "v2v" and not _list_videos(paths.references):
-            raise ValueError("IC-LoRA requires paired reference videos (upload to references/)")
+            if not (req.resume_from_checkpoint and _preprocess_ready(paths, v2v=True)):
+                raise ValueError("IC-LoRA requires paired reference videos (upload to references/)")
 
-        if req.slice.enabled:
+        skip_slice = req.resume_from_checkpoint and _slice_artifacts_ready(paths, req)
+        if req.slice.enabled and not skip_slice:
             _check_cancel(should_cancel)
             status["phase"] = "slicing"
             emit({"type": "phase_started", "phase": "slicing", "message": "Slicing source videos…"})
@@ -657,71 +784,103 @@ def run_train_job(
                     }
                 )
                 references_dir = paths.reference_clips
+        elif req.slice.enabled:
+            videos_dir, references_dir, captions_dir = _resolve_video_dirs(paths, req)
+            emit(
+                {
+                    "type": "phase_progress",
+                    "phase": "slicing",
+                    "message": "Using existing sliced clips",
+                }
+            )
         else:
             txts = list(paths.raw.glob("*.txt"))
             if txts:
                 paths.captions.mkdir(parents=True, exist_ok=True)
                 for t in txts:
-                    shutil.copy2(t, paths.captions / t.name)
+                    dest = paths.captions / t.name
+                    if not dest.is_file():
+                        shutil.copy2(t, dest)
                 captions_dir = str(paths.captions)
 
-        _check_cancel(should_cancel)
-        status["phase"] = "preprocessing"
-        emit({"type": "phase_started", "phase": "preprocessing", "message": "Encoding target latents…"})
-        from ltx_trainer_mlx.preprocess import preprocess_dataset
-
-        model_path = resolve_mlx_weights_directory(req.model_id, req.model_dir)
-        status["model_path"] = model_path
-        nf = _nearest_valid_frames(int(req.preprocess.max_frames))
-        preset_info = TRAIN_PRESETS.get(req.preset, TRAIN_PRESETS["t2v"])
-        with_audio = req.preprocess.with_audio or preset_info.with_audio
-        preprocess_dataset(
-            videos_dir=str(videos_dir),
-            output_dir=str(paths.preprocessed),
-            model_dir=model_path,
-            gemma_model_id=DEFAULT_GEMMA,
-            target_height=int(req.preprocess.height) if req.preprocess.height else None,
-            target_width=int(req.preprocess.width) if req.preprocess.width else None,
-            max_frames=nf,
-            captions_dir=captions_dir,
-            with_audio=with_audio,
-            frame_rate=float(req.preprocess.frame_rate) if req.preprocess.frame_rate else None,
+        skip_preprocess = req.resume_from_checkpoint and _preprocess_ready(
+            paths, v2v=req.preset == "v2v"
         )
-
-        if req.preset == "v2v":
+        if not skip_preprocess:
             _check_cancel(should_cancel)
+            status["phase"] = "preprocessing"
+            emit({"type": "phase_started", "phase": "preprocessing", "message": "Encoding target latents…"})
+            from ltx_trainer_mlx.preprocess import preprocess_dataset
+
+            videos_dir, references_dir, captions_dir = _resolve_video_dirs(paths, req)
+            model_path = resolve_mlx_weights_directory(req.model_id, req.model_dir)
+            status["model_path"] = model_path
+            nf = _nearest_valid_frames(int(req.preprocess.max_frames))
+            preset_info = TRAIN_PRESETS.get(req.preset, TRAIN_PRESETS["t2v"])
+            with_audio = req.preprocess.with_audio or preset_info.with_audio
+            preprocess_dataset(
+                videos_dir=str(videos_dir),
+                output_dir=str(paths.preprocessed),
+                model_dir=model_path,
+                gemma_model_id=DEFAULT_GEMMA,
+                target_height=int(req.preprocess.height) if req.preprocess.height else None,
+                target_width=int(req.preprocess.width) if req.preprocess.width else None,
+                max_frames=nf,
+                captions_dir=captions_dir,
+                with_audio=with_audio,
+                frame_rate=float(req.preprocess.frame_rate) if req.preprocess.frame_rate else None,
+            )
+
+            if req.preset == "v2v":
+                _check_cancel(should_cancel)
+                emit(
+                    {
+                        "type": "phase_progress",
+                        "phase": "preprocessing",
+                        "message": "Encoding reference latents for IC-LoRA…",
+                    }
+                )
+                targets = _list_videos(videos_dir)
+                ref_paths = _pair_reference_videos(targets, references_dir)
+                if len(ref_paths) != len(targets):
+                    raise ValueError("Reference video count must match target clip count")
+                encode_reference_latents(
+                    ref_paths,
+                    preprocessed_root=paths.preprocessed,
+                    model_dir=model_path,
+                    target_height=int(req.preprocess.height or 704),
+                    target_width=int(req.preprocess.width or 480),
+                    max_frames=nf,
+                    frame_rate=float(req.preprocess.frame_rate) if req.preprocess.frame_rate else None,
+                    downscale_factor=int(req.preprocess.reference_downscale_factor),
+                )
+
+            emit({"type": "phase_progress", "phase": "preprocessing", "message": "Preprocess complete"})
+        else:
             emit(
                 {
                     "type": "phase_progress",
                     "phase": "preprocessing",
-                    "message": "Encoding reference latents for IC-LoRA…",
+                    "message": "Using existing preprocessed latents",
                 }
             )
-            targets = _list_videos(videos_dir)
-            ref_paths = _pair_reference_videos(targets, references_dir)
-            if len(ref_paths) != len(targets):
-                raise ValueError("Reference video count must match target clip count")
-            encode_reference_latents(
-                ref_paths,
-                preprocessed_root=paths.preprocessed,
-                model_dir=model_path,
-                target_height=int(req.preprocess.height or 704),
-                target_width=int(req.preprocess.width or 480),
-                max_frames=nf,
-                frame_rate=float(req.preprocess.frame_rate) if req.preprocess.frame_rate else None,
-                downscale_factor=int(req.preprocess.reference_downscale_factor),
-            )
-
-        emit({"type": "phase_progress", "phase": "preprocessing", "message": "Preprocess complete"})
 
         _check_cancel(should_cancel)
         status["phase"] = "training"
-        status["total_steps"] = int(req.train.steps)
-        emit({"type": "phase_started", "phase": "training", "message": "Training LoRA…"})
+        status["total_steps"] = total_steps_target
+        train_message = "Training LoRA…"
+        if resume_step > 0:
+            train_message = f"Resuming training from step {resume_step}…"
+        emit({"type": "phase_started", "phase": "training", "message": train_message})
 
         from ltx_trainer_mlx.trainer import LtxvTrainer
 
-        config = build_trainer_config(req, paths=paths)
+        config = build_trainer_config(
+            req,
+            paths=paths,
+            load_checkpoint=load_checkpoint,
+            training_steps=training_steps,
+        )
         paths.config.write_text(yaml.safe_dump(config.model_dump(mode="json")), encoding="utf-8")
 
         train_t0 = time.time()
@@ -732,13 +891,14 @@ def run_train_job(
 
         def step_callback(step: int, total: int, validation_paths: list) -> None:
             _check_cancel(should_cancel)
+            global_step = int(resume_step) + int(step)
             elapsed = max(time.time() - train_t0, 1e-6)
             eta_s = (elapsed / max(step, 1)) * max(total - step, 0)
             payload: dict[str, Any] = {
                 "type": "train_step",
                 "phase": "training",
-                "step": int(step),
-                "total_steps": int(total),
+                "step": global_step,
+                "total_steps": total_steps_target,
                 "eta_s": round(eta_s, 1),
             }
             if last_metrics:
@@ -754,13 +914,13 @@ def run_train_job(
                         rel = p.name
                     rels.append(
                         {
-                            "step": int(step),
+                            "step": global_step,
                             "filename": str(rel),
                             "url": f"/api/train/jobs/{job_id}/artifacts/{rel.as_posix()}",
                         }
                     )
                 status.setdefault("validation_clips", []).extend(rels)
-                emit({"type": "train_validation", "step": int(step), "videos": rels})
+                emit({"type": "train_validation", "step": global_step, "videos": rels})
 
         with _metrics_hook(on_metrics):
             trainer = LtxvTrainer(config)
@@ -802,3 +962,7 @@ def run_train_job(
         save_status(output_dir, job_id, status)
         emit({"type": "error", "phase": status.get("phase"), "message": str(exc)})
         raise
+    finally:
+        manifest = load_manifest(output_dir, job_id)
+        if manifest and manifest.pop("resume_from_checkpoint", None):
+            save_manifest(output_dir, job_id, manifest)

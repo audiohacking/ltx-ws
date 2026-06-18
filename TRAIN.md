@@ -220,7 +220,7 @@ Pin tag to `LTX2_MLX_GIT_TAG` in `ltx_mlx_backend.py`.
 ### Phase 5 — Polish
 
 - [x] Job persistence (`manifest.json` + `status.json`); resume interrupted/failed jobs (`POST …/resume`)
-- [ ] Resume from training checkpoint (`model.load_checkpoint`)
+- [x] Resume from training checkpoint (`model.load_checkpoint`) — loads latest `outputs/checkpoints/*step_*.safetensors`, trains remaining steps, skips slice/preprocess when artifacts exist
 - [ ] W&B optional (`wandb` extra)
 - [ ] MCP tool `ltx_train_lora` for agents (optional)
 
@@ -234,7 +234,7 @@ Pin tag to `LTX2_MLX_GIT_TAG` in `ltx_mlx_backend.py`.
 | Train + generate concurrent | Global `mlx_busy` lock shared with `LocalVideoGenerator` |
 | Preprocess partial HF download | Use same resolved `model_path` as inference (full snapshot already cached) |
 | V2V reference latents | Automated in `v2v` preset (`references/` → `reference_latents/`) |
-| Long jobs lost on server restart | `manifest.json` + `status.json`; jobs reloaded on startup; **Resume** for interrupted/failed |
+| Long jobs lost on server restart | `manifest.json` + `status.json`; jobs reloaded on startup; **Resume** reloads LoRA weights from checkpoint when available |
 | Alpha trainer API | Pin v0.14.12; thin adapter layer in `ltx_train_backend.py` |
 
 ---

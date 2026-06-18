@@ -283,6 +283,7 @@ def register_train_routes(app: Any, state: AppState) -> None:
         save_status,
         trainer_health,
         training_job_paths,
+        find_latest_training_checkpoint,
     )
 
     _init_train_state(state)
@@ -412,9 +413,10 @@ def register_train_routes(app: Any, state: AppState) -> None:
             raise HTTPException(409, "A training job is already running")
         if state.is_generation_active():
             raise HTTPException(409, "Cannot start training while generation is active")
-        manifest = load_manifest(state.output_dir, job_id)
-        if not manifest:
-            raise HTTPException(400, "Job manifest missing; cannot resume")
+        manifest = load_manifest(state.output_dir, job_id) or {}
+        ckpt_path, ckpt_step = find_latest_training_checkpoint(training_job_paths(state.output_dir, job_id))
+        manifest["resume_from_checkpoint"] = True
+        save_manifest(state.output_dir, job_id, manifest)
 
         state._cancelled_train_jobs.discard(job_id)
         save_status(
@@ -430,8 +432,19 @@ def register_train_routes(app: Any, state: AppState) -> None:
         _sync_job_record(state, job_id)
         state.train_event_queues[job_id] = asyncio.Queue()
         await state._pending_train.put(job_id)
-        log.info("Resumed train job %s", job_id)
-        return {"ok": True, "job_id": job_id, "status": "queued"}
+        log.info(
+            "Resumed train job %s (checkpoint_step=%s path=%s)",
+            job_id,
+            ckpt_step if ckpt_path else None,
+            ckpt_path,
+        )
+        return {
+            "ok": True,
+            "job_id": job_id,
+            "status": "queued",
+            "resume_from_checkpoint": bool(ckpt_path and ckpt_step > 0),
+            "latest_checkpoint_step": ckpt_step if ckpt_path else None,
+        }
 
     @app.post("/api/train/jobs/{job_id}/cancel")
     async def cancel_train_job(job_id: str):

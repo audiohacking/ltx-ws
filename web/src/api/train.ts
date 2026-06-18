@@ -74,7 +74,12 @@ export async function createTrainJob(
   return res.json();
 }
 
-export async function resumeTrainJob(jobId: string): Promise<{ job_id: string; status: string }> {
+export async function resumeTrainJob(jobId: string): Promise<{
+  job_id: string;
+  status: string;
+  resume_from_checkpoint?: boolean;
+  latest_checkpoint_step?: number | null;
+}> {
   const res = await fetch(`/api/train/jobs/${jobId}/resume`, { method: "POST" });
   if (!res.ok) {
     const text = await res.text();
