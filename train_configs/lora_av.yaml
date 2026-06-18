@@ -1,0 +1,53 @@
+# Hyperparameters only — paths injected at runtime (see lora_t2v.yaml header).
+model:
+  transformer_file: transformer-dev.safetensors
+  text_encoder_path: mlx-community/gemma-3-12b-it-4bit
+  training_mode: lora
+
+lora:
+  rank: 32
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+    - audio_attn1
+    - audio_attn2
+    - video_to_audio_attn
+
+optimization:
+  learning_rate: 1.5e-4
+  steps: 2000
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  enable_gradient_checkpointing: true
+  scheduler_type: linear
+  scheduler_params:
+    start_factor: 1.0
+    end_factor: 0.1
+
+training_strategy:
+  name: text_to_video
+  generate_audio: true
+
+flow_matching:
+  timestep_sampling_mode: shifted_logit_normal
+
+validation:
+  prompts:
+    - "a person speaking softly close to a microphone, intimate ASMR"
+  video_dims: [192, 192, 97]
+  frame_rate: 24.0
+  inference_steps: 8
+  interval: 200
+  guidance_scale: 4.0
+  stg_scale: 0.0
+  seed: 42
+  generate_audio: true
+  skip_initial_validation: true
+
+checkpoints:
+  interval: 100
+  keep_last_n: 10
+
+seed: 42

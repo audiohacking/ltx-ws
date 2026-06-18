@@ -423,6 +423,16 @@ phase: queued → slicing → preprocessing → training → done | failed | can
 
 Persisted to `web_outputs/train/<job_id>/status.json` (+ index in `settings.json`).
 
+**Storage policy (no `/tmp`):**
+
+| Asset | Location |
+|-------|----------|
+| Uploads, clips, preprocessed latents, checkpoints, validation MP4s | `<web_outputs>/train/<job_id>/` |
+| Base MLX weights (preprocess + train) | Local path, `$VIDEOFENTANYL_MODELS` / `<repo>/models/`, or existing **HF hub cache** (`HF_HOME` / `~/.cache/huggingface`) via `resolve_mlx_weights_directory` |
+| Finished LoRA for inference | Copied to `$VIDEOFENTANYL_LORA_DIR` or `<repo>/loras/` when registered |
+
+Preset YAML files under `train_configs/` hold **hyperparameters only** — paths are injected at job start.
+
 ```json
 {
   "job_id": "...",

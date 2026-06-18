@@ -141,6 +141,50 @@ def _model_snapshot_present(dest: Path) -> bool:
     return bool(has_config and has_weights)
 
 
+def _hf_hub_cache_roots() -> list[Path]:
+    """Candidate Hugging Face hub cache roots (``HF_HOME``, ``HUGGINGFACE_HUB_CACHE``, defaults)."""
+    candidates: list[Path] = []
+    hub_cache = os.environ.get("HUGGINGFACE_HUB_CACHE", "").strip()
+    if hub_cache:
+        candidates.append(Path(hub_cache).expanduser().resolve())
+    hf_home = os.environ.get("HF_HOME", "").strip()
+    if hf_home:
+        candidates.append(Path(hf_home).expanduser().resolve())
+    xdg = os.environ.get("XDG_CACHE_HOME", "").strip()
+    if xdg:
+        candidates.append((Path(xdg).expanduser() / "huggingface").resolve())
+    candidates.append((Path.home() / ".cache" / "huggingface").resolve())
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for path in candidates:
+        if path not in seen:
+            seen.add(path)
+            unique.append(path)
+    return unique
+
+
+def find_hf_hub_snapshot(repo_id: str) -> Path | None:
+    """Return the newest materialized weights tree under the HF hub cache, if any."""
+    slug = repo_id.strip().replace("/", "--")
+    best: Path | None = None
+    best_mtime = -1.0
+    for cache_root in _hf_hub_cache_roots():
+        snaps_dir = cache_root / "hub" / f"models--{slug}" / "snapshots"
+        if not snaps_dir.is_dir():
+            continue
+        try:
+            for snap in snaps_dir.iterdir():
+                if not snap.is_dir() or not _model_snapshot_present(snap):
+                    continue
+                mtime = snap.stat().st_mtime
+                if mtime >= best_mtime:
+                    best_mtime = mtime
+                    best = snap.resolve()
+        except OSError:
+            continue
+    return best
+
+
 def hf_local_weights_directory(repo_id: str, explicit_model_dir: str | None) -> Path:
     """
     Directory where we store a full ``snapshot_download`` for ``repo_id``.
@@ -253,6 +297,10 @@ def resolve_mlx_weights_directory(model: str, explicit_model_dir: str | None) ->
                 "Install with:  pip install huggingface_hub\n"
                 "Or use a local directory for --model."
             ) from e
+        hub_snap = find_hf_hub_snapshot(raw)
+        if hub_snap is not None:
+            log.info("Using Hugging Face hub cache snapshot for %r at %s", raw, hub_snap)
+            return str(hub_snap)
         dest = hf_local_weights_directory(raw, explicit_model_dir)
         dest.mkdir(parents=True, exist_ok=True)
         if _model_snapshot_present(dest):

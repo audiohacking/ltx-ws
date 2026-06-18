@@ -23,3 +23,7 @@ mcp>=1.0.0
 #
 # Tag must match ltx_mlx_backend.LTX2_MLX_GIT_TAG (v0.14.12).
 # Upstream: https://github.com/dgrauet/ltx-2-mlx
+#
+# Optional trainer (training branch / Web UI /train):
+#   uv pip install \
+#     "ltx-trainer-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@v0.14.12#subdirectory=packages/ltx-trainer"
