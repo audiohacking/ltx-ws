@@ -1711,7 +1711,13 @@ async def _finish_autoconcat(
 
 async def _execute_run(state: AppState, run_id: str) -> None:
     if state.embedded and state.video_server is not None:
-        await _execute_run_embedded(state, run_id)
+        from web_train import _init_train_state, is_training_active
+
+        _init_train_state(state)
+        if is_training_active(state):
+            raise RuntimeError("Cannot generate while LoRA training is active")
+        async with state._mlx_lock:
+            await _execute_run_embedded(state, run_id)
         return
     await _execute_run_via_ws(state, run_id)
 
@@ -2158,6 +2164,9 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         state.ensure_worker()
+        from web_train import ensure_train_worker
+
+        ensure_train_worker(state)
         loop = asyncio.get_running_loop()
 
         def _on_interrupt() -> None:
@@ -2780,6 +2789,10 @@ def create_app(
             # yields HTTP 403 on the WebSocket upgrade (Starlette/FastAPI requirement).
             await ws.accept()
             await ws_handler(ws)
+
+    from web_train import register_train_routes
+
+    register_train_routes(app, state)
 
     if mount_static and resolve_web_dist().is_dir():
         app.mount("/", StaticFiles(directory=str(resolve_web_dist()), html=True), name="static")
