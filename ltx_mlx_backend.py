@@ -32,7 +32,7 @@ from urllib.request import url2pathname, urlopen
 log = logging.getLogger("fvserver")
 
 LTX2_SPATIAL_ALIGN = 32
-LTX2_MLX_GIT_TAG = "v0.14.9"
+LTX2_MLX_GIT_TAG = "v0.14.12"
 
 CHAIN_METHOD_AUTOCONTINUE = "autocontinue"
 CHAIN_METHOD_NATIVE_EXTEND = "native_extend"
