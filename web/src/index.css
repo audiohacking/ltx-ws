@@ -1700,6 +1700,31 @@ body {
   color: var(--danger);
 }
 
+.job-status.status-interrupted {
+  background: #fef3c7;
+  color: #b45309;
+}
+
+.pairing-note {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  background: var(--accent-soft);
+  border-radius: 10px;
+  font-size: 0.85rem;
+  line-height: 1.45;
+}
+
+.reference-zone {
+  margin-top: 12px;
+  border-color: #c4b5fd;
+}
+
+.reference-zone:hover,
+.reference-zone.drag-over {
+  border-color: #7c3aed;
+  background: #f5f3ff;
+}
+
 .job-card-meta {
   grid-column: 1 / -1;
   font-size: 0.75rem;

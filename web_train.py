@@ -18,8 +18,6 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("web_train")
 
-_TRAIN_BODIES: dict[str, dict[str, Any]] = {}
-
 
 class TrainJobStatus(str, Enum):
     QUEUED = "queued"
@@ -27,6 +25,7 @@ class TrainJobStatus(str, Enum):
     DONE = "done"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    INTERRUPTED = "interrupted"
 
 
 @dataclass
@@ -57,6 +56,47 @@ def _init_train_state(state: AppState) -> None:
     state._train_worker_started = False
     state._mlx_lock = asyncio.Lock()
     state._train_initialized = True
+    _load_train_jobs_from_disk(state)
+
+
+def _record_from_payload(job_id: str, payload: dict[str, Any]) -> TrainJobRecord:
+    validation = payload.get("validation_clips")
+    if validation is None:
+        validation = []
+    return TrainJobRecord(
+        id=job_id,
+        name=str(payload.get("name") or job_id),
+        preset=str(payload.get("preset") or "t2v"),
+        status=str(payload.get("status") or "queued"),
+        created_at=str(payload.get("created_at") or ""),
+        phase=str(payload.get("phase") or payload.get("status") or "queued"),
+        step=int(payload.get("step") or 0),
+        total_steps=int(payload.get("total_steps") or 0),
+        error=payload.get("error"),
+        artifact_url=payload.get("artifact_url"),
+        artifact_name=(
+            Path(str(payload["artifact_lora"])).name
+            if payload.get("artifact_lora") and not payload.get("artifact_name")
+            else payload.get("artifact_name")
+        ),
+        registered_lora_id=payload.get("registered_lora_id"),
+        validation_clips=list(validation) if isinstance(validation, list) else [],
+    )
+
+
+def _load_train_jobs_from_disk(state: AppState) -> None:
+    from ltx_train_backend import (
+        discover_train_job_ids,
+        job_api_payload,
+        reconcile_interrupted_jobs,
+    )
+
+    reconcile_interrupted_jobs(state.output_dir)
+    for job_id in discover_train_job_ids(state.output_dir):
+        payload = job_api_payload(state.output_dir, job_id)
+        if not payload:
+            continue
+        state.train_jobs[job_id] = _record_from_payload(job_id, payload)
 
 
 def is_training_active(state: AppState) -> bool:
@@ -71,108 +111,45 @@ async def emit_train(state: AppState, job_id: str, event: dict[str, Any]) -> Non
         await q.put(event)
 
 
-def _job_for_api(state: AppState, job: TrainJobRecord) -> dict[str, Any]:
-    data = asdict(job)
-    status = None
-    try:
-        from ltx_train_backend import load_status
+def _job_for_api(state: AppState, job: TrainJobRecord | None = None, *, job_id: str | None = None) -> dict[str, Any]:
+    from ltx_train_backend import job_api_payload
 
-        status = load_status(state.output_dir, job.id)
-    except Exception:
-        pass
-    if status:
-        for key in (
-            "phase",
-            "step",
-            "total_steps",
-            "loss",
-            "lr",
-            "eta_s",
-            "artifact_url",
-            "artifact_lora",
-            "validation_clips",
-            "error",
-            "stats",
-        ):
-            if key in status and status[key] is not None:
-                data[key] = status[key]
-    return data
+    jid = job_id or (job.id if job else "")
+    payload = job_api_payload(state.output_dir, jid)
+    if payload:
+        return payload
+    if job:
+        return asdict(job)
+    return {}
 
 
-def _parse_train_request(body: dict[str, Any]) -> Any:
-    from ltx_train_backend import (
-        PreprocessOptions,
-        SliceOptions,
-        TrainHyperparams,
-        TrainJobRequest,
-        TRAIN_PRESETS,
-    )
+def _sync_job_record(state: AppState, job_id: str) -> None:
+    from ltx_train_backend import job_api_payload
 
-    preset = str(body.get("preset") or "t2v").strip().lower()
-    if preset not in TRAIN_PRESETS:
-        preset = "t2v"
-    preset_info = TRAIN_PRESETS[preset]
-
-    slice_raw = body.get("slice") or {}
-    preprocess_raw = body.get("preprocess") or {}
-    train_raw = body.get("train") or {}
-
-    slice_opts = SliceOptions(
-        enabled=bool(slice_raw.get("enabled", False)),
-        interval=float(slice_raw.get("interval", 4.0)),
-        res=str(slice_raw.get("res") or "384x384"),
-        fps=float(slice_raw.get("fps", 24.0)),
-        fit=str(slice_raw.get("fit") or "crop"),
-        caption_template=slice_raw.get("caption_template"),
-        max_clips=slice_raw.get("max_clips"),
-    )
-    preprocess = PreprocessOptions(
-        width=int(preprocess_raw.get("width") or 704),
-        height=int(preprocess_raw.get("height") or 480),
-        max_frames=int(preprocess_raw.get("max_frames") or 97),
-        with_audio=bool(preprocess_raw.get("with_audio", preset_info.with_audio)),
-        frame_rate=float(preprocess_raw.get("frame_rate") or 24.0),
-    )
-    prompts_raw = train_raw.get("validation_prompts")
-    if isinstance(prompts_raw, str):
-        prompts = [p.strip() for p in prompts_raw.split("\n") if p.strip()]
-    elif isinstance(prompts_raw, list):
-        prompts = [str(p).strip() for p in prompts_raw if str(p).strip()]
-    else:
-        prompts = ["a cinematic landscape at sunset"]
-
-    train = TrainHyperparams(
-        steps=int(train_raw.get("steps") or 2000),
-        rank=int(train_raw.get("rank") or 64),
-        learning_rate=float(train_raw.get("learning_rate") or 5e-4),
-        validation_prompts=prompts,
-        validation_interval=int(train_raw.get("validation_interval") or 500),
-        checkpoint_interval=int(train_raw.get("checkpoint_interval") or 500),
-        low_ram=bool(train_raw.get("low_ram", preset_info.low_ram_default)),
-        seed=int(train_raw.get("seed") or 42),
-    )
-
-    return TrainJobRequest(
-        preset=preset,
-        name=str(body.get("name") or "My LoRA").strip() or "My LoRA",
-        model_id=str(body.get("model_id") or body.get("preferred_model") or "auto"),
-        model_dir=body.get("model_dir"),
-        slice=slice_opts,
-        preprocess=preprocess,
-        train=train,
-    )
+    payload = job_api_payload(state.output_dir, job_id)
+    if not payload:
+        return
+    state.train_jobs[job_id] = _record_from_payload(job_id, payload)
 
 
 async def _execute_train_job(state: AppState, job_id: str) -> None:
-    from ltx_train_backend import TrainingCancelledError, run_train_job
+    from ltx_train_backend import (
+        TrainingCancelledError,
+        load_manifest,
+        parse_train_request,
+        run_train_job,
+    )
 
     _init_train_state(state)
     job = state.train_jobs.get(job_id)
     if not job:
+        _sync_job_record(state, job_id)
+        job = state.train_jobs.get(job_id)
+    if not job:
         return
 
-    body = _TRAIN_BODIES.get(job_id, {})
-    req = _parse_train_request(body)
+    manifest = load_manifest(state.output_dir, job_id) or {}
+    req = parse_train_request(manifest)
 
     job.status = TrainJobStatus.RUNNING.value
     job.phase = "starting"
@@ -197,6 +174,7 @@ async def _execute_train_job(state: AppState, job_id: str) -> None:
 
         def _schedule() -> None:
             loop.create_task(emit_train(state, job_id, event))
+            _sync_job_record(state, job_id)
 
         loop.call_soon_threadsafe(_schedule)
 
@@ -223,6 +201,7 @@ async def _execute_train_job(state: AppState, job_id: str) -> None:
             job.artifact_url = result.get("artifact_url") or job.artifact_url
             if result.get("artifact_lora"):
                 job.artifact_name = Path(str(result["artifact_lora"])).name
+            _sync_job_record(state, job_id)
             await emit_train(
                 state,
                 job_id,
@@ -236,6 +215,7 @@ async def _execute_train_job(state: AppState, job_id: str) -> None:
             job.status = TrainJobStatus.CANCELLED.value
             job.phase = "cancelled"
             job.error = "Cancelled"
+            _sync_job_record(state, job_id)
             await emit_train(state, job_id, {"type": "error", "message": "Cancelled"})
         finally:
             state._active_train_job_id = None
@@ -251,6 +231,14 @@ async def _train_worker_loop(state: AppState) -> None:
             if job and job.status != TrainJobStatus.CANCELLED.value:
                 job.status = TrainJobStatus.FAILED.value
                 job.error = str(exc)
+                from ltx_train_backend import load_status, save_status
+
+                status = load_status(state.output_dir, job_id) or {}
+                status["phase"] = "failed"
+                status["status"] = "failed"
+                status["error"] = str(exc)
+                save_status(state.output_dir, job_id, status)
+                _sync_job_record(state, job_id)
                 await emit_train(state, job_id, {"type": "error", "message": str(exc)})
         finally:
             await emit_train(
@@ -258,7 +246,6 @@ async def _train_worker_loop(state: AppState) -> None:
                 job_id,
                 {"type": "job_complete", "job_id": job_id},
             )
-            _TRAIN_BODIES.pop(job_id, None)
 
 
 def ensure_train_worker(state: AppState) -> None:
@@ -269,13 +256,31 @@ def ensure_train_worker(state: AppState) -> None:
     state._train_worker_started = True
 
 
+def _save_uploads(uploads: list[Any], dest_dir: Path) -> int:
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    saved = 0
+    for upload in uploads:
+        name = Path(upload.filename or f"upload_{saved}").name
+        dest = dest_dir / name
+        with dest.open("wb") as fh:
+            shutil.copyfileobj(upload.file, fh)
+        saved += 1
+    return saved
+
+
 def register_train_routes(app: Any, state: AppState) -> None:
     from fastapi import File, Form, HTTPException, UploadFile
     from fastapi.responses import FileResponse, StreamingResponse
     from ltx_train_backend import (
+        VIDEO_EXTENSIONS,
+        job_api_payload,
         job_root,
+        load_manifest,
         load_status,
+        parse_train_request,
         register_trained_lora,
+        save_manifest,
+        save_status,
         trainer_health,
         training_job_paths,
     )
@@ -296,6 +301,7 @@ def register_train_routes(app: Any, state: AppState) -> None:
 
     @app.get("/api/train/jobs")
     async def list_train_jobs():
+        _load_train_jobs_from_disk(state)
         jobs = sorted(
             state.train_jobs.values(),
             key=lambda j: j.created_at,
@@ -305,18 +311,18 @@ def register_train_routes(app: Any, state: AppState) -> None:
 
     @app.get("/api/train/jobs/{job_id}")
     async def get_train_job(job_id: str):
-        job = state.train_jobs.get(job_id)
-        if not job:
-            status = load_status(state.output_dir, job_id)
-            if not status:
-                raise HTTPException(404, "Job not found")
-            return status
-        return _job_for_api(state, job)
+        payload = job_api_payload(state.output_dir, job_id)
+        if not payload:
+            raise HTTPException(404, "Job not found")
+        if job_id in state.train_jobs:
+            state.train_jobs[job_id] = _record_from_payload(job_id, payload)
+        return payload
 
     @app.post("/api/train/jobs")
     async def create_train_job(
         manifest: str = Form(...),
         videos: list[UploadFile] = File(...),
+        references: list[UploadFile] | None = File(None),
     ):
         ensure_train_worker(state)
         if is_training_active(state):
@@ -330,48 +336,112 @@ def register_train_routes(app: Any, state: AppState) -> None:
             raise HTTPException(400, f"Invalid manifest JSON: {exc}") from exc
 
         if not videos:
-            raise HTTPException(400, "At least one video file is required")
+            raise HTTPException(400, "At least one target video file is required")
 
-        video_exts = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
-        has_video = any(
-            Path(u.filename or "").suffix.lower() in video_exts for u in videos
-        )
+        has_video = any(Path(u.filename or "").suffix.lower() in VIDEO_EXTENSIONS for u in videos)
         if not has_video:
-            raise HTTPException(400, "At least one video file is required")
+            raise HTTPException(400, "At least one target video file is required")
+
+        req = parse_train_request(body)
+        ref_uploads = references or []
+        if req.preset == "v2v":
+            if not ref_uploads:
+                raise HTTPException(400, "IC-LoRA requires reference videos")
+            ref_video = any(Path(u.filename or "").suffix.lower() in VIDEO_EXTENSIONS for u in ref_uploads)
+            if not ref_video:
+                raise HTTPException(400, "IC-LoRA requires at least one reference video file")
 
         job_id = f"train_{uuid.uuid4().hex[:10]}"
         paths = training_job_paths(state.output_dir, job_id)
         paths.ensure_dirs()
 
-        saved = 0
-        for upload in videos:
-            name = Path(upload.filename or f"upload_{saved}").name
-            dest = paths.raw / name
-            with dest.open("wb") as fh:
-                shutil.copyfileobj(upload.file, fh)
-            saved += 1
+        saved = _save_uploads(videos, paths.raw)
+        if ref_uploads:
+            _save_uploads(ref_uploads, paths.references)
 
-        req = _parse_train_request(body)
+        created_at = datetime.now().isoformat()
+        body["created_at"] = created_at
+        save_manifest(state.output_dir, job_id, body)
+
         job = TrainJobRecord(
             id=job_id,
             name=req.name,
             preset=req.preset,
             status=TrainJobStatus.QUEUED.value,
-            created_at=datetime.now().isoformat(),
+            created_at=created_at,
             total_steps=int(req.train.steps),
         )
         state.train_jobs[job_id] = job
-        _TRAIN_BODIES[job_id] = body
+        save_status(
+            state.output_dir,
+            job_id,
+            {
+                "job_id": job_id,
+                "name": req.name,
+                "preset": req.preset,
+                "phase": "queued",
+                "status": "queued",
+                "created_at": created_at,
+                "step": 0,
+                "total_steps": int(req.train.steps),
+                "job_dir": str(paths.root),
+                "validation_clips": [],
+            },
+        )
         state.train_event_queues[job_id] = asyncio.Queue()
         await state._pending_train.put(job_id)
-        log.info("Queued train job %s  preset=%s  videos=%d", job_id, req.preset, saved)
+        log.info(
+            "Queued train job %s  preset=%s  targets=%d  references=%d",
+            job_id,
+            req.preset,
+            saved,
+            len(ref_uploads),
+        )
         return {"job_id": job_id, "name": job.name, "preset": job.preset}
+
+    @app.post("/api/train/jobs/{job_id}/resume")
+    async def resume_train_job(job_id: str):
+        ensure_train_worker(state)
+        payload = job_api_payload(state.output_dir, job_id)
+        if not payload:
+            raise HTTPException(404, "Job not found")
+        status = str(payload.get("status") or "")
+        if status not in (TrainJobStatus.INTERRUPTED.value, TrainJobStatus.FAILED.value):
+            raise HTTPException(400, f"Job cannot be resumed from status {status!r}")
+        if is_training_active(state):
+            raise HTTPException(409, "A training job is already running")
+        if state.is_generation_active():
+            raise HTTPException(409, "Cannot start training while generation is active")
+        manifest = load_manifest(state.output_dir, job_id)
+        if not manifest:
+            raise HTTPException(400, "Job manifest missing; cannot resume")
+
+        state._cancelled_train_jobs.discard(job_id)
+        save_status(
+            state.output_dir,
+            job_id,
+            {
+                **(load_status(state.output_dir, job_id) or {}),
+                "phase": "queued",
+                "status": "queued",
+                "error": None,
+            },
+        )
+        _sync_job_record(state, job_id)
+        state.train_event_queues[job_id] = asyncio.Queue()
+        await state._pending_train.put(job_id)
+        log.info("Resumed train job %s", job_id)
+        return {"ok": True, "job_id": job_id, "status": "queued"}
 
     @app.post("/api/train/jobs/{job_id}/cancel")
     async def cancel_train_job(job_id: str):
         job = state.train_jobs.get(job_id)
         if not job:
-            raise HTTPException(404, "Job not found")
+            payload = job_api_payload(state.output_dir, job_id)
+            if not payload:
+                raise HTTPException(404, "Job not found")
+            job = _record_from_payload(job_id, payload)
+            state.train_jobs[job_id] = job
         if job.status in (
             TrainJobStatus.DONE.value,
             TrainJobStatus.FAILED.value,
@@ -380,6 +450,10 @@ def register_train_routes(app: Any, state: AppState) -> None:
             return {"ok": True, "status": job.status}
         state._cancelled_train_jobs.add(job_id)
         job.status = TrainJobStatus.CANCELLED.value
+        status = load_status(state.output_dir, job_id) or {}
+        status["phase"] = "cancelled"
+        status["status"] = "cancelled"
+        save_status(state.output_dir, job_id, status)
         return {"ok": True, "status": job.status}
 
     @app.get("/api/train/jobs/{job_id}/artifacts/{artifact_path:path}")
@@ -397,22 +471,22 @@ def register_train_routes(app: Any, state: AppState) -> None:
     async def register_lora(job_id: str, body: dict[str, Any] | None = None):
         from web_ui import _label_for_lora_spec, _lora_catalog, _read_custom_loras, _write_custom_loras
 
-        job = state.train_jobs.get(job_id)
-        status = load_status(state.output_dir, job_id)
+        payload = job_api_payload(state.output_dir, job_id)
+        if not payload:
+            raise HTTPException(404, "Job not found")
+        job = state.train_jobs.get(job_id) or _record_from_payload(job_id, payload)
+
         artifact = None
-        if job and job.artifact_url:
-            artifact_name = job.artifact_name
-            if artifact_name:
-                artifact = job_root(state.output_dir, job_id) / "outputs" / artifact_name
-        if artifact is None and status:
-            al = status.get("artifact_lora")
-            if al:
-                artifact = Path(str(al))
+        artifact_name = job.artifact_name or payload.get("artifact_name")
+        if artifact_name:
+            artifact = job_root(state.output_dir, job_id) / "outputs" / artifact_name
+        if artifact is None and payload.get("artifact_lora"):
+            artifact = Path(str(payload["artifact_lora"]))
         if artifact is None or not artifact.is_file():
             raise HTTPException(404, "Trained LoRA artifact not found")
 
         body = body or {}
-        label = str(body.get("label") or (job.name if job else "") or "Trained LoRA").strip()
+        label = str(body.get("label") or job.name or "Trained LoRA").strip()
         try:
             scale = float(body.get("scale", 1.0))
         except (TypeError, ValueError):
@@ -432,8 +506,13 @@ def register_train_routes(app: Any, state: AppState) -> None:
         ]
         entries.append({"id": lid, "label": label or _label_for_lora_spec(spec), "spec": spec, "scale": scale})
         _write_custom_loras(state.output_dir, entries)
-        if job:
-            job.registered_lora_id = lid
+
+        manifest = load_manifest(state.output_dir, job_id) or {}
+        manifest["registered_lora_id"] = lid
+        save_manifest(state.output_dir, job_id, manifest)
+        job.registered_lora_id = lid
+        state.train_jobs[job_id] = job
+
         lora_presets, default_lora_preset_id = _lora_catalog(state.output_dir)
         preferred = state.preferred_lora_preset_ids()
         if lid not in preferred:
@@ -451,28 +530,23 @@ def register_train_routes(app: Any, state: AppState) -> None:
 
     @app.get("/api/train/jobs/{job_id}/events")
     async def train_events(job_id: str):
-        if job_id not in state.train_jobs:
-            status = load_status(state.output_dir, job_id)
-            if not status:
-                raise HTTPException(404, "Job not found")
+        payload = job_api_payload(state.output_dir, job_id)
+        if not payload:
+            raise HTTPException(404, "Job not found")
         if job_id not in state.train_event_queues:
             state.train_event_queues[job_id] = asyncio.Queue()
 
         async def stream() -> AsyncIterator[str]:
             q = state.train_event_queues[job_id]
-            job = state.train_jobs.get(job_id)
-            if job and job.status in (
+            snap = job_api_payload(state.output_dir, job_id) or {}
+            terminal = snap.get("status") in (
                 TrainJobStatus.DONE.value,
                 TrainJobStatus.FAILED.value,
                 TrainJobStatus.CANCELLED.value,
-            ):
-                snap = _job_for_api(state, job) if job else load_status(state.output_dir, job_id) or {}
+                TrainJobStatus.INTERRUPTED.value,
+            )
+            if terminal and state._active_train_job_id != job_id:
                 yield f"data: {json.dumps({'type': 'snapshot', 'job': snap})}\n\n"
-                yield f"data: {json.dumps({'type': 'job_complete', 'job_id': job_id})}\n\n"
-                return
-            status = load_status(state.output_dir, job_id)
-            if status and status.get("phase") in ("done", "failed", "cancelled"):
-                yield f"data: {json.dumps({'type': 'snapshot', 'job': status})}\n\n"
                 yield f"data: {json.dumps({'type': 'job_complete', 'job_id': job_id})}\n\n"
                 return
             while True:

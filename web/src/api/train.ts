@@ -39,6 +39,7 @@ export interface TrainManifest {
     max_frames: number;
     with_audio: boolean;
     frame_rate: number;
+    reference_downscale_factor?: number;
   };
   train: {
     steps: number;
@@ -54,17 +55,30 @@ export interface TrainManifest {
 
 export async function createTrainJob(
   manifest: TrainManifest,
-  files: File[],
+  targetFiles: File[],
+  referenceFiles: File[] = [],
 ): Promise<{ job_id: string; name: string; preset: string }> {
   const form = new FormData();
   form.append("manifest", JSON.stringify(manifest));
-  for (const file of files) {
+  for (const file of targetFiles) {
     form.append("videos", file, file.name);
+  }
+  for (const file of referenceFiles) {
+    form.append("references", file, file.name);
   }
   const res = await fetch("/api/train/jobs", { method: "POST", body: form });
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text || `Create job failed (${res.status})`);
+  }
+  return res.json();
+}
+
+export async function resumeTrainJob(jobId: string): Promise<{ job_id: string; status: string }> {
+  const res = await fetch(`/api/train/jobs/${jobId}/resume`, { method: "POST" });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `Resume failed (${res.status})`);
   }
   return res.json();
 }

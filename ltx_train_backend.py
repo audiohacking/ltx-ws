@@ -13,6 +13,7 @@ Storage policy (no ``/tmp``):
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import shutil
@@ -74,7 +75,18 @@ TRAIN_PRESETS: dict[str, TrainPresetInfo] = {
         with_audio=True,
         low_ram_default=True,
     ),
+    "v2v": TrainPresetInfo(
+        id="v2v",
+        label="IC-LoRA (video-to-video)",
+        description="Learn a style transfer from paired reference → target clips.",
+        ram_hint="48 GB recommended",
+        with_audio=False,
+        low_ram_default=True,
+    ),
 }
+
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+ACTIVE_JOB_PHASES = frozenset({"queued", "slicing", "preprocessing", "training", "starting"})
 
 
 @dataclass
@@ -95,6 +107,7 @@ class PreprocessOptions:
     max_frames: int = 97
     with_audio: bool = False
     frame_rate: float | None = 24.0
+    reference_downscale_factor: int = 2
 
 
 @dataclass
@@ -156,6 +169,8 @@ class TrainJobPaths:
 
     root: Path
     raw: Path
+    references: Path
+    reference_clips: Path
     clips: Path
     captions: Path
     preprocessed: Path
@@ -163,7 +178,16 @@ class TrainJobPaths:
     config: Path
 
     def ensure_dirs(self) -> None:
-        for d in (self.root, self.raw, self.clips, self.captions, self.preprocessed, self.outputs):
+        for d in (
+            self.root,
+            self.raw,
+            self.references,
+            self.reference_clips,
+            self.clips,
+            self.captions,
+            self.preprocessed,
+            self.outputs,
+        ):
             d.mkdir(parents=True, exist_ok=True)
 
 
@@ -172,6 +196,8 @@ def training_job_paths(output_dir: Path, job_id: str) -> TrainJobPaths:
     return TrainJobPaths(
         root=root,
         raw=root / "raw",
+        references=root / "references",
+        reference_clips=root / "reference_clips",
         clips=root / "clips",
         captions=root / "captions",
         preprocessed=root / "preprocessed",
@@ -210,12 +236,224 @@ def load_status(output_dir: Path, job_id: str) -> dict[str, Any] | None:
 
 
 def save_status(output_dir: Path, job_id: str, payload: dict[str, Any]) -> None:
-    import json
-
     root = job_root(output_dir, job_id)
     root.mkdir(parents=True, exist_ok=True)
     path = status_path(output_dir, job_id)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def manifest_path(output_dir: Path, job_id: str) -> Path:
+    return job_root(output_dir, job_id) / "manifest.json"
+
+
+def save_manifest(output_dir: Path, job_id: str, payload: dict[str, Any]) -> None:
+    root = job_root(output_dir, job_id)
+    root.mkdir(parents=True, exist_ok=True)
+    manifest_path(output_dir, job_id).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def load_manifest(output_dir: Path, job_id: str) -> dict[str, Any] | None:
+    path = manifest_path(output_dir, job_id)
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def discover_train_job_ids(output_dir: Path) -> list[str]:
+    root = output_dir.resolve() / "train"
+    if not root.is_dir():
+        return []
+    ids: list[str] = []
+    for child in sorted(root.iterdir()):
+        if child.is_dir() and (child / "status.json").is_file():
+            ids.append(child.name)
+    return ids
+
+
+def _phase_to_status(phase: str | None) -> str:
+    key = (phase or "queued").strip().lower()
+    if key in ("done",):
+        return "done"
+    if key in ("failed",):
+        return "failed"
+    if key in ("cancelled",):
+        return "cancelled"
+    if key in ("interrupted",):
+        return "interrupted"
+    if key in ACTIVE_JOB_PHASES:
+        return "running"
+    return "queued"
+
+
+def reconcile_interrupted_jobs(output_dir: Path) -> int:
+    """Mark in-flight jobs as interrupted after a process restart."""
+    changed = 0
+    for job_id in discover_train_job_ids(output_dir):
+        status = load_status(output_dir, job_id)
+        if not status:
+            continue
+        phase = str(status.get("phase") or "").lower()
+        if phase in ACTIVE_JOB_PHASES:
+            status["phase"] = "interrupted"
+            status["status"] = "interrupted"
+            status["error"] = status.get("error") or "Interrupted by server restart"
+            save_status(output_dir, job_id, status)
+            changed += 1
+    return changed
+
+
+def job_api_payload(output_dir: Path, job_id: str) -> dict[str, Any] | None:
+    """Merge persisted status + manifest for API responses."""
+    status = load_status(output_dir, job_id)
+    manifest = load_manifest(output_dir, job_id)
+    if not status and not manifest:
+        return None
+    data: dict[str, Any] = {"id": job_id}
+    if status:
+        data.update(status)
+        data["id"] = job_id
+        data["status"] = status.get("status") or _phase_to_status(status.get("phase"))
+    if manifest:
+        data.setdefault("name", manifest.get("name"))
+        data.setdefault("preset", manifest.get("preset"))
+        if manifest.get("registered_lora_id"):
+            data["registered_lora_id"] = manifest["registered_lora_id"]
+        data["created_at"] = manifest.get("created_at") or data.get("created_at")
+    if "created_at" not in data:
+        data["created_at"] = ""
+    return data
+
+
+def parse_train_request(body: dict[str, Any]) -> TrainJobRequest:
+    preset = str(body.get("preset") or "t2v").strip().lower()
+    if preset not in TRAIN_PRESETS:
+        preset = "t2v"
+    preset_info = TRAIN_PRESETS[preset]
+
+    slice_raw = body.get("slice") or {}
+    preprocess_raw = body.get("preprocess") or {}
+    train_raw = body.get("train") or {}
+
+    slice_opts = SliceOptions(
+        enabled=bool(slice_raw.get("enabled", False)),
+        interval=float(slice_raw.get("interval", 4.0)),
+        res=str(slice_raw.get("res") or "384x384"),
+        fps=float(slice_raw.get("fps", 24.0)),
+        fit=str(slice_raw.get("fit") or "crop"),
+        caption_template=slice_raw.get("caption_template"),
+        max_clips=slice_raw.get("max_clips"),
+    )
+    preprocess = PreprocessOptions(
+        width=int(preprocess_raw.get("width") or 704),
+        height=int(preprocess_raw.get("height") or 480),
+        max_frames=int(preprocess_raw.get("max_frames") or 97),
+        with_audio=bool(preprocess_raw.get("with_audio", preset_info.with_audio)),
+        frame_rate=float(preprocess_raw.get("frame_rate") or 24.0),
+        reference_downscale_factor=int(preprocess_raw.get("reference_downscale_factor") or 2),
+    )
+    prompts_raw = train_raw.get("validation_prompts")
+    if isinstance(prompts_raw, str):
+        prompts = [p.strip() for p in prompts_raw.split("\n") if p.strip()]
+    elif isinstance(prompts_raw, list):
+        prompts = [str(p).strip() for p in prompts_raw if str(p).strip()]
+    else:
+        prompts = ["a cinematic landscape at sunset"]
+
+    train = TrainHyperparams(
+        steps=int(train_raw.get("steps") or 2000),
+        rank=int(train_raw.get("rank") or 64),
+        learning_rate=float(train_raw.get("learning_rate") or 5e-4),
+        validation_prompts=prompts,
+        validation_interval=int(train_raw.get("validation_interval") or 500),
+        checkpoint_interval=int(train_raw.get("checkpoint_interval") or 500),
+        low_ram=bool(train_raw.get("low_ram", preset_info.low_ram_default)),
+        seed=int(train_raw.get("seed") or 42),
+    )
+
+    return TrainJobRequest(
+        preset=preset,
+        name=str(body.get("name") or "My LoRA").strip() or "My LoRA",
+        model_id=str(body.get("model_id") or body.get("preferred_model") or "auto"),
+        model_dir=body.get("model_dir"),
+        slice=slice_opts,
+        preprocess=preprocess,
+        train=train,
+    )
+
+
+def _list_videos(directory: Path) -> list[Path]:
+    if not directory.is_dir():
+        return []
+    return sorted(
+        p
+        for p in directory.rglob("*")
+        if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS
+    )
+
+
+def _pair_reference_videos(targets: list[Path], references_dir: Path) -> list[Path]:
+    paired: list[Path] = []
+    for target in targets:
+        direct = references_dir / target.name
+        if direct.is_file():
+            paired.append(direct)
+            continue
+        matches = sorted(
+            p
+            for p in references_dir.rglob("*")
+            if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS and p.stem == target.stem
+        )
+        if not matches:
+            raise ValueError(f"No reference video paired with target {target.name}")
+        paired.append(matches[0])
+    return paired
+
+
+def _validation_reference_paths(paths: TrainJobPaths, num_prompts: int) -> list[str]:
+    refs = _list_videos(paths.references)
+    if not refs:
+        raise ValueError("IC-LoRA requires reference videos in the job references folder")
+    out: list[str] = []
+    for i in range(num_prompts):
+        out.append(str(refs[min(i, len(refs) - 1)].resolve()))
+    return out
+
+
+def encode_reference_latents(
+    reference_videos: list[Path],
+    *,
+    preprocessed_root: Path,
+    model_dir: str,
+    target_height: int,
+    target_width: int,
+    max_frames: int,
+    frame_rate: float | None,
+    downscale_factor: int,
+) -> None:
+    """Encode paired reference clips into ``reference_latents/`` for IC-LoRA."""
+    from ltx_trainer_mlx.preprocess import _encode_all_videos
+
+    factor = max(1, int(downscale_factor))
+    ref_h = max(32, int(target_height) // factor)
+    ref_w = max(32, int(target_width) // factor)
+    ref_h = (ref_h // 32) * 32
+    ref_w = (ref_w // 32) * 32
+
+    ref_dir = preprocessed_root / ".precomputed" / "reference_latents"
+    ref_dir.mkdir(parents=True, exist_ok=True)
+
+    _encode_all_videos(
+        video_files=reference_videos,
+        latents_dir=ref_dir,
+        model_dir=model_dir,
+        target_height=ref_h,
+        target_width=ref_w,
+        max_frames=max_frames,
+        frame_rate=frame_rate,
+    )
 
 
 def _preset_yaml_path(preset: str) -> Path:
@@ -263,16 +501,22 @@ def build_trainer_config(req: TrainJobRequest, *, paths: TrainJobPaths) -> Any:
     nf = _nearest_valid_frames(int(req.preprocess.max_frames))
     val["video_dims"] = [w, h, nf]
     val["frame_rate"] = float(req.preprocess.frame_rate or 24.0)
-    val["generate_audio"] = bool(TRAIN_PRESETS.get(req.preset, TRAIN_PRESETS["t2v"]).with_audio)
+    preset_info = TRAIN_PRESETS.get(req.preset, TRAIN_PRESETS["t2v"])
+    if req.preset == "v2v":
+        val["reference_videos"] = _validation_reference_paths(paths, len(prompts))
+        val["reference_downscale_factor"] = max(1, int(req.preprocess.reference_downscale_factor))
+        val["generate_audio"] = False
+    else:
+        val["generate_audio"] = bool(preset_info.with_audio)
     raw["validation"] = val
 
     ckpt = raw.get("checkpoints") or {}
     ckpt["interval"] = int(req.train.checkpoint_interval)
     raw["checkpoints"] = ckpt
 
-    strat = raw.get("training_strategy") or {}
-    preset_info = TRAIN_PRESETS.get(req.preset, TRAIN_PRESETS["t2v"])
-    strat["generate_audio"] = preset_info.with_audio
+    strat = dict(raw.get("training_strategy") or {})
+    if req.preset != "v2v":
+        strat["generate_audio"] = preset_info.with_audio
     raw["training_strategy"] = strat
 
     return LtxTrainerConfig(**raw)
@@ -335,26 +579,37 @@ def run_train_job(
         "name": req.name,
         "preset": req.preset,
         "phase": "queued",
+        "status": "running",
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "step": 0,
         "total_steps": int(req.train.steps),
         "job_dir": str(paths.root),
         "model_path": None,
         "error": None,
+        "validation_clips": [],
     }
+    existing = load_status(output_dir, job_id)
+    if existing:
+        status["created_at"] = existing.get("created_at") or status["created_at"]
+        status["validation_clips"] = existing.get("validation_clips") or []
     save_status(output_dir, job_id, status)
 
     def emit(event: dict[str, Any]) -> None:
         nonlocal status
         status.update({k: v for k, v in event.items() if k != "type"})
+        status["status"] = _phase_to_status(status.get("phase"))
         save_status(output_dir, job_id, status)
         if on_event:
             on_event(event)
 
     videos_dir = paths.raw
+    references_dir = paths.references
     captions_dir: str | None = None
 
     try:
+        if req.preset == "v2v" and not _list_videos(paths.references):
+            raise ValueError("IC-LoRA requires paired reference videos (upload to references/)")
+
         if req.slice.enabled:
             _check_cancel(should_cancel)
             status["phase"] = "slicing"
@@ -363,11 +618,7 @@ def run_train_job(
                 raise RuntimeError("ffmpeg is required for slice")
             from ltx_trainer_mlx.slice_clips import slice_videos
 
-            sources = sorted(
-                p
-                for p in paths.raw.iterdir()
-                if p.suffix.lower() in {".mp4", ".mov", ".avi", ".mkv", ".webm"}
-            )
+            sources = _list_videos(paths.raw)
             if not sources:
                 raise ValueError("No video files found in upload")
             count = slice_videos(
@@ -380,9 +631,32 @@ def run_train_job(
                 caption_template=req.slice.caption_template,
                 max_clips=req.slice.max_clips,
             )
-            emit({"type": "phase_progress", "phase": "slicing", "message": f"Created {count} clips"})
+            emit({"type": "phase_progress", "phase": "slicing", "message": f"Created {count} target clips"})
             videos_dir = paths.clips
             captions_dir = None
+
+            if req.preset == "v2v":
+                ref_sources = _list_videos(paths.references)
+                if not ref_sources:
+                    raise ValueError("IC-LoRA requires reference videos when slicing")
+                ref_count = slice_videos(
+                    [str(p) for p in ref_sources],
+                    str(paths.reference_clips),
+                    interval=float(req.slice.interval),
+                    res=str(req.slice.res),
+                    fps=float(req.slice.fps),
+                    fit=str(req.slice.fit),
+                    caption_template=req.slice.caption_template,
+                    max_clips=req.slice.max_clips,
+                )
+                emit(
+                    {
+                        "type": "phase_progress",
+                        "phase": "slicing",
+                        "message": f"Created {ref_count} reference clips",
+                    }
+                )
+                references_dir = paths.reference_clips
         else:
             txts = list(paths.raw.glob("*.txt"))
             if txts:
@@ -393,7 +667,7 @@ def run_train_job(
 
         _check_cancel(should_cancel)
         status["phase"] = "preprocessing"
-        emit({"type": "phase_started", "phase": "preprocessing", "message": "Encoding latents…"})
+        emit({"type": "phase_started", "phase": "preprocessing", "message": "Encoding target latents…"})
         from ltx_trainer_mlx.preprocess import preprocess_dataset
 
         model_path = resolve_mlx_weights_directory(req.model_id, req.model_dir)
@@ -413,6 +687,31 @@ def run_train_job(
             with_audio=with_audio,
             frame_rate=float(req.preprocess.frame_rate) if req.preprocess.frame_rate else None,
         )
+
+        if req.preset == "v2v":
+            _check_cancel(should_cancel)
+            emit(
+                {
+                    "type": "phase_progress",
+                    "phase": "preprocessing",
+                    "message": "Encoding reference latents for IC-LoRA…",
+                }
+            )
+            targets = _list_videos(videos_dir)
+            ref_paths = _pair_reference_videos(targets, references_dir)
+            if len(ref_paths) != len(targets):
+                raise ValueError("Reference video count must match target clip count")
+            encode_reference_latents(
+                ref_paths,
+                preprocessed_root=paths.preprocessed,
+                model_dir=model_path,
+                target_height=int(req.preprocess.height or 704),
+                target_width=int(req.preprocess.width or 480),
+                max_frames=nf,
+                frame_rate=float(req.preprocess.frame_rate) if req.preprocess.frame_rate else None,
+                downscale_factor=int(req.preprocess.reference_downscale_factor),
+            )
+
         emit({"type": "phase_progress", "phase": "preprocessing", "message": "Preprocess complete"})
 
         _check_cancel(should_cancel)
@@ -473,6 +772,7 @@ def run_train_job(
         lora_path = Path(saved_path)
         artifact_url = f"/api/train/jobs/{job_id}/artifacts/{lora_path.name}"
         status["phase"] = "done"
+        status["status"] = "done"
         status["artifact_lora"] = str(lora_path)
         status["artifact_url"] = artifact_url
         status["stats"] = stats.model_dump() if hasattr(stats, "model_dump") else dict(stats)
@@ -489,6 +789,7 @@ def run_train_job(
 
     except TrainingCancelledError:
         status["phase"] = "cancelled"
+        status["status"] = "cancelled"
         status["error"] = "Cancelled"
         save_status(output_dir, job_id, status)
         emit({"type": "error", "phase": status.get("phase"), "message": "Cancelled"})
@@ -496,6 +797,7 @@ def run_train_job(
     except Exception as exc:
         log.exception("Train job %s failed", job_id)
         status["phase"] = "failed"
+        status["status"] = "failed"
         status["error"] = str(exc)
         save_status(output_dir, job_id, status)
         emit({"type": "error", "phase": status.get("phase"), "message": str(exc)})

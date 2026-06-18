@@ -7,6 +7,7 @@ import {
   fetchTrainJobs,
   fetchTrainPresets,
   registerTrainedLora,
+  resumeTrainJob,
   subscribeTrainJob,
   type TrainManifest,
 } from "./api/train";
@@ -45,6 +46,8 @@ function phaseLabel(phase?: string): string {
       return "Failed";
     case "cancelled":
       return "Cancelled";
+    case "interrupted":
+      return "Interrupted";
     default:
       return phase || "Queued";
   }
@@ -60,12 +63,16 @@ export default function TrainPage() {
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [registering, setRegistering] = useState(false);
+  const [resuming, setResuming] = useState(false);
 
   const [name, setName] = useState("My LoRA");
   const [preset, setPreset] = useState("t2v");
   const [videos, setVideos] = useState<File[]>([]);
+  const [references, setReferences] = useState<File[]>([]);
   const [dragOver, setDragOver] = useState(false);
+  const [refDragOver, setRefDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const refInputRef = useRef<HTMLInputElement>(null);
 
   const [sliceEnabled, setSliceEnabled] = useState(false);
   const [sliceInterval, setSliceInterval] = useState(4);
@@ -78,6 +85,7 @@ export default function TrainPage() {
   const [height, setHeight] = useState(480);
   const [maxFrames, setMaxFrames] = useState(97);
   const [withAudio, setWithAudio] = useState(false);
+  const [referenceDownscale, setReferenceDownscale] = useState(2);
 
   const [steps, setSteps] = useState(2000);
   const [rank, setRank] = useState(64);
@@ -119,10 +127,16 @@ export default function TrainPage() {
     refreshJobs();
   }, [refreshJobs]);
 
+  const isV2v = preset === "v2v";
+
   useEffect(() => {
     if (!selectedPreset) return;
     setWithAudio(selectedPreset.with_audio);
     setLowRam(selectedPreset.low_ram_default);
+    if (selectedPreset.id === "v2v") {
+      setSteps(3000);
+      setValidationPrompts("a person walking in a park");
+    }
   }, [selectedPreset?.id]);
 
   const manifest = useMemo((): TrainManifest => {
@@ -148,6 +162,7 @@ export default function TrainPage() {
         max_frames: maxFrames,
         with_audio: withAudio,
         frame_rate: 24,
+        reference_downscale_factor: referenceDownscale,
       },
       train: {
         steps,
@@ -174,6 +189,7 @@ export default function TrainPage() {
     height,
     maxFrames,
     withAudio,
+    referenceDownscale,
     steps,
     rank,
     learningRate,
@@ -239,7 +255,7 @@ export default function TrainPage() {
     return unsub;
   }, [activeJobId, updateJob, refreshJobs]);
 
-  function addFiles(fileList: FileList | File[]) {
+  function addTargetFiles(fileList: FileList | File[]) {
     const incoming = Array.from(fileList).filter((f) =>
       /\.(mp4|mov|avi|mkv|webm|txt)$/i.test(f.name),
     );
@@ -254,11 +270,31 @@ export default function TrainPage() {
     });
   }
 
+  function addReferenceFiles(fileList: FileList | File[]) {
+    const incoming = Array.from(fileList).filter((f) =>
+      /\.(mp4|mov|avi|mkv|webm)$/i.test(f.name),
+    );
+    if (!incoming.length) return;
+    setReferences((prev) => {
+      const names = new Set(prev.map((f) => f.name));
+      const merged = [...prev];
+      for (const f of incoming) {
+        if (!names.has(f.name)) merged.push(f);
+      }
+      return merged;
+    });
+  }
+
   async function startTraining() {
     setError(null);
     const videoFiles = videos.filter((f) => !f.name.toLowerCase().endsWith(".txt"));
     if (!videoFiles.length) {
-      setError("Add at least one video file (.mp4, .mov, …).");
+      setError("Add at least one target video file (.mp4, .mov, …).");
+      setStep("dataset");
+      return;
+    }
+    if (isV2v && !references.length) {
+      setError("IC-LoRA requires reference videos paired by matching filename.");
       setStep("dataset");
       return;
     }
@@ -272,7 +308,8 @@ export default function TrainPage() {
     }
     setSubmitting(true);
     try {
-      const result = await createTrainJob(manifest, videos);
+      const captionFiles = videos.filter((f) => f.name.toLowerCase().endsWith(".txt"));
+      const result = await createTrainJob(manifest, [...videoFiles, ...captionFiles], references);
       const job: TrainJob = {
         id: result.job_id,
         name: result.name,
@@ -290,6 +327,23 @@ export default function TrainPage() {
       setError(exc instanceof Error ? exc.message : String(exc));
     } finally {
       setSubmitting(false);
+    }
+  }
+
+  async function handleResume(jobId?: string) {
+    const id = jobId || activeJobId;
+    if (!id) return;
+    setResuming(true);
+    setError(null);
+    try {
+      await resumeTrainJob(id);
+      setActiveJobId(id);
+      setStep("runs");
+      await refreshJobs();
+    } catch (exc) {
+      setError(exc instanceof Error ? exc.message : String(exc));
+    } finally {
+      setResuming(false);
     }
   }
 
@@ -324,6 +378,7 @@ export default function TrainPage() {
 
   const videoCount = videos.filter((f) => !f.name.toLowerCase().endsWith(".txt")).length;
   const captionCount = videos.filter((f) => f.name.toLowerCase().endsWith(".txt")).length;
+  const referenceCount = references.length;
 
   return (
     <div className="train-page">
@@ -381,8 +436,9 @@ export default function TrainPage() {
             <section className="train-section">
               <h2>Dataset</h2>
               <p className="train-section-lead">
-                Drop training videos here. Optional <code>.txt</code> caption files with matching names are used when
-                slicing is off.
+                {isV2v
+                  ? "Upload target clips (desired output) and reference clips (conditioning). Pair by matching filename — e.g. scene01.mp4 + scene01.mp4."
+                  : "Drop training videos here. Optional .txt caption files with matching names are used when slicing is off."}
               </p>
 
               <label className="field">
@@ -415,7 +471,7 @@ export default function TrainPage() {
                 onDrop={(e) => {
                   e.preventDefault();
                   setDragOver(false);
-                  if (e.dataTransfer.files.length) addFiles(e.dataTransfer.files);
+                  if (e.dataTransfer.files.length) addTargetFiles(e.dataTransfer.files);
                 }}
                 onClick={() => fileInputRef.current?.click()}
                 role="button"
@@ -430,20 +486,64 @@ export default function TrainPage() {
                   multiple
                   accept="video/*,.txt"
                   hidden
-                  onChange={(e) => e.target.files && addFiles(e.target.files)}
+                  onChange={(e) => e.target.files && addTargetFiles(e.target.files)}
                 />
                 <div className="drop-zone-icon">↑</div>
-                <div className="drop-zone-title">Drop videos or click to browse</div>
+                <div className="drop-zone-title">
+                  {isV2v ? "Drop target videos" : "Drop videos or click to browse"}
+                </div>
                 <div className="drop-zone-meta">
-                  {videoCount} video{videoCount !== 1 ? "s" : ""}
+                  {videoCount} target video{videoCount !== 1 ? "s" : ""}
                   {captionCount > 0 ? ` · ${captionCount} caption file${captionCount !== 1 ? "s" : ""}` : ""}
                 </div>
               </div>
 
+              {isV2v && (
+                <>
+                  <p className="pairing-note">
+                    Reference clips drive IC-LoRA conditioning (e.g. depth maps, edges, or a source take). Use the same
+                    filenames as targets so pairing survives slicing.
+                  </p>
+                  <div
+                    className={`drop-zone reference-zone ${refDragOver ? "drag-over" : ""}`}
+                    onDragOver={(e) => {
+                      e.preventDefault();
+                      setRefDragOver(true);
+                    }}
+                    onDragLeave={() => setRefDragOver(false)}
+                    onDrop={(e) => {
+                      e.preventDefault();
+                      setRefDragOver(false);
+                      if (e.dataTransfer.files.length) addReferenceFiles(e.dataTransfer.files);
+                    }}
+                    onClick={() => refInputRef.current?.click()}
+                    role="button"
+                    tabIndex={0}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") refInputRef.current?.click();
+                    }}
+                  >
+                    <input
+                      ref={refInputRef}
+                      type="file"
+                      multiple
+                      accept="video/*"
+                      hidden
+                      onChange={(e) => e.target.files && addReferenceFiles(e.target.files)}
+                    />
+                    <div className="drop-zone-icon">◎</div>
+                    <div className="drop-zone-title">Drop reference videos</div>
+                    <div className="drop-zone-meta">
+                      {referenceCount} reference video{referenceCount !== 1 ? "s" : ""}
+                    </div>
+                  </div>
+                </>
+              )}
+
               {videos.length > 0 && (
                 <ul className="file-list">
                   {videos.map((f) => (
-                    <li key={f.name}>
+                    <li key={`t-${f.name}`}>
                       <span>{f.name}</span>
                       <span className="file-size">{(f.size / 1024 / 1024).toFixed(1)} MB</span>
                       <button
@@ -451,6 +551,25 @@ export default function TrainPage() {
                         className="file-remove"
                         aria-label={`Remove ${f.name}`}
                         onClick={() => setVideos((prev) => prev.filter((x) => x !== f))}
+                      >
+                        ×
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+
+              {isV2v && references.length > 0 && (
+                <ul className="file-list">
+                  {references.map((f) => (
+                    <li key={`r-${f.name}`}>
+                      <span>ref: {f.name}</span>
+                      <span className="file-size">{(f.size / 1024 / 1024).toFixed(1)} MB</span>
+                      <button
+                        type="button"
+                        className="file-remove"
+                        aria-label={`Remove ${f.name}`}
+                        onClick={() => setReferences((prev) => prev.filter((x) => x !== f))}
                       >
                         ×
                       </button>
@@ -529,6 +648,7 @@ export default function TrainPage() {
               <h2>Preprocess</h2>
               <p className="train-section-lead">
                 Latents are encoded at this resolution. Frames are rounded to valid LTX lengths (8k+1).
+                {isV2v && " Reference latents are encoded at a lower resolution for IC-LoRA conditioning."}
               </p>
               <div className="field-grid">
                 <label className="field">
@@ -552,12 +672,24 @@ export default function TrainPage() {
                   <input
                     type="checkbox"
                     checked={withAudio}
-                    disabled={selectedPreset?.with_audio}
+                    disabled={selectedPreset?.with_audio || isV2v}
                     onChange={(e) => setWithAudio(e.target.checked)}
                   />
                   Encode audio latents
                   {selectedPreset?.with_audio && <span className="field-note"> (required for AV preset)</span>}
                 </label>
+                {isV2v && (
+                  <label className="field">
+                    <span>Reference downscale factor</span>
+                    <input
+                      type="number"
+                      min={1}
+                      max={8}
+                      value={referenceDownscale}
+                      onChange={(e) => setReferenceDownscale(Number(e.target.value))}
+                    />
+                  </label>
+                )}
               </div>
               <div className="train-actions">
                 <button type="button" className="btn-secondary" onClick={() => setStep("dataset")}>
@@ -637,7 +769,10 @@ export default function TrainPage() {
                   <strong>{name}</strong> · {selectedPreset?.label || preset} · {steps} steps · rank {rank}
                 </div>
                 <div className="train-summary-meta">
-                  {videoCount} video{videoCount !== 1 ? "s" : ""} · {width}×{height} · {maxFrames} frames
+                  {videoCount} target{isV2v ? "" : ""} video{videoCount !== 1 ? "s" : ""}
+                  {isV2v ? ` · ${referenceCount} reference${referenceCount !== 1 ? "s" : ""}` : ""}
+                  {" · "}
+                  {width}×{height} · {maxFrames} frames
                 </div>
               </div>
 
@@ -686,27 +821,51 @@ export default function TrainPage() {
                   <div className="job-detail-header">
                     <div>
                       <h3>{activeJob.name}</h3>
-                      <p className="job-phase">{phaseLabel(activeJob.phase)}</p>
+                      <p className="job-phase">
+                        {phaseLabel(activeJob.phase)} · {activeJob.preset}
+                      </p>
                     </div>
-                    {["queued", "running"].includes(activeJob.status) && (
-                      <button type="button" className="btn-danger" onClick={handleCancel}>
-                        Cancel
-                      </button>
-                    )}
+                    <div className="artifact-actions">
+                      {["interrupted", "failed"].includes(activeJob.status) && (
+                        <button
+                          type="button"
+                          className="btn-primary"
+                          disabled={resuming || !!health?.generation_active}
+                          onClick={() => handleResume()}
+                        >
+                          {resuming ? "Resuming…" : "Resume"}
+                        </button>
+                      )}
+                      {["queued", "running"].includes(activeJob.status) && (
+                        <button type="button" className="btn-danger" onClick={handleCancel}>
+                          Cancel
+                        </button>
+                      )}
+                    </div>
                   </div>
 
-                  {activeJob.phase === "training" && (
+                  {["queued", "running", "slicing", "preprocessing", "training", "starting"].includes(
+                    activeJob.phase || "",
+                  ) &&
+                    activeJob.status !== "interrupted" && (
                     <div className="progress-block">
                       <div className="progress-bar">
-                        <div className="progress-fill" style={{ width: `${trainProgress}%` }} />
+                        <div
+                          className="progress-fill"
+                          style={{
+                            width: activeJob.phase === "training" ? `${trainProgress}%` : "12%",
+                          }}
+                        />
                       </div>
-                      <div className="progress-stats">
-                        <span>
-                          Step {activeJob.step || 0} / {activeJob.total_steps || steps}
-                        </span>
-                        {activeJob.loss != null && <span>Loss {activeJob.loss.toFixed(4)}</span>}
-                        <span>ETA {formatEta(activeJob.eta_s)}</span>
-                      </div>
+                      {activeJob.phase === "training" && (
+                        <div className="progress-stats">
+                          <span>
+                            Step {activeJob.step || 0} / {activeJob.total_steps || steps}
+                          </span>
+                          {activeJob.loss != null && <span>Loss {activeJob.loss.toFixed(4)}</span>}
+                          <span>ETA {formatEta(activeJob.eta_s)}</span>
+                        </div>
+                      )}
                     </div>
                   )}
 
