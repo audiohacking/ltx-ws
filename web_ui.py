@@ -240,6 +240,7 @@ def _lora_catalog(output_dir: Path | None = None) -> tuple[list[dict[str, Any]],
     Returns (presets including a None entry, default_preset_id).
     """
     from server import (
+        BUILTIN_LORA_PRESETS,
         DEFAULT_GLOBAL_LORA_PATH,
         DEFAULT_GLOBAL_LORA_SCALE,
         DEFAULT_LORA_URL,
@@ -257,13 +258,24 @@ def _lora_catalog(output_dir: Path | None = None) -> tuple[list[dict[str, Any]],
     ]
     default_id = "none"
 
-    def _add(id_: str, label: str, spec: str, scale: float, is_default: bool = False) -> None:
+    def _add(
+        id_: str,
+        label: str,
+        spec: str,
+        scale: float,
+        is_default: bool = False,
+        **extra: Any,
+    ) -> None:
         nonlocal default_id
         key = f"{spec}:{scale}"
         if not spec or key in seen:
             return
         seen.add(key)
-        presets.append({"id": id_, "label": label, "spec": spec, "scale": scale})
+        entry: dict[str, Any] = {"id": id_, "label": label, "spec": spec, "scale": scale}
+        for k, v in extra.items():
+            if v is not None:
+                entry[k] = v
+        presets.append(entry)
         if is_default:
             default_id = id_
 
@@ -288,6 +300,17 @@ def _lora_catalog(output_dir: Path | None = None) -> tuple[list[dict[str, Any]],
             default_path,
             default_scale,
             is_default=True,
+        )
+
+    for builtin in BUILTIN_LORA_PRESETS:
+        _add(
+            str(builtin["id"]),
+            str(builtin["label"]),
+            str(builtin["spec"]),
+            float(builtin.get("scale", 1.0)),
+            description=builtin.get("description"),
+            negative_prompt_hint=builtin.get("negative_prompt_hint"),
+            suggested_modes=builtin.get("suggested_modes"),
         )
 
     for i, (path, scale) in enumerate(_default_loras_from_env()):
@@ -1193,6 +1216,7 @@ def _build_params_from_request(body: dict[str, Any], *, state: AppState | None =
         stage2_steps=body.get("stage2_steps"),
         no_regen_audio=bool(body.get("no_regen_audio", False)),
         reference_strength=body.get("reference_strength"),
+        negative_prompt=str(body.get("negative_prompt") or "").strip() or None,
     )
 
 
@@ -1355,6 +1379,7 @@ async def _run_clip_inprocess(
                         stage2_steps=getattr(params, "stage2_steps", None),
                         no_regen_audio=bool(getattr(params, "no_regen_audio", False)),
                         reference_strength=getattr(params, "reference_strength", None),
+                        negative_prompt=str(getattr(params, "negative_prompt", "") or "").strip(),
                     )
                 )
                 while not gen_task.done():

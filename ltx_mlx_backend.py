@@ -725,6 +725,8 @@ def _apply_optional_generate_kwargs(call_kwargs: dict[str, Any], req: Generation
         call_kwargs["no_regen_audio"] = True
     if req.reference_strength is not None:
         call_kwargs["reference_strength"] = float(req.reference_strength)
+    if req.negative_prompt and str(req.negative_prompt).strip():
+        call_kwargs["negative_prompt"] = str(req.negative_prompt).strip()
 
 
 def _frame_rate_from_kwargs(kwargs: dict[str, Any], default: float) -> float:
@@ -1488,7 +1490,6 @@ class LocalVideoGenerator:
             log.error("  ✗ spill salvage failed: %s", exc)
 
     def _generate_sync(self, req: GenerationRequest) -> str:
-        del req.negative_prompt  # reserved for future CFG-enabled variants
         self._check_cancel()
         self.load()
         self._check_cancel()

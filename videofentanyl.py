@@ -249,6 +249,7 @@ class GenerationParams:
     stage2_steps: Optional[int] = None
     no_regen_audio: bool = False
     reference_strength: Optional[float] = None
+    negative_prompt: Optional[str] = None
 
 
 @dataclasses.dataclass
@@ -392,6 +393,8 @@ def msg_simple_generate(p: GenerationParams) -> str:
         d["no_regen_audio"] = True
     if p.reference_strength is not None:
         d["reference_strength"] = float(p.reference_strength)
+    if p.negative_prompt and str(p.negative_prompt).strip():
+        d["negative_prompt"] = str(p.negative_prompt).strip()
     return json.dumps(d)
 
 

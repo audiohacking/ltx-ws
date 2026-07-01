@@ -599,15 +599,66 @@ body {
   margin-top: 8px;
 }
 
+.prompt-block {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  padding: 10px 16px 8px;
+  box-shadow: var(--shadow);
+}
+
 .prompt-row {
   display: flex;
   gap: 10px;
   align-items: flex-end;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 20px;
-  padding: 10px 10px 10px 16px;
-  box-shadow: var(--shadow);
+}
+
+.prompt-footer {
+  display: flex;
+  justify-content: flex-start;
+  margin-top: 6px;
+}
+
+.negative-prompt-toggle {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.75rem;
+  padding: 2px 0;
+  cursor: pointer;
+}
+
+.negative-prompt-toggle:hover:not(:disabled) {
+  color: var(--text);
+}
+
+.negative-prompt-toggle:disabled {
+  opacity: 0.65;
+  cursor: not-allowed;
+}
+
+.negative-prompt-input {
+  width: 100%;
+  margin-top: 8px;
+  border: none;
+  border-top: 1px solid var(--border);
+  outline: none;
+  font: inherit;
+  font-size: 0.85rem;
+  line-height: 1.4;
+  background: transparent;
+  color: var(--text);
+  padding: 10px 0 4px;
+}
+
+.negative-prompt-input::placeholder {
+  color: var(--muted);
+}
+
+.negative-prompt-input:disabled {
+  opacity: 0.65;
+  cursor: not-allowed;
 }
 
 .prompt-input {
@@ -746,6 +797,46 @@ body {
 
 .hint-inline {
   margin: 6px 0 0;
+}
+
+.lora-preset-hint {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--surface) 92%, var(--accent) 8%);
+}
+
+.lora-preset-hint p {
+  margin: 6px 0 0;
+}
+
+.lora-negative-hint {
+  display: block;
+  margin-top: 4px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 0.7rem;
+}
+
+.lora-use-negative-btn {
+  margin-left: 8px;
+  font-size: 0.72rem;
+}
+
+.btn-link {
+  border: none;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  padding: 0;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.btn-link:hover {
+  opacity: 0.85;
 }
 
 .options-checks {

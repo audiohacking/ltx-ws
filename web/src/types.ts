@@ -10,6 +10,9 @@ export interface LoraPreset {
   spec: string;
   scale: number;
   custom?: boolean;
+  description?: string;
+  negative_prompt_hint?: string;
+  suggested_modes?: string[];
 }
 
 export interface PresetOption {

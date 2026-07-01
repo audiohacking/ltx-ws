@@ -8,6 +8,8 @@ const API = "";
 const MODEL_PREF_KEY = "ltx-ws-preferred-model";
 const LORA_SEL_KEY = "ltx-ws-lora-preset-ids";
 const LORA_ENSURED_KEY = "ltx-ws-lora-ensured-specs";
+const NEGATIVE_PROMPT_KEY = "ltx-ws-negative-prompt";
+const SHOW_NEGATIVE_PROMPT_KEY = "ltx-ws-show-negative-prompt";
 const BLOB_VIDEO_PREFIX = "blob:";
 
 function readEnsuredLoraSpecs(): Set<string> {
@@ -264,7 +266,9 @@ function LoraMultiSelect({
                 disabled={disabled}
                 onChange={(e) => onToggle(p.id, e.target.checked)}
               />
-              <span className="multi-select-item-label">{p.label}</span>
+              <span className="multi-select-item-label" title={p.description || undefined}>
+                {p.label}
+              </span>
               <button
                 type="button"
                 className="lora-remove"
@@ -293,6 +297,21 @@ export default function App() {
   const [chainId, setChainId] = useState<string | null>(null);
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
   const [prompt, setPrompt] = useState("");
+  const [negativePrompt, setNegativePrompt] = useState(() => {
+    try {
+      return localStorage.getItem(NEGATIVE_PROMPT_KEY) || "";
+    } catch {
+      return "";
+    }
+  });
+  const [showNegativePrompt, setShowNegativePrompt] = useState(() => {
+    try {
+      return localStorage.getItem(SHOW_NEGATIVE_PROMPT_KEY) === "1";
+    } catch {
+      return false;
+    }
+  });
+  const negativePromptRef = useRef<HTMLInputElement>(null);
   const [busy, setBusy] = useState(false);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [progress, setProgress] = useState<ProgressState | null>(null);
@@ -336,6 +355,31 @@ export default function App() {
 
   const imageRef = useRef<HTMLInputElement>(null);
   const promptRef = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(NEGATIVE_PROMPT_KEY, negativePrompt);
+      localStorage.setItem(SHOW_NEGATIVE_PROMPT_KEY, showNegativePrompt ? "1" : "0");
+    } catch {
+      /* ignore */
+    }
+  }, [negativePrompt, showNegativePrompt]);
+
+  function toggleNegativePromptField() {
+    setShowNegativePrompt((open) => {
+      const next = !open;
+      if (next) {
+        window.setTimeout(() => negativePromptRef.current?.focus(), 0);
+      }
+      return next;
+    });
+  }
+
+  function applyNegativePromptHint(text: string) {
+    setShowNegativePrompt(true);
+    setNegativePrompt(text);
+    window.setTimeout(() => negativePromptRef.current?.focus(), 0);
+  }
   const playerVideoRef = useRef<HTMLVideoElement>(null);
   const endImageRef = useRef<HTMLInputElement>(null);
   const audioRef = useRef<HTMLInputElement>(null);
@@ -945,6 +989,11 @@ export default function App() {
     isT2vLike && !audiocontinue && isMultiClip;
   const chainMethodLabel =
     chainMethod === "native_extend" ? "extend video" : "autocontinue";
+  const selectedLoraHints = (config?.lora_presets ?? []).filter(
+    (p) =>
+      loraPresetIds.includes(p.id) &&
+      (p.description || p.negative_prompt_hint || (p.suggested_modes?.length ?? 0) > 0),
+  );
   const showChainedImageHint =
     isA2v &&
     (autocontinue || isMultiClip || audiocontinue) &&
@@ -1303,6 +1352,9 @@ export default function App() {
     } else {
       body.seed = -1;
     }
+    if (negativePrompt.trim()) {
+      body.negative_prompt = negativePrompt.trim();
+    }
 
     const selectedLoras = (config?.lora_presets ?? []).filter(
       (p) => loraPresetIds.includes(p.id) && p.spec,
@@ -1553,34 +1605,63 @@ export default function App() {
         </section>
 
         <section className="composer">
-          <div className="prompt-row">
-            <textarea
-              ref={promptRef}
-              className="prompt-input"
-              rows={1}
-              placeholder={
-                willContinueChain
-                  ? "What do you want to edit?"
-                  : "What video do you want to create?"
-              }
-              value={prompt}
-              onChange={(e) => setPrompt(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
-                  void handleGenerate();
+          <div className="prompt-block">
+            <div className="prompt-row">
+              <textarea
+                ref={promptRef}
+                className="prompt-input"
+                rows={1}
+                placeholder={
+                  willContinueChain
+                    ? "What do you want to edit?"
+                    : "What video do you want to create?"
                 }
-              }}
-              disabled={busy}
-            />
-            <button
-              type="button"
-              className="btn-generate"
-              onClick={handleGenerate}
-              disabled={!canSubmit}
-            >
-              ↑
-            </button>
+                value={prompt}
+                onChange={(e) => setPrompt(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    void handleGenerate();
+                  }
+                }}
+                disabled={busy}
+              />
+              <button
+                type="button"
+                className="btn-generate"
+                onClick={handleGenerate}
+                disabled={!canSubmit}
+              >
+                ↑
+              </button>
+            </div>
+            {showNegativePrompt && (
+              <input
+                ref={negativePromptRef}
+                type="text"
+                className="negative-prompt-input"
+                placeholder="Negative prompt (optional)"
+                value={negativePrompt}
+                onChange={(e) => setNegativePrompt(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    void handleGenerate();
+                  }
+                }}
+                disabled={busy}
+              />
+            )}
+            <div className="prompt-footer">
+              <button
+                type="button"
+                className="negative-prompt-toggle"
+                onClick={toggleNegativePromptField}
+                disabled={busy}
+              >
+                {showNegativePrompt ? "Hide negative prompt" : "Negative prompt"}
+              </button>
+            </div>
           </div>
 
           <button
@@ -1778,6 +1859,29 @@ export default function App() {
                   </button>
                 </div>
               </div>
+
+              {selectedLoraHints.map((p) => (
+                <div key={p.id} className="hint lora-preset-hint">
+                  <strong>{p.label}</strong>
+                  {p.description && <p>{p.description}</p>}
+                  {p.suggested_modes?.length ? (
+                    <p>Works best in {p.suggested_modes.join(" or ")} mode.</p>
+                  ) : null}
+                  {p.negative_prompt_hint && (
+                    <p>
+                      Suggested negative prompt:{" "}
+                      <code className="lora-negative-hint">{p.negative_prompt_hint}</code>
+                      <button
+                        type="button"
+                        className="btn-link lora-use-negative-btn"
+                        onClick={() => applyNegativePromptHint(p.negative_prompt_hint!)}
+                      >
+                        Use
+                      </button>
+                    </p>
+                  )}
+                </div>
+              ))}
 
               {isMultiClip && !audiocontinue && (
                 <p className="hint hint-inline">

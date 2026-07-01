@@ -192,7 +192,7 @@ For agent-driven workflows, see [`AGENTS.md`](AGENTS.md) and [`DIRECTOR.md`](DIR
 - **Server-wide** — `python server.py --enable-lora --lora <url-or-path> 1.0`
 - **Env** — `LTX_WS_ENABLE_LORA=1`, `LTX_WS_DEFAULT_LORA`, `VIDEOFENTANYL_LORA_DIR`
 
-Default catalog includes the OmniNFT RL LoRA; choose **None** in the UI to disable for a job.
+Default catalog includes the OmniNFT RL LoRA and the [LTX-2.3 Foley](https://huggingface.co/FuzzPuppy/LTX-2.3-Foley-LoRA) video-to-audio SFX LoRA; choose **None** in the UI to disable for a job.
 
 ---
 

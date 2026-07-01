@@ -309,9 +309,10 @@ Structure prompts as a **timeline**, not duplicate full scene descriptions.
 
 For most **director narrative** work, stay on `mode: generate` with **autocontinue sequences**.
 
-### LoRA (OmniNFT default)
+### LoRA (OmniNFT default + built-in presets)
 
 - **Default artifact:** `https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/loras/LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors` (`DEFAULT_LORA_URL` in `server.py`).
+- **Foley preset:** [FuzzPuppy/LTX-2.3-Foley-LoRA](https://huggingface.co/FuzzPuppy/LTX-2.3-Foley-LoRA) — video-to-audio Foley/SFX (`BUILTIN_LORA_PRESETS`, id `foley`). Scale 1–3; prompt with action + “No speech is present. No music is present.”
 - **Web UI:** dropdown applies per-request `lora_specs` (no `--enable-lora` required).
 - **MCP / API:** `lora_specs: [["<url or path>", 1.0]]` on `ltx_generate_video` or `ltx_generate_sequence`.
 - **Global server default:** `python server.py --enable-lora --lora <url> 1.0` or `LTX_WS_ENABLE_LORA=1` + `LTX_WS_DEFAULT_LORA`.

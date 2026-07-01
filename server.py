@@ -108,6 +108,31 @@ DEFAULT_LORA_URL = (
     "https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/loras/"
     "LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors"
 )
+FOLEY_LORA_REPO = "FuzzPuppy/LTX-2.3-Foley-LoRA"
+FOLEY_LORA_FILENAME = "ltx-2.3-foley-400-steps.safetensors"
+FOLEY_LORA_URL = (
+    f"https://huggingface.co/{FOLEY_LORA_REPO}/resolve/main/{FOLEY_LORA_FILENAME}"
+)
+FOLEY_LORA_SCALE = 1.0
+# Built-in LoRA presets surfaced in the Web UI catalog (in addition to default/env/custom).
+BUILTIN_LORA_PRESETS: list[dict[str, object]] = [
+    {
+        "id": "foley",
+        "label": "LTX-2.3 Foley (video-to-audio SFX)",
+        "spec": FOLEY_LORA_URL,
+        "scale": FOLEY_LORA_SCALE,
+        "description": (
+            "Realistic, visually synchronized Foley and sound effects without a music overlay. "
+            "Describe the on-screen action, then add: “No speech is present. No music is present.” "
+            "Try scale 1–3 if score or music still appears."
+        ),
+        "negative_prompt_hint": (
+            "music, melody, song, singing, vocals, score, soundtrack, beat, rhythm bed, "
+            "instrumental backing, tinny, thin, harsh, clipped, distorted, low bitrate"
+        ),
+        "suggested_modes": ["generate", "retake"],
+    },
+]
 DEFAULT_GLOBAL_LORA_PATH = DEFAULT_LORA_URL
 DEFAULT_GLOBAL_LORA_SCALE = 1.0
 DEFAULT_NUM_FRAMES     = 97    # ~4 s @ 24 fps; LTX requires (8k+1) frames: 9, 17, 25, … 97, 105, …
