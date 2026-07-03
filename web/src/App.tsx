@@ -318,6 +318,7 @@ export default function App() {
   const [endImageName, setEndImageName] = useState<string | null>(null);
   const [audioPath, setAudioPath] = useState<string | null>(null);
   const [audioName, setAudioName] = useState<string | null>(null);
+  const [audioStartSeconds, setAudioStartSeconds] = useState(0);
   const [videoPath, setVideoPath] = useState<string | null>(null);
   const [sourceClipId, setSourceClipId] = useState<string | null>(null);
   const [retakeStart, setRetakeStart] = useState(1);
@@ -872,6 +873,7 @@ export default function App() {
     setEndImageName(null);
     setAudioPath(null);
     setAudioName(null);
+    setAudioStartSeconds(0);
     setVideoPath(null);
     setSourceClipId(null);
     if (imageRef.current) imageRef.current.value = "";
@@ -894,6 +896,7 @@ export default function App() {
     if (nextMode !== "a2v" && nextMode !== "lipdub") {
       setAudioPath(null);
       setAudioName(null);
+      setAudioStartSeconds(0);
       if (audioRef.current) audioRef.current.value = "";
       setAudiocontinue(false);
     }
@@ -1292,6 +1295,9 @@ export default function App() {
     }
     if ((mode === "a2v" || mode === "lipdub") && audioPath) {
       body.audio_path = audioPath;
+      if (mode === "a2v" && audioStartSeconds > 0) {
+        body.audio_start_seconds = audioStartSeconds;
+      }
     }
     if ((mode === "retake" || mode === "extend" || mode === "lipdub") && sourceClipId) {
       body.source_clip_id = sourceClipId;
@@ -1362,6 +1368,7 @@ export default function App() {
     const continuing = willContinueChain;
     if (mode === "i2v" && !imagePath && !continuing) return false;
     if (mode === "a2v" && !audioPath) return false;
+    if (mode === "a2v" && audioStartSeconds > 0 && !config?.ffmpeg_available) return false;
     if (audiocontinue && !config?.ffmpeg_available) return false;
     if ((mode === "retake" || mode === "extend" || mode === "lipdub") && !hasVideoSource) {
       return false;
@@ -1929,6 +1936,22 @@ export default function App() {
                           </span>
                         </label>
                       </div>
+                      <label className="opt-inline">
+                        Audio start (seconds)
+                        <input
+                          type="number"
+                          min={0}
+                          step={0.1}
+                          value={audioStartSeconds}
+                          disabled={!audioPath}
+                          onChange={(e) =>
+                            setAudioStartSeconds(Math.max(0, Number(e.target.value) || 0))
+                          }
+                        />
+                      </label>
+                      {audioStartSeconds > 0 && !config?.ffmpeg_available && (
+                        <p className="hint hint-inline">Requires ffmpeg.</p>
+                      )}
                       {showChainedImageHint && chainMethod === "autocontinue" && (
                         <p className="hint">
                           With autocontinue / audiocontinue, the start image is used for

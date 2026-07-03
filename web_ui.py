@@ -15,6 +15,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -570,10 +571,121 @@ def _delete_upload_paths(paths: list[Path]) -> None:
 
 
 def _cleanup_run_uploads(state: AppState, gen_body: dict[str, Any]) -> None:
+    """Delete upload-dir files from a finished run (session clear uses :meth:`clear_upload_dir`)."""
     paths = _upload_paths_from_body(gen_body, state.upload_dir)
     if paths:
         log.info("Web UI: cleaning %d upload file(s)", len(paths))
         _delete_upload_paths(paths)
+
+
+def clear_upload_dir(upload_dir: Path) -> int:
+    """Remove all files in the Web UI upload directory."""
+    deleted = 0
+    if not upload_dir.is_dir():
+        return deleted
+    for path in upload_dir.iterdir():
+        if not path.is_file():
+            continue
+        try:
+            path.unlink(missing_ok=True)
+            deleted += 1
+        except OSError as exc:
+            log.warning("Could not delete upload %s: %s", path, exc)
+    return deleted
+
+
+def _validate_request_media_paths(body: dict[str, Any]) -> None:
+    """Fail fast when the client references uploads that are no longer on disk."""
+    from fastapi import HTTPException
+
+    for key, label in (
+        ("audio_path", "Audio"),
+        ("image_path", "Image"),
+        ("end_image_path", "End image"),
+        ("video_path", "Video"),
+    ):
+        raw = body.get(key)
+        if not raw:
+            continue
+        path = Path(str(raw)).expanduser()
+        if not path.is_file():
+            raise HTTPException(
+                400,
+                f"{label} file not found: {raw}. Re-upload the file and try again.",
+            )
+
+
+def _clip_audio_duration_seconds(body: dict[str, Any]) -> float:
+    duration_s = body.get("duration_seconds")
+    if duration_s is not None:
+        return max(0.25, float(duration_s))
+    num_frames = body.get("num_frames")
+    if num_frames is not None:
+        return max(0.25, int(num_frames) / float(FPS))
+    return 5.0
+
+
+def _trim_audio_segment(
+    audio_path: str,
+    *,
+    start_seconds: float,
+    duration_seconds: float | None = None,
+) -> tuple[Path, Path]:
+    """Extract ``[start, start+duration)`` from an audio file; returns (file, temp_dir)."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise ValueError("Audio start offset requires ffmpeg on PATH")
+    src = Path(audio_path).expanduser()
+    if not src.is_file():
+        raise FileNotFoundError(f"Audio not found: {audio_path}")
+    start_seconds = max(0.0, float(start_seconds))
+    temp_dir = Path(tempfile.mkdtemp(prefix="web_audio_trim_"))
+    suffix = src.suffix if src.suffix else ".mp3"
+    out_path = temp_dir / f"segment{suffix}"
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-ss",
+        f"{start_seconds:.3f}",
+        "-i",
+        str(src.resolve()),
+    ]
+    if duration_seconds is not None and duration_seconds > 0:
+        cmd.extend(["-t", f"{float(duration_seconds):.3f}"])
+    cmd.extend(["-vn", str(out_path)])
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0 or not out_path.is_file():
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        tail = (result.stderr or result.stdout or "").strip()[-400:]
+        raise RuntimeError(f"ffmpeg audio trim failed: {tail or 'unknown error'}")
+    return out_path, temp_dir
+
+
+def _apply_audio_start_offset(body: dict[str, Any]) -> tuple[dict[str, Any], list[Path]]:
+    """Optional a2v/lipdub audio skip — web-layer trim only, inference unchanged."""
+    temps: list[Path] = []
+    try:
+        start = float(body.get("audio_start_seconds") or 0)
+    except (TypeError, ValueError):
+        start = 0.0
+    if start <= 0:
+        return body, temps
+    audio_path = str(body.get("audio_path") or "").strip()
+    if not audio_path:
+        return body, temps
+    ui_mode = (body.get("mode") or "generate").strip().lower()
+    if ui_mode not in ("a2v", "lipdub"):
+        return body, temps
+    duration_s = None if body.get("audiocontinue") else _clip_audio_duration_seconds(body)
+    out_file, temp_dir = _trim_audio_segment(
+        audio_path,
+        start_seconds=start,
+        duration_seconds=duration_s,
+    )
+    temps.append(temp_dir)
+    new_body = dict(body)
+    new_body["audio_path"] = str(out_file)
+    return new_body, temps
 
 
 def resolve_source_video_path(state: AppState, body: dict[str, Any]) -> str | None:
@@ -975,8 +1087,13 @@ class AppState:
         self.clips.clear()
         self.runs.clear()
         self.event_queues.clear()
+        upload_deleted = clear_upload_dir(self.upload_dir)
         self.save_index()
-        return {"deleted_clips": clip_count, "deleted_files": deleted_files}
+        return {
+            "deleted_clips": clip_count,
+            "deleted_files": deleted_files,
+            "deleted_uploads": upload_deleted,
+        }
 
     async def emit(self, run_id: str, event: dict[str, Any]) -> None:
         q = self.event_queues.get(run_id)
@@ -1772,7 +1889,8 @@ async def _execute_run_embedded(state: AppState, run_id: str) -> None:
     )
 
     jobs: list[Job] = []
-    gen_body = _RUN_BODIES.get(run_id, {})
+    gen_body = dict(_RUN_BODIES.get(run_id, {}))
+    gen_body, audio_trim_dirs = _apply_audio_start_offset(gen_body)
     prompts = run.prompts
     total_clips = len(prompts)
     chaining_enabled = run.autocontinue
@@ -1938,6 +2056,8 @@ async def _execute_run_embedded(state: AppState, run_id: str) -> None:
                 gen.clear_cancel()
         if temp_audio_dir is not None:
             shutil.rmtree(temp_audio_dir, ignore_errors=True)
+        for trim_dir in audio_trim_dirs:
+            shutil.rmtree(trim_dir, ignore_errors=True)
 
 
 async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
@@ -1977,7 +2097,8 @@ async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
 
     _set_server_override(_run_ws_url(state))
     jobs: list[Job] = []
-    gen_body = _RUN_BODIES.get(run_id, {})
+    gen_body = dict(_RUN_BODIES.get(run_id, {}))
+    gen_body, audio_trim_dirs = _apply_audio_start_offset(gen_body)
     prompts = run.prompts
     total_clips = len(prompts)
     chaining_enabled = run.autocontinue
@@ -2136,6 +2257,8 @@ async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
         state.set_active_run(None)
         if temp_audio_dir is not None:
             shutil.rmtree(temp_audio_dir, ignore_errors=True)
+        for trim_dir in audio_trim_dirs:
+            shutil.rmtree(trim_dir, ignore_errors=True)
 
 
 async def _worker_loop(state: AppState) -> None:
@@ -2183,12 +2306,7 @@ async def _worker_loop(state: AppState) -> None:
                 )
             except Exception:
                 log.exception("Web UI: failed to emit run_complete for %s", run_id)
-            gen_body = _RUN_BODIES.pop(run_id, {})
-            if gen_body:
-                try:
-                    _cleanup_run_uploads(state, gen_body)
-                except Exception:
-                    log.exception("Web UI: upload cleanup failed for run %s", run_id)
+            _RUN_BODIES.pop(run_id, None)
 
 
 def create_app(
@@ -2546,6 +2664,16 @@ def create_app(
             lora_items = body.get("lora_specs") or []
             if len(lora_items) != 1:
                 raise HTTPException(400, "lipdub requires exactly one LoRA preset")
+
+        _validate_request_media_paths(body)
+        try:
+            audio_start = float(body.get("audio_start_seconds") or 0)
+        except (TypeError, ValueError):
+            audio_start = 0.0
+        if audio_start < 0:
+            raise HTTPException(400, "audio_start_seconds must be >= 0")
+        if audio_start > 0 and not shutil.which("ffmpeg"):
+            raise HTTPException(400, "audio_start_seconds requires ffmpeg on PATH")
 
         if clip_count > 1 and len(prompts) == 1:
             prompts = [prompts[0]] * clip_count

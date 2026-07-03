@@ -1118,6 +1118,19 @@ body {
   gap: 12px;
 }
 
+.media-panel label.opt-inline {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 0.78rem;
+  color: var(--muted);
+  max-width: 12rem;
+}
+
+.media-panel label.opt-inline input {
+  width: 100%;
+}
+
 @media (max-width: 640px) {
   .media-upload-row {
     grid-template-columns: 1fr;
