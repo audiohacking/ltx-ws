@@ -541,6 +541,20 @@ class GenerationScheduler:
     def running_generation_id(self) -> str | None:
         return self._running_id
 
+    def reconcile(self) -> None:
+        """Clear stale queue state after a cancelled or crashed generation."""
+        if self._running_id is not None and not self._gen_lock.locked():
+            log.warning(
+                "Clearing stale running_generation_id=%s (lock not held)",
+                self._running_id,
+            )
+            self._running_id = None
+        if self._gen_lock.locked() and self._running_id is None:
+            log.warning("Resetting stale generation lock (no active generation_id)")
+            self._gen_lock = asyncio.Lock()
+        if self._n_waiters < 0:
+            self._n_waiters = 0
+
     @contextlib.asynccontextmanager
     async def generation_slot(self, notify: NotifyJson):
         """
@@ -552,7 +566,6 @@ class GenerationScheduler:
         async with self._meta:
             self._n_waiters += 1
             ahead = self._n_waiters - 1
-        held = False
         try:
             if ahead > 0:
                 async with self._meta:
@@ -564,22 +577,18 @@ class GenerationScheduler:
                     total_gpus=1,
                     active_generation_id=active,
                 )
-            await self._gen_lock.acquire()
-            held = True
-            gid = str(uuid.uuid4())
-            async with self._meta:
-                self._running_id = gid
-            try:
-                yield gid
-            finally:
+            async with self._gen_lock:
+                gid = str(uuid.uuid4())
                 async with self._meta:
-                    self._running_id = None
-                if held:
-                    self._gen_lock.release()
-                    held = False
+                    self._running_id = gid
+                try:
+                    yield gid
+                finally:
+                    async with self._meta:
+                        self._running_id = None
         finally:
             async with self._meta:
-                self._n_waiters -= 1
+                self._n_waiters = max(0, self._n_waiters - 1)
 
 
 # ── Per-connection request handler ─────────────────────────────────────────────

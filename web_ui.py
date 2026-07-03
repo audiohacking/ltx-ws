@@ -733,6 +733,7 @@ class AppState:
         self.event_queues: dict[str, asyncio.Queue[dict[str, Any]]] = {}
         self._pending: asyncio.Queue[str] = asyncio.Queue()
         self._worker_started = False
+        self._worker_task: asyncio.Task[None] | None = None
         self._cancelled_runs: set[str] = set()
         self._active_run_id: str | None = None
         self._sigint_count: int = 0
@@ -872,14 +873,24 @@ class AppState:
         return clean
 
     def ensure_worker(self) -> None:
-        """Start background generation worker (idempotent)."""
-        if self._worker_started:
+        """Start background generation worker (idempotent; restarts if it died)."""
+        task = self._worker_task
+        if self._worker_started and task is not None and not task.done():
             return
+        if task is not None and task.done():
+            try:
+                exc = task.exception()
+            except asyncio.CancelledError:
+                exc = None
+            if exc is not None:
+                log.error("Generation worker exited unexpectedly: %s", exc)
+            else:
+                log.warning("Generation worker stopped; restarting queue processor")
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.upload_dir.mkdir(parents=True, exist_ok=True)
         self.apply_saved_settings()
         self.load_index()
-        asyncio.create_task(_worker_loop(self))
+        self._worker_task = asyncio.create_task(_worker_loop(self))
         self._worker_started = True
 
     def load_index(self) -> None:
@@ -1212,6 +1223,15 @@ def _cleanup_temp_video(path: str | None) -> None:
 
 async def _emit_protocol(on_event: Any, payload: dict[str, Any]) -> None:
     await on_event({"type": "protocol", "event": payload})
+
+
+def _reconcile_generation_scheduler(state: AppState) -> None:
+    vs = state.video_server
+    if vs is None:
+        return
+    sched = getattr(vs, "scheduler", None)
+    if sched is not None and hasattr(sched, "reconcile"):
+        sched.reconcile()
 
 
 def _model_progress_payload(video_server: Any) -> dict[str, Any]:
@@ -2122,26 +2142,53 @@ async def _worker_loop(state: AppState) -> None:
     while True:
         run_id = await state._pending.get()
         try:
-            await _execute_run(state, run_id)
-        except Exception as exc:
+            try:
+                await _execute_run(state, run_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.exception("Web UI: run %s failed", run_id)
+                run = state.runs.get(run_id)
+                if run and run.status != RunStatus.CANCELLED.value:
+                    run.status = RunStatus.FAILED.value
+                    run.error = str(exc)
+                    state.save_index()
+                    await state.emit(run_id, {"type": "error", "message": str(exc)})
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:
+            log.exception("Web UI: generation worker error on run %s", run_id)
             run = state.runs.get(run_id)
-            if run and run.status != RunStatus.CANCELLED.value:
+            if run and run.status not in (
+                RunStatus.CANCELLED.value,
+                RunStatus.DONE.value,
+            ):
                 run.status = RunStatus.FAILED.value
                 run.error = str(exc)
                 state.save_index()
-                await state.emit(run_id, {"type": "error", "message": str(exc)})
+                try:
+                    await state.emit(run_id, {"type": "error", "message": str(exc)})
+                except Exception:
+                    log.exception("Web UI: failed to emit run error for %s", run_id)
         finally:
-            await state.emit(
-                run_id,
-                {
-                    "type": "run_complete",
-                    "run_id": run_id,
-                    "chain_id": state.runs.get(run_id).chain_id if state.runs.get(run_id) else None,
-                },
-            )
+            _reconcile_generation_scheduler(state)
+            try:
+                await state.emit(
+                    run_id,
+                    {
+                        "type": "run_complete",
+                        "run_id": run_id,
+                        "chain_id": state.runs.get(run_id).chain_id if state.runs.get(run_id) else None,
+                    },
+                )
+            except Exception:
+                log.exception("Web UI: failed to emit run_complete for %s", run_id)
             gen_body = _RUN_BODIES.pop(run_id, {})
             if gen_body:
-                _cleanup_run_uploads(state, gen_body)
+                try:
+                    _cleanup_run_uploads(state, gen_body)
+                except Exception:
+                    log.exception("Web UI: upload cleanup failed for run %s", run_id)
 
 
 def create_app(
@@ -2463,6 +2510,7 @@ def create_app(
 
     @app.post("/api/generate")
     async def generate(body: dict[str, Any]):
+        state.ensure_worker()
         prompt = str(body.get("prompt") or "").strip()
         prompts = body.get("prompts") or []
         if prompt:
