@@ -688,6 +688,47 @@ def _apply_audio_start_offset(body: dict[str, Any]) -> tuple[dict[str, Any], lis
     return new_body, temps
 
 
+@dataclass
+class _RunTempFiles:
+    """Tracks per-run scratch dirs/files; always cleaned in ``cleanup()``."""
+
+    dirs: list[Path] = field(default_factory=list)
+
+    def add_dir(self, path: Path | None) -> None:
+        if path is not None:
+            self.dirs.append(path)
+
+    def add_dirs(self, paths: list[Path]) -> None:
+        for path in paths:
+            self.add_dir(path)
+
+    def cleanup(self) -> None:
+        seen: set[Path] = set()
+        for raw in self.dirs:
+            path = Path(raw)
+            if path in seen:
+                continue
+            seen.add(path)
+            try:
+                if path.is_dir():
+                    shutil.rmtree(path, ignore_errors=True)
+                elif path.is_file():
+                    path.unlink(missing_ok=True)
+            except OSError as exc:
+                log.warning("Could not remove run temp %s: %s", path, exc)
+        self.dirs.clear()
+
+
+def _finish_run_teardown(state: AppState, temps: _RunTempFiles) -> None:
+    temps.cleanup()
+    state.set_active_run(None)
+    vs = state.video_server
+    if vs is not None:
+        gen = getattr(vs, "generator", None)
+        if gen is not None and hasattr(gen, "clear_cancel"):
+            gen.clear_cancel()
+
+
 def resolve_source_video_path(state: AppState, body: dict[str, Any]) -> str | None:
     """Resolve ``source_clip_id`` (library) or ``video_path`` (upload) to a local MP4 path."""
     clip_id = str(body.get("source_clip_id") or "").strip()
@@ -1332,7 +1373,9 @@ def _cleanup_temp_video(path: str | None) -> None:
         if p.is_file():
             p.unlink(missing_ok=True)
         parent = p.parent
-        if parent.is_dir() and parent.name.startswith(("fv_", "fvserver_work_")):
+        if parent.is_dir() and parent.name.startswith(
+            ("fv_", "fvserver_work_", "web_audio_trim_", "videofentanyl_audio_")
+        ):
             shutil.rmtree(parent, ignore_errors=True)
     except OSError:
         pass
@@ -1423,6 +1466,7 @@ async def _run_clip_inprocess(
         await _emit_protocol(on_event, kwargs)
 
     job.started_at = time.time()
+    video_path: str | None = None
     try:
         async with vs.scheduler.generation_slot(notify) as generation_id:
             await _emit_protocol(
@@ -1539,7 +1583,6 @@ async def _run_clip_inprocess(
                     "e2e_ms": int(job.e2e_latency_ms or 0),
                 },
             )
-            _cleanup_temp_video(video_path)
             job.finished_at = time.time()
             job.status = JobStatus.DONE
             return True
@@ -1569,6 +1612,8 @@ async def _run_clip_inprocess(
             },
         )
         return False
+    finally:
+        _cleanup_temp_video(video_path)
 
 
 def _audiocontinue_segment_seconds(body: dict[str, Any]) -> float:
@@ -1889,8 +1934,8 @@ async def _execute_run_embedded(state: AppState, run_id: str) -> None:
     )
 
     jobs: list[Job] = []
+    temps = _RunTempFiles()
     gen_body = dict(_RUN_BODIES.get(run_id, {}))
-    gen_body, audio_trim_dirs = _apply_audio_start_offset(gen_body)
     prompts = run.prompts
     total_clips = len(prompts)
     chaining_enabled = run.autocontinue
@@ -1898,14 +1943,22 @@ async def _execute_run_embedded(state: AppState, run_id: str) -> None:
     prefix = sanitize_filename(prompts[0]) or "clip"
 
     audio_segments: list[dict[str, Any]] | None = None
-    temp_audio_dir: Path | None = None
 
     try:
+        try:
+            gen_body, trim_dirs = _apply_audio_start_offset(gen_body)
+            temps.add_dirs(trim_dirs)
+        except Exception as exc:
+            log.exception("Web UI: audio start offset failed")
+            await _fail_run_early(state, run_id, str(exc))
+            return
+
         if gen_body.get("audiocontinue"):
             try:
                 audio_segments, temp_audio_dir = _prepare_audiocontinue_segments(
                     gen_body, len(prompts)
                 )
+                temps.add_dir(temp_audio_dir)
             except Exception as exc:
                 log.exception("Web UI: audiocontinue setup failed")
                 await _fail_run_early(state, run_id, str(exc))
@@ -2048,16 +2101,7 @@ async def _execute_run_embedded(state: AppState, run_id: str) -> None:
             {"type": "run_done", "run_id": run_id, "chain_id": run.chain_id},
         )
     finally:
-        state.set_active_run(None)
-        vs = state.video_server
-        if vs is not None:
-            gen = getattr(vs, "generator", None)
-            if gen is not None and hasattr(gen, "clear_cancel"):
-                gen.clear_cancel()
-        if temp_audio_dir is not None:
-            shutil.rmtree(temp_audio_dir, ignore_errors=True)
-        for trim_dir in audio_trim_dirs:
-            shutil.rmtree(trim_dir, ignore_errors=True)
+        _finish_run_teardown(state, temps)
 
 
 async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
@@ -2097,8 +2141,8 @@ async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
 
     _set_server_override(_run_ws_url(state))
     jobs: list[Job] = []
+    temps = _RunTempFiles()
     gen_body = dict(_RUN_BODIES.get(run_id, {}))
-    gen_body, audio_trim_dirs = _apply_audio_start_offset(gen_body)
     prompts = run.prompts
     total_clips = len(prompts)
     chaining_enabled = run.autocontinue
@@ -2106,14 +2150,22 @@ async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
     prefix = sanitize_filename(prompts[0]) or "clip"
 
     audio_segments: list[dict[str, Any]] | None = None
-    temp_audio_dir: Path | None = None
 
     try:
+        try:
+            gen_body, trim_dirs = _apply_audio_start_offset(gen_body)
+            temps.add_dirs(trim_dirs)
+        except Exception as exc:
+            log.exception("Web UI: audio start offset failed")
+            await _fail_run_early(state, run_id, str(exc))
+            return
+
         if gen_body.get("audiocontinue"):
             try:
                 audio_segments, temp_audio_dir = _prepare_audiocontinue_segments(
                     gen_body, len(prompts)
                 )
+                temps.add_dir(temp_audio_dir)
             except Exception as exc:
                 log.exception("Web UI: audiocontinue setup failed")
                 await _fail_run_early(state, run_id, str(exc))
@@ -2254,11 +2306,7 @@ async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
             {"type": "run_done", "run_id": run_id, "chain_id": run.chain_id},
         )
     finally:
-        state.set_active_run(None)
-        if temp_audio_dir is not None:
-            shutil.rmtree(temp_audio_dir, ignore_errors=True)
-        for trim_dir in audio_trim_dirs:
-            shutil.rmtree(trim_dir, ignore_errors=True)
+        _finish_run_teardown(state, temps)
 
 
 async def _worker_loop(state: AppState) -> None:
