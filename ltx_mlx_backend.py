@@ -1950,6 +1950,12 @@ class LocalVideoGenerator:
                             )
             except BaseException as exc:
                 if not isinstance(exc, GenerationCancelledError):
+                    log.exception(
+                        "Generation failed (job %s, mode=%s): %s",
+                        req.job_id[:8] if req.job_id else "?",
+                        mode,
+                        exc,
+                    )
                     self._salvage_mp4_to_spill(
                         tmpdir, out_path, req.job_id, req.prompt, "ENCODE_FAIL"
                     )

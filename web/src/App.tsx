@@ -949,8 +949,10 @@ export default function App() {
 
   const needsImageUpload = mode === "i2v" || mode === "keyframe";
   const isA2v = mode === "a2v";
+  const ffmpegWorking =
+    config?.ffmpeg_working ?? config?.ffmpeg_available ?? false;
   const audioTrimAvailable =
-    config?.audio_trim_available ?? config?.ffmpeg_available ?? false;
+    config?.audio_trim_available ?? ffmpegWorking;
   const needsEndImageUpload = mode === "keyframe";
   const needsVideoUpload = mode === "retake" || mode === "extend" || mode === "lipdub";
   const showStartImageOptional = mode === "generate";
@@ -1403,7 +1405,7 @@ export default function App() {
     if (mode === "i2v" && !imagePath && !continuing) return false;
     if (mode === "a2v" && !audioPath) return false;
     if (mode === "a2v" && audioStartSeconds > 0 && !audioTrimAvailable) return false;
-    if (audiocontinue && !config?.ffmpeg_available) return false;
+    if (audiocontinue && !ffmpegWorking) return false;
     if ((mode === "retake" || mode === "extend" || mode === "lipdub") && !hasVideoSource) {
       return false;
     }
@@ -1418,7 +1420,7 @@ export default function App() {
     audiocontinue,
     clipMultiplier,
     audioTrimAvailable,
-    config?.ffmpeg_available,
+    ffmpegWorking,
     videoPath,
     sourceClipId,
     hasVideoSource,
@@ -1847,13 +1849,13 @@ export default function App() {
                           setClipMultiplier(2);
                         }
                       }}
-                      disabled={!audioPath || !config?.ffmpeg_available}
+                      disabled={!audioPath || !ffmpegWorking}
                     />
                     Audiocontinue
                   </label>
                 )}
-                {mode === "a2v" && !config?.ffmpeg_available && (
-                  <p className="hint hint-inline">Requires ffmpeg.</p>
+                {mode === "a2v" && !ffmpegWorking && (
+                  <p className="hint hint-inline">Audiocontinue requires a working ffmpeg.</p>
                 )}
                 <label className="check">
                   <input

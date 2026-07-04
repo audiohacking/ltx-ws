@@ -695,20 +695,6 @@ def _ffmpeg_env_overrides() -> list[dict[str, str] | None]:
     return [None, merged]
 
 
-def resolve_ffmpeg() -> str | None:
-    """Return the first ffmpeg on PATH that actually runs (Homebrew dylib breaks are skipped)."""
-    seen: set[str] = set()
-    for name in _FFMPEG_CANDIDATE_NAMES:
-        path = shutil.which(name) if "/" not in name else name
-        if not path or path in seen or not Path(path).is_file():
-            continue
-        seen.add(path)
-        for env in _ffmpeg_env_overrides():
-            if _probe_executable(path, *_FFMPEG_PROBE_ARGS, env=env):
-                return path
-    return None
-
-
 def _resolve_ffmpeg_run_env() -> tuple[str | None, dict[str, str] | None]:
     """Pick ffmpeg plus optional env (e.g. DYLD_LIBRARY_PATH) for subprocess runs."""
     seen: set[str] = set()
@@ -721,6 +707,64 @@ def _resolve_ffmpeg_run_env() -> tuple[str | None, dict[str, str] | None]:
             if _probe_executable(path, *_FFMPEG_PROBE_ARGS, env=env):
                 return path, env
     return None, None
+
+
+def resolve_ffmpeg() -> str | None:
+    """Return ffmpeg path when a probe run succeeds."""
+    ffmpeg, _env = _resolve_ffmpeg_run_env()
+    return ffmpeg
+
+
+def _resolve_ffprobe(ffmpeg: str | None) -> str | None:
+    if not ffmpeg:
+        return None
+    sibling = Path(ffmpeg).with_name("ffprobe")
+    if sibling.is_file():
+        return str(sibling)
+    return shutil.which("ffprobe")
+
+
+def _probe_audio_duration_seconds(
+    path: Path,
+    *,
+    ffmpeg: str | None = None,
+    ffmpeg_env: dict[str, str] | None = None,
+) -> float | None:
+    if path.suffix.lower() == ".wav":
+        try:
+            import wave
+
+            with wave.open(str(path), "rb") as handle:
+                rate = handle.getframerate()
+                if rate > 0:
+                    return handle.getnframes() / float(rate)
+        except (OSError, wave.Error, ZeroDivisionError):
+            pass
+    ffprobe = _resolve_ffprobe(ffmpeg)
+    if not ffprobe:
+        return None
+    cmd = [
+        ffprobe,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(path.resolve()),
+    ]
+    try:
+        cp = subprocess.run(cmd, capture_output=True, text=True, env=ffmpeg_env, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if cp.returncode != 0:
+        return None
+    try:
+        value = float((cp.stdout or "").strip())
+    except ValueError:
+        return None
+    return value if value > 0 else None
 
 
 def audio_trim_available() -> bool:
@@ -751,10 +795,9 @@ def _run_ffmpeg_audio_trim(
     out_path: Path,
     *,
     start_seconds: float,
-    duration_seconds: float | None,
-    copy_codec: bool,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    """Re-encode trimmed audio to PCM WAV (reliable for MLX a2v ingestion)."""
     cmd = [
         ffmpeg,
         "-hide_banner",
@@ -762,19 +805,19 @@ def _run_ffmpeg_audio_trim(
         "error",
         "-nostdin",
         "-y",
-        "-ss",
-        f"{start_seconds:.3f}",
         "-i",
         str(src.resolve()),
+        "-ss",
+        f"{start_seconds:.3f}",
+        "-map",
+        "0:a:0?",
+        "-vn",
+        "-c:a",
+        "pcm_s16le",
+        "-ar",
+        "44100",
+        str(out_path),
     ]
-    if duration_seconds is not None and duration_seconds > 0:
-        cmd.extend(["-t", f"{float(duration_seconds):.3f}"])
-    cmd.extend(["-map", "0:a:0?", "-vn"])
-    if copy_codec:
-        cmd.extend(["-c:a", "copy"])
-    else:
-        cmd.extend(["-c:a", "pcm_s16le"])
-    cmd.append(str(out_path))
     return subprocess.run(cmd, capture_output=True, text=True, env=env)
 
 
@@ -783,14 +826,11 @@ def _trim_audio_with_sox(
     out_path: Path,
     *,
     start_seconds: float,
-    duration_seconds: float | None,
 ) -> None:
     sox = shutil.which("sox")
     if not sox:
         raise ValueError("Audio start offset requires ffmpeg or sox on PATH")
     cmd = [sox, str(src.resolve()), str(out_path), "trim", f"{start_seconds:.3f}"]
-    if duration_seconds is not None and duration_seconds > 0:
-        cmd.append(f"{start_seconds + float(duration_seconds):.3f}")
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0 or not out_path.is_file():
         tail = _ffmpeg_error_tail(result)
@@ -801,9 +841,8 @@ def _trim_audio_segment(
     audio_path: str,
     *,
     start_seconds: float,
-    duration_seconds: float | None = None,
 ) -> tuple[Path, Path]:
-    """Extract ``[start, start+duration)`` from an audio file; returns (file, temp_dir)."""
+    """Drop ``start_seconds`` from the front of an audio file; returns (wav file, temp_dir)."""
     if not audio_trim_available():
         raise ValueError(
             "Audio start offset requires a working ffmpeg install or sox on PATH"
@@ -813,47 +852,34 @@ def _trim_audio_segment(
         raise FileNotFoundError(f"Audio not found: {audio_path}")
     start_seconds = max(0.0, float(start_seconds))
     temp_dir = Path(tempfile.mkdtemp(prefix="web_audio_trim_"))
-    suffix = src.suffix if src.suffix else ".wav"
-    out_path = temp_dir / f"segment{suffix}"
+    out_path = temp_dir / "segment.wav"
     errors: list[str] = []
 
     ffmpeg, ffmpeg_env = _resolve_ffmpeg_run_env()
     if ffmpeg:
-        for copy_codec in (True, False):
-            attempt_path = out_path if copy_codec else temp_dir / "segment.wav"
-            result = _run_ffmpeg_audio_trim(
-                ffmpeg,
-                src,
-                attempt_path,
-                start_seconds=start_seconds,
-                duration_seconds=duration_seconds,
-                copy_codec=copy_codec,
-                env=ffmpeg_env,
-            )
-            if result.returncode == 0 and attempt_path.is_file():
-                return attempt_path, temp_dir
-            if attempt_path.is_file():
-                attempt_path.unlink(missing_ok=True)
-            errors.append(
-                f"ffmpeg ({'copy' if copy_codec else 'pcm'}): "
-                f"{_ffmpeg_error_tail(result)}"
-            )
-
-    try:
-        _trim_audio_with_sox(
+        result = _run_ffmpeg_audio_trim(
+            ffmpeg,
             src,
             out_path,
             start_seconds=start_seconds,
-            duration_seconds=duration_seconds,
+            env=ffmpeg_env,
         )
+        if result.returncode == 0 and out_path.is_file() and out_path.stat().st_size > 1024:
+            return out_path, temp_dir
+        if out_path.is_file():
+            out_path.unlink(missing_ok=True)
+        errors.append(f"ffmpeg pcm: {_ffmpeg_error_tail(result)}")
+
+    try:
+        _trim_audio_with_sox(src, out_path, start_seconds=start_seconds)
+        if out_path.stat().st_size <= 1024:
+            raise RuntimeError("sox produced empty audio output")
         return out_path, temp_dir
     except Exception as exc:
         errors.append(str(exc))
 
     shutil.rmtree(temp_dir, ignore_errors=True)
-    hint = (
-        "If ffmpeg is installed via Homebrew, try: brew reinstall ffmpeg x265"
-    )
+    hint = "If ffmpeg is installed via Homebrew, try: brew reinstall ffmpeg x265"
     detail = "; ".join(errors[-3:]) if errors else "unknown error"
     raise RuntimeError(f"Audio trim failed ({detail}). {hint}")
 
@@ -873,15 +899,40 @@ def _apply_audio_start_offset(body: dict[str, Any]) -> tuple[dict[str, Any], lis
     ui_mode = (body.get("mode") or "generate").strip().lower()
     if ui_mode not in ("a2v", "lipdub"):
         return body, temps
-    duration_s = None if body.get("audiocontinue") else _clip_audio_duration_seconds(body)
-    out_file, temp_dir = _trim_audio_segment(
-        audio_path,
-        start_seconds=start,
-        duration_seconds=duration_s,
+
+    src = Path(audio_path).expanduser()
+    ffmpeg, ffmpeg_env = _resolve_ffmpeg_run_env()
+    source_duration = _probe_audio_duration_seconds(
+        src,
+        ffmpeg=ffmpeg,
+        ffmpeg_env=ffmpeg_env,
     )
+    if source_duration is not None:
+        if start >= source_duration - 0.05:
+            raise ValueError(
+                f"Audio start {start:.1f}s is at or past the end of the source "
+                f"({source_duration:.1f}s)"
+            )
+        if not body.get("audiocontinue"):
+            clip_need = _clip_audio_duration_seconds(body)
+            remaining = source_duration - start
+            if remaining + 0.05 < clip_need:
+                raise ValueError(
+                    f"Only {remaining:.1f}s of audio remains after {start:.1f}s offset, "
+                    f"but this clip needs ~{clip_need:.1f}s — lower the start offset or "
+                    "shorten the clip"
+                )
+
+    out_file, temp_dir = _trim_audio_segment(audio_path, start_seconds=start)
     temps.append(temp_dir)
     new_body = dict(body)
     new_body["audio_path"] = str(out_file)
+    log.info(
+        "Web UI: audio start trim offset=%.2fs -> %s (%d bytes)",
+        start,
+        out_file.name,
+        out_file.stat().st_size,
+    )
     return new_body, temps
 
 
@@ -2703,7 +2754,8 @@ def create_app(
             "lora_presets": lora_presets,
             "default_lora_preset_id": default_lora_preset_id,
             "preferred_lora_preset_ids": preferred_lora_ids,
-            "ffmpeg_available": resolve_ffmpeg() is not None,
+            "ffmpeg_available": bool(shutil.which("ffmpeg")),
+            "ffmpeg_working": resolve_ffmpeg() is not None,
             "audio_trim_available": audio_trim_available(),
         }
 
@@ -3054,7 +3106,7 @@ def create_app(
         if started_immediately:
             log.info(
                 "Web UI: executing run %s  chain=%s  clips=%d  mode=%s  chain_method=%s  "
-                "duration=%ss (%d frames)  audiocontinue=%s",
+                "duration=%ss (%d frames)  audiocontinue=%s  audio_start=%ss",
                 run_id,
                 chain_id,
                 len(clip_ids),
@@ -3063,11 +3115,12 @@ def create_app(
                 body.get("duration_seconds", 5.0),
                 seg_frames,
                 audiocontinue,
+                body.get("audio_start_seconds") or 0,
             )
         else:
             log.info(
                 "Web UI: queued run %s  chain=%s  clips=%d  mode=%s  chain_method=%s  "
-                "duration=%ss (%d frames)  audiocontinue=%s",
+                "duration=%ss (%d frames)  audiocontinue=%s  audio_start=%ss",
                 run_id,
                 chain_id,
                 len(clip_ids),
@@ -3076,6 +3129,7 @@ def create_app(
                 body.get("duration_seconds", 5.0),
                 seg_frames,
                 audiocontinue,
+                body.get("audio_start_seconds") or 0,
             )
 
         return {
