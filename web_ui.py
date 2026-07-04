@@ -745,8 +745,12 @@ def _finish_run_teardown(state: AppState, temps: _RunTempFiles) -> None:
     vs = state.video_server
     if vs is not None:
         gen = getattr(vs, "generator", None)
-        if gen is not None and hasattr(gen, "clear_cancel"):
-            gen.clear_cancel()
+        if gen is not None:
+            if hasattr(gen, "clear_cancel"):
+                gen.clear_cancel()
+            cleanup = getattr(gen, "cleanup_after_generation", None)
+            if callable(cleanup):
+                cleanup()
 
 
 def resolve_source_video_path(state: AppState, body: dict[str, Any]) -> str | None:
@@ -1467,7 +1471,13 @@ def _cleanup_temp_video(path: str | None) -> None:
             p.unlink(missing_ok=True)
         parent = p.parent
         if parent.is_dir() and parent.name.startswith(
-            ("fv_", "fvserver_work_", "web_audio_trim_", "videofentanyl_audio_")
+            (
+                "fv_",
+                "fvserver_work_",
+                "web_audio_trim_",
+                "videofentanyl_audio_",
+                "ltx_audio_trim_",
+            )
         ):
             shutil.rmtree(parent, ignore_errors=True)
     except OSError:

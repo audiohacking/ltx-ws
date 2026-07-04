@@ -803,23 +803,43 @@ def _sync_pipeline_load_flag(pipe: Any) -> None:
         pipe._loaded = False
 
 
+def _free_pipeline_blocks(pipe: Any) -> None:
+    """Drop per-job MLX weights held on a cached pipeline instance."""
+    if getattr(pipe, "dit", None) is not None:
+        pipe.dit = None
+    for block_name in (
+        "prompt_encoder",
+        "image_conditioner",
+        "audio_conditioner",
+        "video_decoder_block",
+        "audio_decoder_block",
+    ):
+        block = getattr(pipe, block_name, None)
+        if block is not None and hasattr(block, "free"):
+            try:
+                block.free()
+            except Exception as exc:
+                log.debug("Pipeline block free %s failed: %s", block_name, exc)
+    if hasattr(pipe, "vae_encoder"):
+        pipe.vae_encoder = None
+    _sync_pipeline_load_flag(pipe)
+
+
+def _mlx_aggressive_cleanup() -> None:
+    try:
+        from ltx_core_mlx.utils.memory import aggressive_cleanup
+
+        aggressive_cleanup()
+    except ImportError:
+        pass
+
+
 def _release_pipe_after_generation(pipe: Any) -> None:
-    """Reset per-request state on a cached pipeline instance.
-
-    Always clears request-scoped LoRA specs (``_pending_loras``) so the next job
-    does not inherit the previous clip's adapters.
-
-    When ``low_memory`` is off, leaves DiT / VAE encoder / decoders loaded so
-    back-to-back generations reuse warm weights and fused LoRAs.
-
-    When ``low_memory`` is on, upstream ``generate_and_save`` / decode paths
-    already free blocks between stages; we only reconcile ``_loaded`` if a
-    partial free left the flag set (which would skip ``load()`` and crash on
-    ``assert self.vae_encoder is not None`` on the next job).
-    """
+    """Reset per-request pipeline state and free MLX blocks between jobs."""
     if hasattr(pipe, "_pending_loras"):
         pipe._pending_loras = []
-    _sync_pipeline_load_flag(pipe)
+    _free_pipeline_blocks(pipe)
+    _mlx_aggressive_cleanup()
 
 
 def _unlink_fvserver_temp(path: str | None, marker: str) -> None:
@@ -1437,6 +1457,14 @@ class LocalVideoGenerator:
 
     def model_progress_for_ws(self) -> dict[str, Any] | None:
         return self._model_progress.snapshot()
+
+    def cleanup_after_generation(self, pipe: Any | None = None) -> None:
+        """Clear progress state and MLX memory after each job (success or failure)."""
+        self._model_progress.clear()
+        if pipe is not None:
+            _release_pipe_after_generation(pipe)
+        else:
+            _mlx_aggressive_cleanup()
 
     def default_lora_count(self) -> int:
         if self._resolved_default_loras is not None:
@@ -2134,11 +2162,13 @@ class LocalVideoGenerator:
                 raise RuntimeError(
                     f"Generation completed but output file not found: {video_path}"
                 )
-            if last_pipe is not None:
-                _release_pipe_after_generation(last_pipe)
             return _export_output_mp4(video_path)
 
         finally:
+            if last_pipe is not None:
+                self.cleanup_after_generation(last_pipe)
+            else:
+                self.cleanup_after_generation()
             for tmp in media_cleanups:
                 _unlink_fvserver_temp(tmp, "fvserver_")
             for tmp in tmp_video_conditioning_cleanup:

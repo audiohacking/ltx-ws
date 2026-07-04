@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { AudioTrimControl } from "./AudioTrimControl";
 import { clipDisplayPrompt, snapshotFromClip } from "./clipEditor";
 import { applyProgressEvent } from "./progress";
 import { captureVideoFrame, formatVideoTime } from "./frameCapture";
@@ -317,6 +318,8 @@ export default function App() {
   const [endImagePath, setEndImagePath] = useState<string | null>(null);
   const [endImageName, setEndImageName] = useState<string | null>(null);
   const [audioPath, setAudioPath] = useState<string | null>(null);
+  const [audioFile, setAudioFile] = useState<File | null>(null);
+  const [audioPreviewUrl, setAudioPreviewUrl] = useState<string | null>(null);
   const [audioName, setAudioName] = useState<string | null>(null);
   const [audioDurationSeconds, setAudioDurationSeconds] = useState<number | null>(null);
   const [audioStartSeconds, setAudioStartSeconds] = useState(0);
@@ -388,7 +391,7 @@ export default function App() {
     setMode((current) => {
       if (["retake", "extend", "lipdub"].includes(current)) return "generate";
       if (current === "i2v" && !imagePath) return "generate";
-      if (current === "a2v" && !audioPath) return "generate";
+      if (current === "a2v" && !audioPath && !audioFile) return "generate";
       if (current === "keyframe" && (!imagePath || !endImagePath)) return "generate";
       return current;
     });
@@ -396,7 +399,7 @@ export default function App() {
     setAutoconcat(false);
     setAudiocontinue(false);
     setClipMultiplier(1);
-  }, [audioPath, endImagePath, imagePath]);
+  }, [audioFile, audioPath, endImagePath, imagePath]);
 
   const syncClipSelection = useCallback(
     (all: Clip[], deleted?: Clip) => {
@@ -741,13 +744,17 @@ export default function App() {
   }, [config, durationId]);
 
   const totalDurationSeconds = durationSeconds * clipMultiplier;
+  const isMultiClip = clipMultiplier > 1;
+  const audioClipDurationSeconds = useMemo(() => {
+    if (audiocontinue || isMultiClip) return totalDurationSeconds;
+    return durationSeconds;
+  }, [audiocontinue, isMultiClip, totalDurationSeconds, durationSeconds]);
   const audioStartSliderMax = useMemo(() => {
     if (audioDurationSeconds && audioDurationSeconds > 0) {
-      return Math.max(0.1, audioDurationSeconds - 0.1);
+      return Math.max(0.1, audioDurationSeconds - audioClipDurationSeconds);
     }
     return 300;
-  }, [audioDurationSeconds]);
-  const isMultiClip = clipMultiplier > 1;
+  }, [audioClipDurationSeconds, audioDurationSeconds]);
   const editingChain =
     !isMultiClip &&
     Boolean(chainId && activeClip?.status === "done");
@@ -873,20 +880,48 @@ export default function App() {
     }
   }
 
+  function revokeAudioPreviewUrl(url: string | null) {
+    if (url?.startsWith(BLOB_VIDEO_PREFIX)) {
+      URL.revokeObjectURL(url);
+    }
+  }
+
+  function resetAudioSelection() {
+    setAudioPreviewUrl((prev) => {
+      revokeAudioPreviewUrl(prev);
+      return null;
+    });
+    setAudioFile(null);
+    setAudioPath(null);
+    setAudioName(null);
+    setAudioDurationSeconds(null);
+    setAudioStartSeconds(0);
+    if (audioRef.current) audioRef.current.value = "";
+  }
+
+  function handleAudioFileSelected(file: File) {
+    setAudioPreviewUrl((prev) => {
+      revokeAudioPreviewUrl(prev);
+      return URL.createObjectURL(file);
+    });
+    setAudioFile(file);
+    setAudioName(file.name);
+    setAudioPath(null);
+    setAudioStartSeconds(0);
+    setAudioDurationSeconds(null);
+    void probeAudioDuration(file).then(setAudioDurationSeconds);
+  }
+
   function clearAllMedia() {
     setImagePath(null);
     setImageName(null);
     setEndImagePath(null);
     setEndImageName(null);
-    setAudioPath(null);
-    setAudioName(null);
-    setAudioDurationSeconds(null);
-    setAudioStartSeconds(0);
+    resetAudioSelection();
     setVideoPath(null);
     setSourceClipId(null);
     if (imageRef.current) imageRef.current.value = "";
     if (endImageRef.current) endImageRef.current.value = "";
-    if (audioRef.current) audioRef.current.value = "";
     if (videoRef.current) videoRef.current.value = "";
   }
 
@@ -902,11 +937,7 @@ export default function App() {
       if (endImageRef.current) endImageRef.current.value = "";
     }
     if (nextMode !== "a2v" && nextMode !== "lipdub") {
-      setAudioPath(null);
-      setAudioName(null);
-      setAudioDurationSeconds(null);
-      setAudioStartSeconds(0);
-      if (audioRef.current) audioRef.current.value = "";
+      resetAudioSelection();
       setAudiocontinue(false);
     }
     if (!["retake", "extend", "lipdub"].includes(nextMode)) {
@@ -964,6 +995,18 @@ export default function App() {
     isA2v &&
     (autocontinue || isMultiClip || audiocontinue) &&
     Boolean(imagePath);
+
+  useEffect(() => {
+    if (audioStartSeconds > audioStartSliderMax) {
+      setAudioStartSeconds(audioStartSliderMax);
+    }
+  }, [audioStartSeconds, audioStartSliderMax]);
+
+  useEffect(() => {
+    return () => {
+      revokeAudioPreviewUrl(audioPreviewUrl);
+    };
+  }, [audioPreviewUrl]);
 
   function probeAudioDuration(file: File): Promise<number | null> {
     return new Promise((resolve) => {
@@ -1324,8 +1367,13 @@ export default function App() {
     if (mode === "keyframe" && endImagePath) {
       body.end_image_path = endImagePath;
     }
-    if ((mode === "a2v" || mode === "lipdub") && audioPath) {
-      body.audio_path = audioPath;
+    let resolvedAudioPath = audioPath;
+    if ((mode === "a2v" || mode === "lipdub") && !resolvedAudioPath && audioFile) {
+      resolvedAudioPath = await uploadFile(audioFile, "audio");
+      setAudioPath(resolvedAudioPath);
+    }
+    if ((mode === "a2v" || mode === "lipdub") && resolvedAudioPath) {
+      body.audio_path = resolvedAudioPath;
       if (mode === "a2v" && audioStartSeconds > 0) {
         body.audio_start_seconds = audioStartSeconds;
         if (audioDurationSeconds && audioDurationSeconds > 0) {
@@ -1405,7 +1453,7 @@ export default function App() {
     if (!prompt.trim() || busy || !serverOk) return false;
     const continuing = willContinueChain;
     if (mode === "i2v" && !imagePath && !continuing) return false;
-    if (mode === "a2v" && !audioPath) return false;
+    if (mode === "a2v" && !audioPath && !audioFile) return false;
     if (mode === "a2v" && audioStartSeconds > 0 && !audioTrimAvailable) return false;
     if (audiocontinue && !pyavAvailable) return false;
     if ((mode === "retake" || mode === "extend" || mode === "lipdub") && !hasVideoSource) {
@@ -1419,6 +1467,7 @@ export default function App() {
     mode,
     imagePath,
     audioPath,
+    audioFile,
     audiocontinue,
     clipMultiplier,
     audioTrimAvailable,
@@ -1851,7 +1900,7 @@ export default function App() {
                           setClipMultiplier(2);
                         }
                       }}
-                      disabled={!audioPath || !pyavAvailable}
+                      disabled={(!audioPath && !audioFile) || !pyavAvailable}
                     />
                     Audiocontinue
                   </label>
@@ -1954,83 +2003,20 @@ export default function App() {
                             {imageName ?? "Choose image file…"}
                           </span>
                         </label>
-                        <label className="media-upload">
-                          <span className="media-upload-label">
-                            Source audio (required)
-                          </span>
-                          <input
-                            ref={audioRef}
-                            type="file"
-                            accept="audio/*"
-                            onChange={async (e) => {
-                              const f = e.target.files?.[0];
-                              if (f) {
-                                setAudioStartSeconds(0);
-                                setAudioDurationSeconds(null);
-                                setAudioPath(await uploadFile(f, "audio"));
-                                setAudioName(f.name);
-                                void probeAudioDuration(f).then(setAudioDurationSeconds);
-                              }
-                            }}
-                          />
-                          <span className="media-upload-hint">
-                            {audioName ?? "Choose audio file…"}
-                          </span>
-                        </label>
                       </div>
-                      <div className="audio-start-control">
-                        <div className="audio-start-header">
-                          <span className="audio-start-label">Audio start</span>
-                          <span className="audio-start-value">
-                            {audioStartSeconds.toFixed(1)}s
-                            {audioDurationSeconds
-                              ? ` / ${Math.floor(audioDurationSeconds)}s`
-                              : ""}
-                          </span>
-                        </div>
-                        <input
-                          type="range"
-                          className="audio-start-slider"
-                          min={0}
-                          max={audioStartSliderMax}
-                          step={0.1}
-                          value={Math.min(audioStartSeconds, audioStartSliderMax)}
-                          disabled={!audioPath}
-                          aria-label="Audio start offset in seconds"
-                          onChange={(e) =>
-                            setAudioStartSeconds(Number(e.target.value))
-                          }
-                        />
-                        <div className="audio-start-input-row">
-                          <input
-                            type="number"
-                            min={0}
-                            max={audioStartSliderMax}
-                            step={0.1}
-                            value={audioStartSeconds}
-                            disabled={!audioPath}
-                            aria-label="Audio start seconds"
-                            onChange={(e) =>
-                              setAudioStartSeconds(
-                                Math.min(
-                                  audioStartSliderMax,
-                                  Math.max(0, Number(e.target.value) || 0),
-                                ),
-                              )
-                            }
-                          />
-                          <span className="audio-start-hint">
-                            {audioPath
-                              ? "Skip this far into the source audio before generation."
-                              : "Select source audio above to enable."}
-                          </span>
-                        </div>
-                        {audioStartSeconds > 0 && !audioTrimAvailable && (
-                          <p className="hint hint-inline">
-                            Audio start requires PyAV (pip install av).
-                          </p>
-                        )}
-                      </div>
+                      <AudioTrimControl
+                        fileName={audioName}
+                        previewUrl={audioPreviewUrl}
+                        durationSeconds={audioDurationSeconds}
+                        startSeconds={audioStartSeconds}
+                        clipDurationSeconds={audioClipDurationSeconds}
+                        maxStart={audioStartSliderMax}
+                        trimAvailable={audioTrimAvailable}
+                        disabled={busy}
+                        fileInputRef={audioRef}
+                        onFileSelected={handleAudioFileSelected}
+                        onStartChange={setAudioStartSeconds}
+                      />
                       {showChainedImageHint && chainMethod === "autocontinue" && (
                         <p className="hint">
                           With autocontinue / audiocontinue, the start image is used for

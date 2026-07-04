@@ -1213,6 +1213,55 @@ body {
   line-height: 1.35;
 }
 
+.audio-trim-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 8px;
+}
+
+.audio-trim-player {
+  width: 100%;
+  height: 36px;
+  border-radius: 6px;
+}
+
+.audio-trim-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.audio-trim-timeline-track {
+  position: relative;
+  height: 8px;
+  border-radius: 4px;
+  background: var(--border);
+  overflow: hidden;
+}
+
+.audio-trim-timeline-segment {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  border-radius: 4px;
+  background: var(--accent);
+  opacity: 0.85;
+}
+
+.audio-trim-timeline-labels {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.7rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.audio-trim-preview-btn {
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
 .clip-source-picker {
   display: flex;
   flex-direction: column;
