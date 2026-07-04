@@ -318,6 +318,7 @@ export default function App() {
   const [endImageName, setEndImageName] = useState<string | null>(null);
   const [audioPath, setAudioPath] = useState<string | null>(null);
   const [audioName, setAudioName] = useState<string | null>(null);
+  const [audioDurationSeconds, setAudioDurationSeconds] = useState<number | null>(null);
   const [audioStartSeconds, setAudioStartSeconds] = useState(0);
   const [videoPath, setVideoPath] = useState<string | null>(null);
   const [sourceClipId, setSourceClipId] = useState<string | null>(null);
@@ -740,6 +741,12 @@ export default function App() {
   }, [config, durationId]);
 
   const totalDurationSeconds = durationSeconds * clipMultiplier;
+  const audioStartSliderMax = useMemo(() => {
+    if (audioDurationSeconds && audioDurationSeconds > 0) {
+      return Math.max(0.1, audioDurationSeconds - 0.1);
+    }
+    return 300;
+  }, [audioDurationSeconds]);
   const isMultiClip = clipMultiplier > 1;
   const editingChain =
     !isMultiClip &&
@@ -873,6 +880,7 @@ export default function App() {
     setEndImageName(null);
     setAudioPath(null);
     setAudioName(null);
+    setAudioDurationSeconds(null);
     setAudioStartSeconds(0);
     setVideoPath(null);
     setSourceClipId(null);
@@ -896,6 +904,7 @@ export default function App() {
     if (nextMode !== "a2v" && nextMode !== "lipdub") {
       setAudioPath(null);
       setAudioName(null);
+      setAudioDurationSeconds(null);
       setAudioStartSeconds(0);
       if (audioRef.current) audioRef.current.value = "";
       setAudiocontinue(false);
@@ -952,6 +961,25 @@ export default function App() {
     isA2v &&
     (autocontinue || isMultiClip || audiocontinue) &&
     Boolean(imagePath);
+
+  function probeAudioDuration(file: File): Promise<number | null> {
+    return new Promise((resolve) => {
+      const url = URL.createObjectURL(file);
+      const el = document.createElement("audio");
+      el.preload = "metadata";
+      const cleanup = () => URL.revokeObjectURL(url);
+      el.onloadedmetadata = () => {
+        const duration = Number.isFinite(el.duration) ? el.duration : null;
+        cleanup();
+        resolve(duration);
+      };
+      el.onerror = () => {
+        cleanup();
+        resolve(null);
+      };
+      el.src = url;
+    });
+  }
 
   async function uploadFile(file: File, kind: string): Promise<string> {
     const fd = new FormData();
@@ -1851,25 +1879,6 @@ export default function App() {
                   />
                   Autoconcat
                 </label>
-                {mode === "a2v" && (
-                  <label className="opt-audio-start">
-                    Audio start (s)
-                    <input
-                      type="number"
-                      min={0}
-                      step={0.1}
-                      value={audioStartSeconds}
-                      disabled={!audioPath}
-                      title="Skip this many seconds into the source audio before generation"
-                      onChange={(e) =>
-                        setAudioStartSeconds(Math.max(0, Number(e.target.value) || 0))
-                      }
-                    />
-                  </label>
-                )}
-                {mode === "a2v" && audioStartSeconds > 0 && !config?.ffmpeg_available && (
-                  <p className="hint hint-inline">Audio start requires ffmpeg.</p>
-                )}
                 <label className="opt-profile">
                   Profile
                   <select
@@ -1949,8 +1958,11 @@ export default function App() {
                             onChange={async (e) => {
                               const f = e.target.files?.[0];
                               if (f) {
+                                setAudioStartSeconds(0);
+                                setAudioDurationSeconds(null);
                                 setAudioPath(await uploadFile(f, "audio"));
                                 setAudioName(f.name);
+                                void probeAudioDuration(f).then(setAudioDurationSeconds);
                               }
                             }}
                           />
@@ -1958,6 +1970,57 @@ export default function App() {
                             {audioName ?? "Choose audio file…"}
                           </span>
                         </label>
+                      </div>
+                      <div className="audio-start-control">
+                        <div className="audio-start-header">
+                          <span className="audio-start-label">Audio start</span>
+                          <span className="audio-start-value">
+                            {audioStartSeconds.toFixed(1)}s
+                            {audioDurationSeconds
+                              ? ` / ${Math.floor(audioDurationSeconds)}s`
+                              : ""}
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          className="audio-start-slider"
+                          min={0}
+                          max={audioStartSliderMax}
+                          step={0.1}
+                          value={Math.min(audioStartSeconds, audioStartSliderMax)}
+                          disabled={!audioPath}
+                          aria-label="Audio start offset in seconds"
+                          onChange={(e) =>
+                            setAudioStartSeconds(Number(e.target.value))
+                          }
+                        />
+                        <div className="audio-start-input-row">
+                          <input
+                            type="number"
+                            min={0}
+                            max={audioStartSliderMax}
+                            step={0.1}
+                            value={audioStartSeconds}
+                            disabled={!audioPath}
+                            aria-label="Audio start seconds"
+                            onChange={(e) =>
+                              setAudioStartSeconds(
+                                Math.min(
+                                  audioStartSliderMax,
+                                  Math.max(0, Number(e.target.value) || 0),
+                                ),
+                              )
+                            }
+                          />
+                          <span className="audio-start-hint">
+                            {audioPath
+                              ? "Skip this far into the source audio before generation."
+                              : "Select source audio above to enable."}
+                          </span>
+                        </div>
+                        {audioStartSeconds > 0 && !config?.ffmpeg_available && (
+                          <p className="hint hint-inline">Audio start requires ffmpeg.</p>
+                        )}
                       </div>
                       {showChainedImageHint && chainMethod === "autocontinue" && (
                         <p className="hint">

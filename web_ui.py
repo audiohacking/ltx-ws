@@ -342,6 +342,28 @@ def resolve_web_dist() -> Path:
     return REPO_ROOT / "web" / "dist"
 
 
+def web_dist_stale() -> bool:
+    """True when built assets are missing or older than web/src sources."""
+    dist = resolve_web_dist()
+    if not dist.is_dir():
+        return True
+    assets = dist / "assets"
+    js_files = list(assets.glob("index-*.js")) if assets.is_dir() else []
+    if not js_files:
+        return True
+    newest_js = max(js_files, key=lambda path: path.stat().st_mtime)
+    src_root = REPO_ROOT / "web" / "src"
+    if not src_root.is_dir():
+        return False
+    try:
+        newest_src = max(
+            path.stat().st_mtime for path in src_root.rglob("*") if path.is_file()
+        )
+    except ValueError:
+        return False
+    return newest_src > newest_js.stat().st_mtime
+
+
 def resolve_favicon_path() -> Path | None:
     """Locate favicon for embedded Web UI (built dist, then source public/)."""
     for candidate in (

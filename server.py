@@ -1373,7 +1373,7 @@ def main() -> None:
     if model_auto_note:
         print(f"  RAM pick : {model_auto_note}")
     print(f"  Runtime  : Apple Silicon / MLX")
-    from web_ui import build_server_urls, resolve_web_dist
+    from web_ui import build_server_urls, resolve_web_dist, web_dist_stale
 
     ws_url, http_url = build_server_urls(args.host, args.port)
     print(f"  Endpoint : {ws_url}")
@@ -1382,6 +1382,11 @@ def main() -> None:
         if not resolve_web_dist().is_dir():
             print(
                 "  [warn] web/dist missing — build UI: cd web && npm install && npm run build",
+                flush=True,
+            )
+        elif web_dist_stale():
+            print(
+                "  [warn] web/dist is older than web/src — rebuild UI: cd web && npm run build",
                 flush=True,
             )
     print(f"  Video    : {args.num_frames} frames @ "
