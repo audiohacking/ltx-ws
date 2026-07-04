@@ -1329,6 +1329,9 @@ export default function App() {
       body.audio_path = audioPath;
       if (mode === "a2v" && audioStartSeconds > 0) {
         body.audio_start_seconds = audioStartSeconds;
+        if (audioDurationSeconds && audioDurationSeconds > 0) {
+          body.audio_source_duration_seconds = audioDurationSeconds;
+        }
       }
     }
     if ((mode === "retake" || mode === "extend" || mode === "lipdub") && sourceClipId) {

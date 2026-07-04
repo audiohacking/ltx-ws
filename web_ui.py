@@ -724,12 +724,35 @@ def _resolve_ffprobe(ffmpeg: str | None) -> str | None:
     return shutil.which("ffprobe")
 
 
+def _parse_ffmpeg_duration(stderr: str) -> float | None:
+    for line in stderr.splitlines():
+        if "Duration:" not in line:
+            continue
+        token = line.split("Duration:", 1)[1].split(",", 1)[0].strip()
+        parts = token.split(":")
+        if len(parts) != 3:
+            continue
+        try:
+            hours = int(parts[0])
+            minutes = int(parts[1])
+            seconds = float(parts[2])
+        except ValueError:
+            continue
+        total = hours * 3600 + minutes * 60 + seconds
+        if total > 0:
+            return total
+    return None
+
+
 def _probe_audio_duration_seconds(
     path: Path,
     *,
     ffmpeg: str | None = None,
     ffmpeg_env: dict[str, str] | None = None,
 ) -> float | None:
+    """Best-effort duration; uses the largest reading to avoid MP3 header underestimates."""
+    readings: list[float] = []
+
     if path.suffix.lower() == ".wav":
         try:
             import wave
@@ -737,34 +760,85 @@ def _probe_audio_duration_seconds(
             with wave.open(str(path), "rb") as handle:
                 rate = handle.getframerate()
                 if rate > 0:
-                    return handle.getnframes() / float(rate)
+                    readings.append(handle.getnframes() / float(rate))
         except (OSError, wave.Error, ZeroDivisionError):
             pass
+
+    sox = shutil.which("sox")
+    if sox:
+        try:
+            cp = subprocess.run(
+                [sox, "--info", "-D", str(path.resolve())],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if cp.returncode == 0:
+                value = float((cp.stdout or "").strip())
+                if value > 0:
+                    readings.append(value)
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            pass
+
     ffprobe = _resolve_ffprobe(ffmpeg)
-    if not ffprobe:
+    if ffprobe:
+        for entries in ("format=duration", "stream=duration"):
+            cmd = [
+                ffprobe,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-select_streams",
+                "a:0",
+                "-show_entries",
+                entries,
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(path.resolve()),
+            ]
+            try:
+                cp = subprocess.run(cmd, capture_output=True, text=True, env=ffmpeg_env, timeout=30)
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            if cp.returncode != 0:
+                continue
+            for line in (cp.stdout or "").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    value = float(line)
+                except ValueError:
+                    continue
+                if value > 0:
+                    readings.append(value)
+
+    if ffmpeg:
+        try:
+            cp = subprocess.run(
+                [
+                    ffmpeg,
+                    "-hide_banner",
+                    "-i",
+                    str(path.resolve()),
+                    "-f",
+                    "null",
+                    "-",
+                ],
+                capture_output=True,
+                text=True,
+                env=ffmpeg_env,
+                timeout=120,
+            )
+            decoded = _parse_ffmpeg_duration(cp.stderr or "")
+            if decoded is not None:
+                readings.append(decoded)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    if not readings:
         return None
-    cmd = [
-        ffprobe,
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-        str(path.resolve()),
-    ]
-    try:
-        cp = subprocess.run(cmd, capture_output=True, text=True, env=ffmpeg_env, timeout=30)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if cp.returncode != 0:
-        return None
-    try:
-        value = float((cp.stdout or "").strip())
-    except ValueError:
-        return None
-    return value if value > 0 else None
+    return max(readings)
 
 
 def audio_trim_available() -> bool:
@@ -805,10 +879,10 @@ def _run_ffmpeg_audio_trim(
         "error",
         "-nostdin",
         "-y",
-        "-i",
-        str(src.resolve()),
         "-ss",
         f"{start_seconds:.3f}",
+        "-i",
+        str(src.resolve()),
         "-map",
         "0:a:0?",
         "-vn",
@@ -816,6 +890,8 @@ def _run_ffmpeg_audio_trim(
         "pcm_s16le",
         "-ar",
         "44100",
+        "-ac",
+        "2",
         str(out_path),
     ]
     return subprocess.run(cmd, capture_output=True, text=True, env=env)
@@ -855,6 +931,20 @@ def _trim_audio_segment(
     out_path = temp_dir / "segment.wav"
     errors: list[str] = []
 
+    sox = shutil.which("sox")
+    if sox:
+        try:
+            _trim_audio_with_sox(src, out_path, start_seconds=start_seconds)
+            if out_path.stat().st_size > 1024:
+                return out_path, temp_dir
+            if out_path.is_file():
+                out_path.unlink(missing_ok=True)
+            errors.append("sox produced empty audio output")
+        except Exception as exc:
+            if out_path.is_file():
+                out_path.unlink(missing_ok=True)
+            errors.append(str(exc))
+
     ffmpeg, ffmpeg_env = _resolve_ffmpeg_run_env()
     if ffmpeg:
         result = _run_ffmpeg_audio_trim(
@@ -869,14 +959,6 @@ def _trim_audio_segment(
         if out_path.is_file():
             out_path.unlink(missing_ok=True)
         errors.append(f"ffmpeg pcm: {_ffmpeg_error_tail(result)}")
-
-    try:
-        _trim_audio_with_sox(src, out_path, start_seconds=start_seconds)
-        if out_path.stat().st_size <= 1024:
-            raise RuntimeError("sox produced empty audio output")
-        return out_path, temp_dir
-    except Exception as exc:
-        errors.append(str(exc))
 
     shutil.rmtree(temp_dir, ignore_errors=True)
     hint = "If ffmpeg is installed via Homebrew, try: brew reinstall ffmpeg x265"
@@ -902,34 +984,37 @@ def _apply_audio_start_offset(body: dict[str, Any]) -> tuple[dict[str, Any], lis
 
     src = Path(audio_path).expanduser()
     ffmpeg, ffmpeg_env = _resolve_ffmpeg_run_env()
-    source_duration = _probe_audio_duration_seconds(
-        src,
-        ffmpeg=ffmpeg,
-        ffmpeg_env=ffmpeg_env,
-    )
-    if source_duration is not None:
-        if start >= source_duration - 0.05:
-            raise ValueError(
-                f"Audio start {start:.1f}s is at or past the end of the source "
-                f"({source_duration:.1f}s)"
-            )
-        if not body.get("audiocontinue"):
-            clip_need = _clip_audio_duration_seconds(body)
-            remaining = source_duration - start
-            if remaining + 0.05 < clip_need:
-                raise ValueError(
-                    f"Only {remaining:.1f}s of audio remains after {start:.1f}s offset, "
-                    f"but this clip needs ~{clip_need:.1f}s — lower the start offset or "
-                    "shorten the clip"
-                )
+    client_duration = body.get("audio_source_duration_seconds")
+    try:
+        client_duration_s = float(client_duration) if client_duration is not None else None
+        if client_duration_s is not None and client_duration_s <= 0:
+            client_duration_s = None
+    except (TypeError, ValueError):
+        client_duration_s = None
 
     out_file, temp_dir = _trim_audio_segment(audio_path, start_seconds=start)
     temps.append(temp_dir)
+    trimmed_duration = _probe_audio_duration_seconds(
+        out_file,
+        ffmpeg=ffmpeg,
+        ffmpeg_env=ffmpeg_env,
+    )
+    if not body.get("audiocontinue"):
+        clip_need = _clip_audio_duration_seconds(body)
+        if trimmed_duration is not None and trimmed_duration + 0.05 < clip_need:
+            raise ValueError(
+                f"Trimmed audio is only {trimmed_duration:.1f}s long, "
+                f"but this clip needs ~{clip_need:.1f}s — lower the start offset or "
+                "shorten the clip"
+            )
+
     new_body = dict(body)
     new_body["audio_path"] = str(out_file)
     log.info(
-        "Web UI: audio start trim offset=%.2fs -> %s (%d bytes)",
+        "Web UI: audio start trim offset=%.2fs client_dur=%s trimmed_dur=%s -> %s (%d bytes)",
         start,
+        f"{client_duration_s:.1f}s" if client_duration_s is not None else "?",
+        f"{trimmed_duration:.1f}s" if trimmed_duration is not None else "?",
         out_file.name,
         out_file.stat().st_size,
     )
