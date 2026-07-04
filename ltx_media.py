@@ -8,8 +8,10 @@ goes through this module (PyAV / ``pip install av``).
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import tempfile
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -425,6 +427,92 @@ def mux_audio_into_video(
 
     if not output_path.is_file() or output_path.stat().st_size == 0:
         raise RuntimeError(f"Audio mux produced empty output: {output_path}")
+    return output_path
+
+
+def stream_decoder_latent_to_mp4(
+    decoder: Any,
+    latent: Any,
+    output_path: Path | str,
+    *,
+    frame_rate: float,
+    audio_path: Path | str | None = None,
+) -> Path:
+    """Decode VAE latent tiles to H.264 MP4 via PyAV (replaces upstream ffmpeg pipe)."""
+    import mlx.core as mx
+    import numpy as np
+
+    require_media()
+    from ltx_core_mlx.model.video_vae.video_vae import _compute_decode_tiling
+    from ltx_core_mlx.utils.memory import aggressive_cleanup
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    frame_rate = float(frame_rate)
+    tiling = _compute_decode_tiling(latent.shape, frame_rate=frame_rate)
+    _, _, _f_lat, h_lat, w_lat = latent.shape
+    out_h = int(h_lat * 32)
+    out_w = int(w_lat * 32)
+    expected_frames = max(1, int(latent.shape[2] * 8 - 7))
+
+    video_tmp = output_path
+    cleanup_video_tmp = False
+    if audio_path:
+        from ltx_paths import mk_scratch_file
+
+        fd, tmp = mk_scratch_file("ltx_vid_", ".mp4")
+        os.close(fd)
+        video_tmp = Path(tmp)
+        cleanup_video_tmp = True
+
+    frames_written = 0
+    with av.open(str(video_tmp), "w") as container:
+        stream = container.add_stream("libx264", rate=frame_rate, width=out_w, height=out_h)
+        stream.pix_fmt = "yuv420p"
+        stream.options = {"crf": "18"}
+        stream.time_base = Fraction(1, int(round(frame_rate)))
+
+        for chunk in decoder.tiled_decode(latent, tiling):
+            num_frames = int(chunk.shape[2])
+            for i in range(num_frames):
+                frame = chunk[:, :, i, :, :]
+                frame = mx.clip(frame, -1.0, 1.0)
+                frame = ((frame + 1.0) * 127.5).astype(mx.uint8)
+                frame_hwc = frame[0].transpose(1, 2, 0)
+                mx.eval(frame_hwc)
+                rgb = np.asarray(frame_hwc)
+                video_frame = av.VideoFrame.from_ndarray(rgb, format="rgb24")
+                video_frame = video_frame.reformat(format="yuv420p")
+                video_frame.pts = frames_written
+                for packet in stream.encode(video_frame):
+                    container.mux(packet)
+                frames_written += 1
+                if i % 8 == 0:
+                    aggressive_cleanup()
+            del chunk
+            aggressive_cleanup()
+        for packet in stream.encode(None):
+            container.mux(packet)
+
+    aggressive_cleanup()
+
+    if frames_written <= 0:
+        raise RuntimeError(
+            f"VAE decode wrote 0 video frames (expected ~{expected_frames})"
+        )
+    if not video_tmp.is_file() or video_tmp.stat().st_size == 0:
+        raise RuntimeError(f"VAE decode produced empty video: {video_tmp}")
+
+    duration_s = frames_written / frame_rate
+    if audio_path:
+        mux_audio_into_video(video_tmp, audio_path, output_path, duration_s=duration_s)
+        if cleanup_video_tmp:
+            video_tmp.unlink(missing_ok=True)
+    elif video_tmp != output_path:
+        shutil.move(str(video_tmp), str(output_path))
+
+    if not output_path.is_file() or output_path.stat().st_size == 0:
+        raise RuntimeError(f"MP4 encode produced empty output: {output_path}")
     return output_path
 
 

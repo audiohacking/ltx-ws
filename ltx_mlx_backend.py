@@ -171,6 +171,46 @@ def _patch_ltx_pipelines_compat(*, default_fps: float = 24.0) -> None:
     orch._ltx_ws_frame_rate_patched = True
 
 
+def _patch_video_decode_pyav_only() -> None:
+    """Replace upstream ffmpeg stdin pipe video encode with PyAV."""
+    import sys
+
+    try:
+        from ltx_core_mlx.model.video_vae import video_vae as vv_mod
+    except ImportError:
+        return
+    if getattr(vv_mod, "_ltx_ws_pyav_decode_patched", False):
+        return
+
+    from ltx_media import stream_decoder_latent_to_mp4
+
+    original = vv_mod.VideoDecoder.decode_and_stream
+
+    def decode_and_stream(
+        self,
+        latent,
+        output_path: str,
+        frame_rate: float = 24.0,
+        audio_path: str | None = None,
+    ) -> None:
+        stream_decoder_latent_to_mp4(
+            self,
+            latent,
+            output_path,
+            frame_rate=frame_rate,
+            audio_path=audio_path,
+        )
+
+    vv_mod.VideoDecoder.decode_and_stream = decode_and_stream
+    for mod in sys.modules.values():
+        if mod is not None and getattr(mod, "VideoDecoder", None) is vv_mod.VideoDecoder:
+            mod.VideoDecoder.decode_and_stream = decode_and_stream
+        bound = getattr(mod, "decode_and_stream", None) if mod is not None else None
+        if bound is original:
+            mod.decode_and_stream = decode_and_stream  # type: ignore[attr-defined]
+    vv_mod._ltx_ws_pyav_decode_patched = True
+
+
 def looks_like_hf_repo_id(model: str) -> bool:
     """True if ``model`` looks like ``author/repo`` and is not an existing directory path."""
     s = (model or "").strip()
@@ -1176,6 +1216,7 @@ class LocalVideoGenerator:
     def load(self) -> None:
         _patch_load_audio_pyav_only()
         _patch_ltx_pipelines_compat(default_fps=self.fps)
+        _patch_video_decode_pyav_only()
         if self._model_path is not None:
             return
         try:
@@ -1266,6 +1307,7 @@ class LocalVideoGenerator:
     def _get_pipe(self, key: str, *, pipe_kwargs: dict[str, Any] | None = None) -> Any:
         _patch_load_audio_pyav_only()
         _patch_ltx_pipelines_compat(default_fps=self.fps)
+        _patch_video_decode_pyav_only()
         if not pipe_kwargs and key in self._pipes:
             return self._pipes[key]
         self.load()
@@ -2049,3 +2091,4 @@ class LocalVideoGenerator:
 # Patch before any ltx-pipelines import binds ffmpeg load_audio.
 _patch_load_audio_pyav_only()
 _patch_ltx_pipelines_compat()
+_patch_video_decode_pyav_only()
