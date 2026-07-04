@@ -895,38 +895,11 @@ def _mux_audio_into_video(
     duration_s: float,
 ) -> None:
     """Mux an audio track into a silent video (a2v chain visual continuation)."""
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg:
-        raise RuntimeError(
-            "ffmpeg is required to mux audio into a2v autocontinue clips"
-        )
-    cmd = [
-        ffmpeg,
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-y",
-        "-i",
-        video_path,
-        "-i",
-        audio_path,
-        "-t",
-        f"{max(0.1, duration_s):.6f}",
-        "-map",
-        "0:v:0",
-        "-map",
-        "1:a:0",
-        "-c:v",
-        "copy",
-        "-c:a",
-        "aac",
-        "-shortest",
-        output_path,
-    ]
-    cp = subprocess.run(cmd, capture_output=True, text=True)
-    if cp.returncode != 0:
-        err = (cp.stderr or cp.stdout or "unknown ffmpeg error").strip()
-        raise RuntimeError(f"ffmpeg audio mux failed: {err}")
+    from ltx_media import media_available, mux_audio_into_video
+
+    if not media_available():
+        raise RuntimeError("PyAV is required to mux audio into a2v autocontinue clips")
+    mux_audio_into_video(video_path, audio_path, output_path, duration_s=duration_s)
 
 
 class _ModelProgressStore:

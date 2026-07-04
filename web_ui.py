@@ -28,6 +28,8 @@ from typing import Any, AsyncIterator, Callable, Optional
 from starlette.requests import Request
 from starlette.websockets import WebSocket
 
+from ltx_media import media_available, probe_audio_duration, trim_audio_to_temp
+
 REPO_ROOT = Path(__file__).resolve().parent
 log = logging.getLogger("web_ui")
 
@@ -647,325 +649,6 @@ def _clip_audio_duration_seconds(body: dict[str, Any]) -> float:
     return 5.0
 
 
-_FFMPEG_PROBE_ARGS = ("-hide_banner", "-loglevel", "error", "-version")
-_FFMPEG_CANDIDATE_NAMES = (
-    "ffmpeg",
-    "/opt/homebrew/bin/ffmpeg",
-    "/usr/local/bin/ffmpeg",
-    "/usr/bin/ffmpeg",
-)
-
-
-def _probe_executable(
-    path: str,
-    *args: str,
-    timeout: float = 15.0,
-    env: dict[str, str] | None = None,
-) -> bool:
-    try:
-        cp = subprocess.run(
-            [path, *args],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=env,
-        )
-        return cp.returncode == 0
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-
-
-def _ffmpeg_env_overrides() -> list[dict[str, str] | None]:
-    """Extra library paths for broken Homebrew ffmpeg dylib resolution on macOS."""
-    if sys.platform != "darwin":
-        return [None]
-    merged = os.environ.copy()
-    extra: list[str] = []
-    for prefix in ("/opt/homebrew", "/usr/local"):
-        lib = f"{prefix}/lib"
-        if Path(lib).is_dir():
-            extra.append(lib)
-        cellar_glob = Path(f"{prefix}/Cellar/x265")
-        if cellar_glob.is_dir():
-            for libdir in cellar_glob.glob("*/lib"):
-                extra.append(str(libdir))
-    if not extra:
-        return [None]
-    merged["DYLD_LIBRARY_PATH"] = ":".join(dict.fromkeys(extra))
-    return [None, merged]
-
-
-def _resolve_ffmpeg_run_env() -> tuple[str | None, dict[str, str] | None]:
-    """Pick ffmpeg plus optional env (e.g. DYLD_LIBRARY_PATH) for subprocess runs."""
-    seen: set[str] = set()
-    for name in _FFMPEG_CANDIDATE_NAMES:
-        path = shutil.which(name) if "/" not in name else name
-        if not path or path in seen or not Path(path).is_file():
-            continue
-        seen.add(path)
-        for env in _ffmpeg_env_overrides():
-            if _probe_executable(path, *_FFMPEG_PROBE_ARGS, env=env):
-                return path, env
-    return None, None
-
-
-def resolve_ffmpeg() -> str | None:
-    """Return ffmpeg path when a probe run succeeds."""
-    ffmpeg, _env = _resolve_ffmpeg_run_env()
-    return ffmpeg
-
-
-def _resolve_ffprobe(ffmpeg: str | None) -> str | None:
-    if not ffmpeg:
-        return None
-    sibling = Path(ffmpeg).with_name("ffprobe")
-    if sibling.is_file():
-        return str(sibling)
-    return shutil.which("ffprobe")
-
-
-def _parse_ffmpeg_duration(stderr: str) -> float | None:
-    for line in stderr.splitlines():
-        if "Duration:" not in line:
-            continue
-        token = line.split("Duration:", 1)[1].split(",", 1)[0].strip()
-        parts = token.split(":")
-        if len(parts) != 3:
-            continue
-        try:
-            hours = int(parts[0])
-            minutes = int(parts[1])
-            seconds = float(parts[2])
-        except ValueError:
-            continue
-        total = hours * 3600 + minutes * 60 + seconds
-        if total > 0:
-            return total
-    return None
-
-
-def _probe_audio_duration_seconds(
-    path: Path,
-    *,
-    ffmpeg: str | None = None,
-    ffmpeg_env: dict[str, str] | None = None,
-) -> float | None:
-    """Best-effort duration; uses the largest reading to avoid MP3 header underestimates."""
-    readings: list[float] = []
-
-    if path.suffix.lower() == ".wav":
-        try:
-            import wave
-
-            with wave.open(str(path), "rb") as handle:
-                rate = handle.getframerate()
-                if rate > 0:
-                    readings.append(handle.getnframes() / float(rate))
-        except (OSError, wave.Error, ZeroDivisionError):
-            pass
-
-    sox = shutil.which("sox")
-    if sox:
-        try:
-            cp = subprocess.run(
-                [sox, "--info", "-D", str(path.resolve())],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            if cp.returncode == 0:
-                value = float((cp.stdout or "").strip())
-                if value > 0:
-                    readings.append(value)
-        except (OSError, subprocess.TimeoutExpired, ValueError):
-            pass
-
-    ffprobe = _resolve_ffprobe(ffmpeg)
-    if ffprobe:
-        for entries in ("format=duration", "stream=duration"):
-            cmd = [
-                ffprobe,
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-select_streams",
-                "a:0",
-                "-show_entries",
-                entries,
-                "-of",
-                "default=noprint_wrappers=1:nokey=1",
-                str(path.resolve()),
-            ]
-            try:
-                cp = subprocess.run(cmd, capture_output=True, text=True, env=ffmpeg_env, timeout=30)
-            except (OSError, subprocess.TimeoutExpired):
-                continue
-            if cp.returncode != 0:
-                continue
-            for line in (cp.stdout or "").splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    value = float(line)
-                except ValueError:
-                    continue
-                if value > 0:
-                    readings.append(value)
-
-    if ffmpeg:
-        try:
-            cp = subprocess.run(
-                [
-                    ffmpeg,
-                    "-hide_banner",
-                    "-i",
-                    str(path.resolve()),
-                    "-f",
-                    "null",
-                    "-",
-                ],
-                capture_output=True,
-                text=True,
-                env=ffmpeg_env,
-                timeout=120,
-            )
-            decoded = _parse_ffmpeg_duration(cp.stderr or "")
-            if decoded is not None:
-                readings.append(decoded)
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-
-    if not readings:
-        return None
-    return max(readings)
-
-
-def audio_trim_available() -> bool:
-    """True when audio start offset can be applied (working ffmpeg and/or sox)."""
-    if resolve_ffmpeg() is not None:
-        return True
-    return bool(shutil.which("sox"))
-
-
-def _ffmpeg_error_tail(result: subprocess.CompletedProcess[str]) -> str:
-    text = (result.stderr or result.stdout or "").strip()
-    if not text:
-        return "unknown error"
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    for line in reversed(lines):
-        lower = line.lower()
-        if "libx265" in lower or "dylib" in lower:
-            continue
-        if line.startswith("ffmpeg version"):
-            continue
-        return line[-500:]
-    return text[-500:]
-
-
-def _run_ffmpeg_audio_trim(
-    ffmpeg: str,
-    src: Path,
-    out_path: Path,
-    *,
-    start_seconds: float,
-    env: dict[str, str] | None = None,
-) -> subprocess.CompletedProcess[str]:
-    """Re-encode trimmed audio to PCM WAV (reliable for MLX a2v ingestion)."""
-    cmd = [
-        ffmpeg,
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-nostdin",
-        "-y",
-        "-ss",
-        f"{start_seconds:.3f}",
-        "-i",
-        str(src.resolve()),
-        "-map",
-        "0:a:0?",
-        "-vn",
-        "-c:a",
-        "pcm_s16le",
-        "-ar",
-        "44100",
-        "-ac",
-        "2",
-        str(out_path),
-    ]
-    return subprocess.run(cmd, capture_output=True, text=True, env=env)
-
-
-def _trim_audio_with_sox(
-    src: Path,
-    out_path: Path,
-    *,
-    start_seconds: float,
-) -> None:
-    sox = shutil.which("sox")
-    if not sox:
-        raise ValueError("Audio start offset requires ffmpeg or sox on PATH")
-    cmd = [sox, str(src.resolve()), str(out_path), "trim", f"{start_seconds:.3f}"]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0 or not out_path.is_file():
-        tail = _ffmpeg_error_tail(result)
-        raise RuntimeError(f"sox audio trim failed: {tail}")
-
-
-def _trim_audio_segment(
-    audio_path: str,
-    *,
-    start_seconds: float,
-) -> tuple[Path, Path]:
-    """Drop ``start_seconds`` from the front of an audio file; returns (wav file, temp_dir)."""
-    if not audio_trim_available():
-        raise ValueError(
-            "Audio start offset requires a working ffmpeg install or sox on PATH"
-        )
-    src = Path(audio_path).expanduser()
-    if not src.is_file():
-        raise FileNotFoundError(f"Audio not found: {audio_path}")
-    start_seconds = max(0.0, float(start_seconds))
-    temp_dir = Path(tempfile.mkdtemp(prefix="web_audio_trim_"))
-    out_path = temp_dir / "segment.wav"
-    errors: list[str] = []
-
-    sox = shutil.which("sox")
-    if sox:
-        try:
-            _trim_audio_with_sox(src, out_path, start_seconds=start_seconds)
-            if out_path.stat().st_size > 1024:
-                return out_path, temp_dir
-            if out_path.is_file():
-                out_path.unlink(missing_ok=True)
-            errors.append("sox produced empty audio output")
-        except Exception as exc:
-            if out_path.is_file():
-                out_path.unlink(missing_ok=True)
-            errors.append(str(exc))
-
-    ffmpeg, ffmpeg_env = _resolve_ffmpeg_run_env()
-    if ffmpeg:
-        result = _run_ffmpeg_audio_trim(
-            ffmpeg,
-            src,
-            out_path,
-            start_seconds=start_seconds,
-            env=ffmpeg_env,
-        )
-        if result.returncode == 0 and out_path.is_file() and out_path.stat().st_size > 1024:
-            return out_path, temp_dir
-        if out_path.is_file():
-            out_path.unlink(missing_ok=True)
-        errors.append(f"ffmpeg pcm: {_ffmpeg_error_tail(result)}")
-
-    shutil.rmtree(temp_dir, ignore_errors=True)
-    hint = "If ffmpeg is installed via Homebrew, try: brew reinstall ffmpeg x265"
-    detail = "; ".join(errors[-3:]) if errors else "unknown error"
-    raise RuntimeError(f"Audio trim failed ({detail}). {hint}")
-
-
 def _apply_audio_start_offset(body: dict[str, Any]) -> tuple[dict[str, Any], list[Path]]:
     """Optional a2v/lipdub audio skip — web-layer trim only, inference unchanged."""
     temps: list[Path] = []
@@ -981,9 +664,9 @@ def _apply_audio_start_offset(body: dict[str, Any]) -> tuple[dict[str, Any], lis
     ui_mode = (body.get("mode") or "generate").strip().lower()
     if ui_mode not in ("a2v", "lipdub"):
         return body, temps
+    if not media_available():
+        raise ValueError("Audio start offset requires PyAV — install with: pip install av")
 
-    src = Path(audio_path).expanduser()
-    ffmpeg, ffmpeg_env = _resolve_ffmpeg_run_env()
     client_duration = body.get("audio_source_duration_seconds")
     try:
         client_duration_s = float(client_duration) if client_duration is not None else None
@@ -992,13 +675,9 @@ def _apply_audio_start_offset(body: dict[str, Any]) -> tuple[dict[str, Any], lis
     except (TypeError, ValueError):
         client_duration_s = None
 
-    out_file, temp_dir = _trim_audio_segment(audio_path, start_seconds=start)
+    out_file, temp_dir = trim_audio_to_temp(audio_path, start)
     temps.append(temp_dir)
-    trimmed_duration = _probe_audio_duration_seconds(
-        out_file,
-        ffmpeg=ffmpeg,
-        ffmpeg_env=ffmpeg_env,
-    )
+    trimmed_duration = probe_audio_duration(out_file)
     if not body.get("audiocontinue"):
         clip_need = _clip_audio_duration_seconds(body)
         if trimmed_duration is not None and trimmed_duration + 0.05 < clip_need:
@@ -2839,9 +2518,9 @@ def create_app(
             "lora_presets": lora_presets,
             "default_lora_preset_id": default_lora_preset_id,
             "preferred_lora_preset_ids": preferred_lora_ids,
-            "ffmpeg_available": bool(shutil.which("ffmpeg")),
-            "ffmpeg_working": resolve_ffmpeg() is not None,
-            "audio_trim_available": audio_trim_available(),
+            "pyav_available": media_available(),
+            "ffmpeg_available": media_available(),
+            "audio_trim_available": media_available(),
         }
 
     @app.post("/api/config/loras")
@@ -3088,10 +2767,10 @@ def create_app(
             audio_start = 0.0
         if audio_start < 0:
             raise HTTPException(400, "audio_start_seconds must be >= 0")
-        if audio_start > 0 and not audio_trim_available():
+        if audio_start > 0 and not media_available():
             raise HTTPException(
                 400,
-                "audio_start_seconds requires a working ffmpeg install or sox on PATH",
+                "audio_start_seconds requires PyAV — install with: pip install av",
             )
 
         if clip_count > 1 and len(prompts) == 1:
@@ -3103,10 +2782,10 @@ def create_app(
                 raise HTTPException(400, "audiocontinue only supports a2v mode")
             if not body.get("audio_path"):
                 raise HTTPException(400, "audiocontinue requires an audio upload")
-            if not resolve_ffmpeg():
+            if not media_available():
                 raise HTTPException(
                     400,
-                    "audiocontinue requires a working ffmpeg install on PATH to split audio",
+                    "audiocontinue requires PyAV — install with: pip install av",
                 )
 
         chain_method = str(body.get("chain_method") or "autocontinue").strip().lower()

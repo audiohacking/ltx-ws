@@ -949,10 +949,9 @@ export default function App() {
 
   const needsImageUpload = mode === "i2v" || mode === "keyframe";
   const isA2v = mode === "a2v";
-  const ffmpegWorking =
-    config?.ffmpeg_working ?? config?.ffmpeg_available ?? false;
-  const audioTrimAvailable =
-    config?.audio_trim_available ?? ffmpegWorking;
+  const pyavAvailable =
+    config?.pyav_available ?? config?.audio_trim_available ?? config?.ffmpeg_available ?? false;
+  const audioTrimAvailable = pyavAvailable;
   const needsEndImageUpload = mode === "keyframe";
   const needsVideoUpload = mode === "retake" || mode === "extend" || mode === "lipdub";
   const showStartImageOptional = mode === "generate";
@@ -1408,7 +1407,7 @@ export default function App() {
     if (mode === "i2v" && !imagePath && !continuing) return false;
     if (mode === "a2v" && !audioPath) return false;
     if (mode === "a2v" && audioStartSeconds > 0 && !audioTrimAvailable) return false;
-    if (audiocontinue && !ffmpegWorking) return false;
+    if (audiocontinue && !pyavAvailable) return false;
     if ((mode === "retake" || mode === "extend" || mode === "lipdub") && !hasVideoSource) {
       return false;
     }
@@ -1423,7 +1422,7 @@ export default function App() {
     audiocontinue,
     clipMultiplier,
     audioTrimAvailable,
-    ffmpegWorking,
+    pyavAvailable,
     videoPath,
     sourceClipId,
     hasVideoSource,
@@ -1852,13 +1851,13 @@ export default function App() {
                           setClipMultiplier(2);
                         }
                       }}
-                      disabled={!audioPath || !ffmpegWorking}
+                      disabled={!audioPath || !pyavAvailable}
                     />
                     Audiocontinue
                   </label>
                 )}
-                {mode === "a2v" && !ffmpegWorking && (
-                  <p className="hint hint-inline">Audiocontinue requires a working ffmpeg.</p>
+                {mode === "a2v" && !pyavAvailable && (
+                  <p className="hint hint-inline">Audiocontinue requires PyAV (pip install av).</p>
                 )}
                 <label className="check">
                   <input
@@ -2028,7 +2027,7 @@ export default function App() {
                         </div>
                         {audioStartSeconds > 0 && !audioTrimAvailable && (
                           <p className="hint hint-inline">
-                            Audio start requires ffmpeg (working install) or sox.
+                            Audio start requires PyAV (pip install av).
                           </p>
                         )}
                       </div>
