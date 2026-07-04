@@ -1159,8 +1159,9 @@ body {
 .audio-start-header {
   display: flex;
   justify-content: space-between;
-  align-items: baseline;
-  gap: 12px;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
 }
 
 .audio-start-label {
@@ -1216,14 +1217,16 @@ body {
 .audio-trim-panel {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 10px;
   margin-top: 8px;
 }
 
-.audio-trim-player {
-  width: 100%;
-  height: 36px;
-  border-radius: 6px;
+.audio-trim-audio-hidden {
+  position: absolute;
+  width: 0;
+  height: 0;
+  opacity: 0;
+  pointer-events: none;
 }
 
 .audio-trim-timeline {
@@ -1234,7 +1237,7 @@ body {
 
 .audio-trim-timeline-track {
   position: relative;
-  height: 8px;
+  height: 6px;
   border-radius: 4px;
   background: var(--border);
   overflow: hidden;
@@ -1249,17 +1252,14 @@ body {
   opacity: 0.85;
 }
 
-.audio-trim-timeline-labels {
-  display: flex;
-  justify-content: space-between;
-  font-size: 0.7rem;
-  color: var(--muted);
-  font-variant-numeric: tabular-nums;
-}
-
 .audio-trim-preview-btn {
   white-space: nowrap;
   flex-shrink: 0;
+  min-width: 5.5rem;
+}
+
+.audio-trim-preview-btn.is-playing {
+  accent-color: var(--accent);
 }
 
 .clip-source-picker {

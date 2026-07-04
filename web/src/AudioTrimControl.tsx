@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type Props = {
   fileName: string | null;
@@ -28,42 +28,65 @@ export function AudioTrimControl({
   onStartChange,
 }: Props) {
   const audioRef = useRef<HTMLAudioElement>(null);
+  const [isPlaying, setIsPlaying] = useState(false);
   const segmentEnd = startSeconds + clipDurationSeconds;
 
   const timeline = useMemo(() => {
-    const total = durationSeconds && durationSeconds > 0 ? durationSeconds : Math.max(maxStart + clipDurationSeconds, 1);
+    const total =
+      durationSeconds && durationSeconds > 0
+        ? durationSeconds
+        : Math.max(maxStart + clipDurationSeconds, 1);
     const startPct = Math.min(100, Math.max(0, (startSeconds / total) * 100));
     const widthPct = Math.min(100 - startPct, (clipDurationSeconds / total) * 100);
     return { total, startPct, widthPct };
   }, [clipDurationSeconds, durationSeconds, maxStart, startSeconds]);
 
+  const stopPreview = useCallback(() => {
+    const el = audioRef.current;
+    if (!el) return;
+    el.pause();
+    el.currentTime = startSeconds;
+    setIsPlaying(false);
+  }, [startSeconds]);
+
   const playSegmentPreview = useCallback(() => {
     const el = audioRef.current;
     if (!el || !previewUrl) return;
+    if (isPlaying) {
+      stopPreview();
+      return;
+    }
     el.currentTime = startSeconds;
-    void el.play();
-  }, [previewUrl, startSeconds]);
+    void el.play().then(() => setIsPlaying(true)).catch(() => setIsPlaying(false));
+  }, [isPlaying, previewUrl, startSeconds, stopPreview]);
 
   useEffect(() => {
     const el = audioRef.current;
     if (!el) return;
+
     const onTimeUpdate = () => {
       if (el.currentTime >= segmentEnd - 0.05) {
         el.pause();
         el.currentTime = Math.min(segmentEnd, el.duration || segmentEnd);
+        setIsPlaying(false);
       }
     };
+    const onPause = () => setIsPlaying(false);
+    const onEnded = () => setIsPlaying(false);
+
     el.addEventListener("timeupdate", onTimeUpdate);
-    return () => el.removeEventListener("timeupdate", onTimeUpdate);
+    el.addEventListener("pause", onPause);
+    el.addEventListener("ended", onEnded);
+    return () => {
+      el.removeEventListener("timeupdate", onTimeUpdate);
+      el.removeEventListener("pause", onPause);
+      el.removeEventListener("ended", onEnded);
+    };
   }, [previewUrl, segmentEnd]);
 
   useEffect(() => {
-    const el = audioRef.current;
-    if (!el || !previewUrl) return;
-    if (el.currentTime < startSeconds || el.currentTime > segmentEnd) {
-      el.currentTime = startSeconds;
-    }
-  }, [previewUrl, segmentEnd, startSeconds]);
+    stopPreview();
+  }, [previewUrl, startSeconds, stopPreview]);
 
   return (
     <div className="audio-trim-panel">
@@ -84,41 +107,38 @@ export function AudioTrimControl({
 
       {previewUrl && (
         <>
-          <audio
-            ref={audioRef}
-            className="audio-trim-player"
-            controls
-            preload="metadata"
-            src={previewUrl}
-          />
-
-          <div className="audio-trim-timeline" aria-hidden={!durationSeconds}>
-            <div className="audio-trim-timeline-track">
-              <div
-                className="audio-trim-timeline-segment"
-                style={{
-                  left: `${timeline.startPct}%`,
-                  width: `${Math.max(timeline.widthPct, 0.5)}%`,
-                }}
-              />
-            </div>
-            <div className="audio-trim-timeline-labels">
-              <span>0s</span>
-              <span>
-                Segment {startSeconds.toFixed(1)}s → {segmentEnd.toFixed(1)}s
-              </span>
-              <span>{timeline.total.toFixed(0)}s</span>
-            </div>
-          </div>
+          <audio ref={audioRef} className="audio-trim-audio-hidden" preload="metadata" src={previewUrl} />
 
           <div className="audio-start-control">
             <div className="audio-start-header">
               <span className="audio-start-label">Audio start</span>
               <span className="audio-start-value">
-                {startSeconds.toFixed(1)}s
-                {durationSeconds ? ` / ${Math.floor(durationSeconds)}s` : ""}
+                {startSeconds.toFixed(1)}s → {segmentEnd.toFixed(1)}s
+                {durationSeconds ? ` · ${Math.floor(durationSeconds)}s total` : ""}
               </span>
+              <button
+                type="button"
+                className={`btn-secondary audio-trim-preview-btn${isPlaying ? " is-playing" : ""}`}
+                disabled={disabled}
+                aria-pressed={isPlaying}
+                onClick={playSegmentPreview}
+              >
+                {isPlaying ? "Stop" : "Preview"}
+              </button>
             </div>
+
+            <div className="audio-trim-timeline" aria-hidden={!durationSeconds}>
+              <div className="audio-trim-timeline-track">
+                <div
+                  className="audio-trim-timeline-segment"
+                  style={{
+                    left: `${timeline.startPct}%`,
+                    width: `${Math.max(timeline.widthPct, 0.5)}%`,
+                  }}
+                />
+              </div>
+            </div>
+
             <input
               type="range"
               className="audio-start-slider"
@@ -143,20 +163,10 @@ export function AudioTrimControl({
                   onStartChange(Math.min(maxStart, Math.max(0, Number(e.target.value) || 0)))
                 }
               />
-              <button
-                type="button"
-                className="btn-secondary audio-trim-preview-btn"
-                disabled={disabled}
-                onClick={playSegmentPreview}
-              >
-                Preview segment
-              </button>
+              <span className="audio-start-hint">
+                {clipDurationSeconds.toFixed(1)}s clip · local preview only until generate
+              </span>
             </div>
-            <p className="audio-start-hint">
-              Preview plays locally in your browser — nothing is uploaded until you generate.
-              The highlighted window matches this clip&apos;s {clipDurationSeconds.toFixed(1)}s
-              duration.
-            </p>
             {startSeconds > 0 && !trimAvailable && (
               <p className="hint hint-inline">
                 Audio start requires PyAV on the server (pip install av).
