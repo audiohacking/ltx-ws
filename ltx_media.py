@@ -45,6 +45,38 @@ def _pyav_frame_rate(fps: float | int | Fraction) -> Fraction:
     return Fraction(round(fps_f * 1000), 1000).limit_denominator(1001)
 
 
+def _add_remux_stream(
+    out_container: Any,
+    in_stream: Any,
+) -> Any:
+    """Create an output stream for remuxing compressed packets from ``in_stream``."""
+    add_from_template = getattr(out_container, "add_stream_from_template", None)
+    if callable(add_from_template):
+        return add_from_template(in_stream)
+    try:
+        return out_container.add_stream(template=in_stream)
+    except TypeError as exc:
+        raise RuntimeError(
+            "PyAV remux requires add_stream_from_template (upgrade: pip install 'av>=12')"
+        ) from exc
+
+
+def _media_time_seconds(obj: Any, stream: Any | None = None) -> float | None:
+    """Best-effort timestamp in seconds for PyAV packets/frames across versions."""
+    t = getattr(obj, "time", None)
+    if t is not None:
+        return float(t)
+    pts = getattr(obj, "pts", None)
+    if pts is None:
+        return None
+    if stream is not None and stream.time_base is not None:
+        return float(pts * stream.time_base)
+    time_base = getattr(obj, "time_base", None)
+    if time_base is not None:
+        return float(pts * time_base)
+    return None
+
+
 def media_available() -> bool:
     """True when PyAV is importable."""
     return _AV_AVAILABLE
@@ -321,11 +353,11 @@ def _concat_videos_copy(paths: list[Path], output: Path) -> Path:
                 in_audio = in_container.streams.audio[0] if in_container.streams.audio else None
 
                 if out_video is None:
-                    out_video = out_container.add_stream(template=in_video)
+                    out_video = _add_remux_stream(out_container, in_video)
                     if in_audio is not None:
-                        out_audio = out_container.add_stream(template=in_audio)
+                        out_audio = _add_remux_stream(out_container, in_audio)
                 elif in_audio is not None and out_audio is None:
-                    out_audio = out_container.add_stream(template=in_audio)
+                    out_audio = _add_remux_stream(out_container, in_audio)
 
                 last_v: av.packet.Packet | None = None
                 for packet in in_container.demux(in_video):
@@ -419,19 +451,21 @@ def mux_audio_into_video(
         a_in = ain.streams.audio[0]
 
         with av.open(str(output_path), "w") as out:
-            v_out = out.add_stream(template=v_in)
+            v_out = _add_remux_stream(out, v_in)
             a_out = out.add_stream("aac", rate=AUDIO_OUTPUT_RATE, layout=AUDIO_OUTPUT_LAYOUT)
 
             for packet in vin.demux(v_in):
                 if packet.dts is None and packet.pts is None:
                     continue
-                if packet.pts is not None and packet.time is not None and packet.time > duration_s:
+                packet_time = _media_time_seconds(packet, v_in)
+                if packet_time is not None and packet_time > duration_s:
                     break
                 packet.stream = v_out
                 out.mux(packet)
 
             for frame in ain.decode(a_in):
-                if frame.time is not None and frame.time > duration_s:
+                frame_time = _media_time_seconds(frame, a_in)
+                if frame_time is not None and frame_time > duration_s:
                     break
                 for resampled in resampler.resample(frame):
                     for packet in a_out.encode(resampled):
