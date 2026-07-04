@@ -55,7 +55,7 @@ cd web && npm install && npm run build && cd ..
 
 For gated Hugging Face models, set [`HF_TOKEN`](https://huggingface.co/docs/huggingface_hub/package_reference/environment_variables) or run `huggingface-cli login`.
 
-Classic **venv + pip**: use `python3.12 -m venv .venv`, `pip install -r requirements.txt`, and the same two `ltx-2-mlx` package lines above. For tests: `pip install -r requirements-dev.txt`.
+Classic **venv + pip**: use `python3.12 -m venv .venv`, `pip install -r requirements.txt`, and the same two `ltx-2-mlx` package lines above.
 
 ---
 
