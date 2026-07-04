@@ -46,8 +46,8 @@ cd ltx-ws
 uv venv --python 3.12 --seed && source .venv/bin/activate
 uv pip install -r requirements.txt
 uv pip install \
-  "ltx-core-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@v0.14.12#subdirectory=packages/ltx-core-mlx" \
-  "ltx-pipelines-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@v0.14.12#subdirectory=packages/ltx-pipelines-mlx"
+  "ltx-core-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@v0.14.15#subdirectory=packages/ltx-core-mlx" \
+  "ltx-pipelines-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@v0.14.15#subdirectory=packages/ltx-pipelines-mlx"
 
 # Web UI (first time, or after editing web/)
 cd web && npm install && npm run build && cd ..

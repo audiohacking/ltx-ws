@@ -32,7 +32,7 @@ from urllib.request import url2pathname, urlopen
 log = logging.getLogger("fvserver")
 
 LTX2_SPATIAL_ALIGN = 32
-LTX2_MLX_GIT_TAG = "v0.14.12"
+LTX2_MLX_GIT_TAG = "v0.14.15"
 
 CHAIN_METHOD_AUTOCONTINUE = "autocontinue"
 CHAIN_METHOD_NATIVE_EXTEND = "native_extend"
@@ -127,6 +127,48 @@ def _patch_load_audio_pyav_only() -> None:
         for mod in sys.modules.values():
             if mod is not None and getattr(mod, "load_audio", None) is stale:
                 mod.load_audio = load_audio_for_inference
+
+
+def _patch_ltx_pipelines_compat(*, default_fps: float = 24.0) -> None:
+    """Default ``frame_rate`` for ``combined_image_conditionings`` (a2v+i2v on older pipelines)."""
+    import sys
+
+    try:
+        from ltx_pipelines_mlx.utils import _orchestration as orch
+    except ImportError:
+        return
+    if getattr(orch, "_ltx_ws_frame_rate_patched", False):
+        return
+
+    original = orch.combined_image_conditionings
+    frame_rate_param = inspect.signature(original).parameters.get("frame_rate")
+    if frame_rate_param is None or frame_rate_param.default is not inspect.Parameter.empty:
+        return
+
+    def combined_image_conditionings(
+        images,
+        *,
+        enc_h: int,
+        enc_w: int,
+        spatial_dims: tuple[int, int, int],
+        video_encoder,
+        frame_rate: float = default_fps,
+    ):
+        return original(
+            images,
+            enc_h=enc_h,
+            enc_w=enc_w,
+            spatial_dims=spatial_dims,
+            video_encoder=video_encoder,
+            frame_rate=frame_rate,
+        )
+
+    combined_image_conditionings.__name__ = getattr(original, "__name__", "combined_image_conditionings")
+    orch.combined_image_conditionings = combined_image_conditionings
+    for mod in sys.modules.values():
+        if mod is not None and getattr(mod, "combined_image_conditionings", None) is original:
+            mod.combined_image_conditionings = combined_image_conditionings
+    orch._ltx_ws_frame_rate_patched = True
 
 
 def looks_like_hf_repo_id(model: str) -> bool:
@@ -1133,6 +1175,7 @@ class LocalVideoGenerator:
 
     def load(self) -> None:
         _patch_load_audio_pyav_only()
+        _patch_ltx_pipelines_compat(default_fps=self.fps)
         if self._model_path is not None:
             return
         try:
@@ -1222,6 +1265,7 @@ class LocalVideoGenerator:
 
     def _get_pipe(self, key: str, *, pipe_kwargs: dict[str, Any] | None = None) -> Any:
         _patch_load_audio_pyav_only()
+        _patch_ltx_pipelines_compat(default_fps=self.fps)
         if not pipe_kwargs and key in self._pipes:
             return self._pipes[key]
         self.load()
@@ -2004,3 +2048,4 @@ class LocalVideoGenerator:
 
 # Patch before any ltx-pipelines import binds ffmpeg load_audio.
 _patch_load_audio_pyav_only()
+_patch_ltx_pipelines_compat()
