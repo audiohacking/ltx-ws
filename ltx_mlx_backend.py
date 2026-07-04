@@ -124,7 +124,7 @@ def _patch_load_audio_pyav_only() -> None:
     audio_mod.load_audio = load_audio_for_inference
 
     if stale is not None:
-        for mod in sys.modules.values():
+        for mod in list(sys.modules.values()):
             if mod is not None and getattr(mod, "load_audio", None) is stale:
                 mod.load_audio = load_audio_for_inference
 
@@ -165,7 +165,7 @@ def _patch_ltx_pipelines_compat(*, default_fps: float = 24.0) -> None:
 
     combined_image_conditionings.__name__ = getattr(original, "__name__", "combined_image_conditionings")
     orch.combined_image_conditionings = combined_image_conditionings
-    for mod in sys.modules.values():
+    for mod in list(sys.modules.values()):
         if mod is not None and getattr(mod, "combined_image_conditionings", None) is original:
             mod.combined_image_conditionings = combined_image_conditionings
     orch._ltx_ws_frame_rate_patched = True
@@ -202,7 +202,7 @@ def _patch_video_decode_pyav_only() -> None:
         )
 
     vv_mod.VideoDecoder.decode_and_stream = decode_and_stream
-    for mod in sys.modules.values():
+    for mod in list(sys.modules.values()):
         if mod is not None and getattr(mod, "VideoDecoder", None) is vv_mod.VideoDecoder:
             mod.VideoDecoder.decode_and_stream = decode_and_stream
         bound = getattr(mod, "decode_and_stream", None) if mod is not None else None
@@ -233,7 +233,7 @@ def _patch_media_io_pyav_only() -> None:
 
     orig_encode = media_mod._ltx_ws_orig_encode
     orig_decode = media_mod._ltx_ws_orig_decode
-    for mod in sys.modules.values():
+    for mod in list(sys.modules.values()):
         if mod is None:
             continue
         bound_encode = getattr(mod, "encode_single_frame", None)

@@ -1142,7 +1142,7 @@ class AppState:
             except OSError as exc:
                 log.warning("Could not delete clip file %s: %s", path, exc)
         del self.clips[clip_id]
-        for run in self.runs.values():
+        for run in list(self.runs.values()):
             if clip_id in run.clip_ids:
                 run.clip_ids = [cid for cid in run.clip_ids if cid != clip_id]
         return True
@@ -1950,10 +1950,14 @@ async def _finish_autoconcat(
         state.clips.pop(clip_id, None)
     merged_id = str(uuid.uuid4())
     max_idx = max(
-        (c.clip_index for c in state.clips.values() if c.chain_id == run.chain_id),
+        (
+            c.clip_index
+            for c in list(state.clips.values())
+            if c.chain_id == run.chain_id
+        ),
         default=-1,
     )
-    for c in state.clips.values():
+    for c in list(state.clips.values()):
         if c.chain_id == run.chain_id and c.label in ("CURRENT", "MERGED"):
             c.label = "EDIT"
     state.clips[merged_id] = ClipRecord(
@@ -2156,7 +2160,7 @@ async def _execute_run_embedded(state: AppState, run_id: str) -> None:
                     if _should_stream_clip_video(run, i, total_clips)
                     else ""
                 )
-                for c in state.clips.values():
+                for c in list(state.clips.values()):
                     if c.chain_id == run.chain_id and c.label == "CURRENT":
                         c.label = "EDIT"
                 clip.label = "CURRENT"
@@ -2361,7 +2365,7 @@ async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
                     if _should_stream_clip_video(run, i, total_clips)
                     else ""
                 )
-                for c in state.clips.values():
+                for c in list(state.clips.values()):
                     if c.chain_id == run.chain_id and c.label == "CURRENT":
                         c.label = "EDIT"
                 clip.label = "CURRENT"
