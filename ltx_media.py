@@ -33,6 +33,18 @@ AUDIO_OUTPUT_FORMAT = "s16"
 _MIN_WAV_BYTES = 44
 
 
+def _pyav_frame_rate(fps: float | int | Fraction) -> Fraction:
+    """Coerce fps to ``Fraction`` for PyAV ``add_stream`` (plain float breaks)."""
+    if isinstance(fps, Fraction):
+        return fps
+    if isinstance(fps, int):
+        return Fraction(fps, 1)
+    fps_f = float(fps)
+    if fps_f == int(fps_f):
+        return Fraction(int(fps_f), 1)
+    return Fraction(round(fps_f * 1000), 1000).limit_denominator(1001)
+
+
 def media_available() -> bool:
     """True when PyAV is importable."""
     return _AV_AVAILABLE
@@ -358,7 +370,9 @@ def _concat_videos_reencode_h265(paths: list[Path], output: Path) -> Path:
         height = in_v.codec_context.height
 
     with av.open(str(output), "w") as out_container:
-        out_v = out_container.add_stream("libx265", rate=rate, width=width, height=height)
+        out_v = out_container.add_stream(
+            "libx265", rate=_pyav_frame_rate(rate), width=width, height=height
+        )
         out_v.options = {"crf": "28", "preset": "faster"}
         for path in paths:
             with av.open(str(path)) as in_container:
@@ -449,6 +463,7 @@ def stream_decoder_latent_to_mp4(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     frame_rate = float(frame_rate)
+    fps_frac = _pyav_frame_rate(frame_rate)
     tiling = _compute_decode_tiling(latent.shape, frame_rate=frame_rate)
     _, _, _f_lat, h_lat, w_lat = latent.shape
     out_h = int(h_lat * 32)
@@ -467,10 +482,10 @@ def stream_decoder_latent_to_mp4(
 
     frames_written = 0
     with av.open(str(video_tmp), "w") as container:
-        stream = container.add_stream("libx264", rate=frame_rate, width=out_w, height=out_h)
+        stream = container.add_stream("libx264", rate=fps_frac, width=out_w, height=out_h)
         stream.pix_fmt = "yuv420p"
         stream.options = {"crf": "18"}
-        stream.time_base = Fraction(1, int(round(frame_rate)))
+        stream.time_base = Fraction(fps_frac.denominator, fps_frac.numerator)
 
         for chunk in decoder.tiled_decode(latent, tiling):
             num_frames = int(chunk.shape[2])
