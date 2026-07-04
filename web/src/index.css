@@ -764,6 +764,28 @@ body {
   min-width: 120px;
 }
 
+.options-checks label.opt-audio-start {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+.options-checks label.opt-audio-start input {
+  width: 5.5rem;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 0.85rem;
+}
+
+.options-checks label.opt-audio-start input:disabled {
+  opacity: 0.5;
+}
+
 .check {
   flex-direction: row !important;
   align-items: center;
@@ -1116,19 +1138,6 @@ body {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 12px;
-}
-
-.media-panel label.opt-inline {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  font-size: 0.78rem;
-  color: var(--muted);
-  max-width: 12rem;
-}
-
-.media-panel label.opt-inline input {
-  width: 100%;
 }
 
 @media (max-width: 640px) {

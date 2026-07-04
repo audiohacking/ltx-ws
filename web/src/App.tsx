@@ -1851,6 +1851,25 @@ export default function App() {
                   />
                   Autoconcat
                 </label>
+                {mode === "a2v" && (
+                  <label className="opt-audio-start">
+                    Audio start (s)
+                    <input
+                      type="number"
+                      min={0}
+                      step={0.1}
+                      value={audioStartSeconds}
+                      disabled={!audioPath}
+                      title="Skip this many seconds into the source audio before generation"
+                      onChange={(e) =>
+                        setAudioStartSeconds(Math.max(0, Number(e.target.value) || 0))
+                      }
+                    />
+                  </label>
+                )}
+                {mode === "a2v" && audioStartSeconds > 0 && !config?.ffmpeg_available && (
+                  <p className="hint hint-inline">Audio start requires ffmpeg.</p>
+                )}
                 <label className="opt-profile">
                   Profile
                   <select
@@ -1940,22 +1959,6 @@ export default function App() {
                           </span>
                         </label>
                       </div>
-                      <label className="opt-inline">
-                        Audio start (seconds)
-                        <input
-                          type="number"
-                          min={0}
-                          step={0.1}
-                          value={audioStartSeconds}
-                          disabled={!audioPath}
-                          onChange={(e) =>
-                            setAudioStartSeconds(Math.max(0, Number(e.target.value) || 0))
-                          }
-                        />
-                      </label>
-                      {audioStartSeconds > 0 && !config?.ffmpeg_available && (
-                        <p className="hint hint-inline">Requires ffmpeg.</p>
-                      )}
                       {showChainedImageHint && chainMethod === "autocontinue" && (
                         <p className="hint">
                           With autocontinue / audiocontinue, the start image is used for
