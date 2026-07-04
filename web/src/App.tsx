@@ -1493,12 +1493,8 @@ export default function App() {
   }, [prompt, fitPromptHeight]);
 
   return (
-    <div className="app">
-      <header className="header">
-        <div className="brand">
-          <span className="brand-mark">LTX-WS</span>
-          <span className="brand-sub">Videofentanyl</span>
-        </div>
+    <>
+      <div className="page-toolbar">
         <div className="header-status">
           <button
             type="button"
@@ -1514,7 +1510,7 @@ export default function App() {
           />
           {serverOk ? "Server connected" : "Server offline"}
         </div>
-      </header>
+      </div>
 
       <div className="app-body">
         <div className="app-main">
@@ -2315,6 +2311,6 @@ export default function App() {
           </div>
         </aside>
       </div>
-    </div>
+    </>
   );
 }

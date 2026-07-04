@@ -399,6 +399,7 @@ Three ~5s segments, chained and merged:
 - **RAM:** longer clips / higher resolution need more unified memory; q8/q4 weights help on smaller Macs.
 - **No GPT rewrite** on this MLX server—optimize prompts yourself.
 - **ltx-2-mlx** version pinned in repo (see `requirements.txt` / `ltx_mlx_backend.py`); install matching MLX packages after pulls.
+- **Training (optional):** Web UI `/train` — install `ltx-trainer-mlx` (see `README.md` / `TRAIN.md`). Do not run training and generation concurrently (MLX lock). Prefer `ltx_generate_*` for inference after registering a trained LoRA.
 - **Weights:** **MLX only** — `dgrauet/ltx-2.3-mlx*` repos or local MLX snapshots; **never** `Lightricks/LTX-2.3` or other standard LTX checkpoints (see [MLX model weights only](#mlx-model-weights-only-mandatory)).
 
 ---

@@ -112,3 +112,51 @@ export interface ProgressState {
   pct?: number;
   eta_s?: number;
 }
+
+export interface TrainPreset {
+  id: string;
+  label: string;
+  description: string;
+  ram_hint: string;
+  with_audio: boolean;
+  low_ram_default: boolean;
+}
+
+export interface TrainHealth {
+  ok: boolean;
+  trainer_installed: boolean;
+  ffmpeg_available: boolean;
+  install_hint?: string | null;
+  presets: TrainPreset[];
+  training_active?: boolean;
+  generation_active?: boolean;
+}
+
+export interface TrainValidationClip {
+  step: number;
+  filename: string;
+  url: string;
+}
+
+export interface TrainJob {
+  id: string;
+  name: string;
+  preset: string;
+  status: string;
+  phase?: string;
+  created_at: string;
+  step?: number;
+  total_steps?: number;
+  loss?: number;
+  lr?: number;
+  eta_s?: number;
+  error?: string | null;
+  artifact_url?: string | null;
+  artifact_name?: string | null;
+  registered_lora_id?: string | null;
+  validation_clips?: TrainValidationClip[];
+  latest_checkpoint?: string | null;
+  latest_checkpoint_step?: number | null;
+  can_resume_from_checkpoint?: boolean;
+  resume_from_step?: number;
+}

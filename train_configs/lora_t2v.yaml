@@ -1,0 +1,56 @@
+# Hyperparameters only — paths are injected at runtime:
+#   model_path     → local dir / $VIDEOFENTANYL_MODELS / HF hub cache (resolve_mlx_weights_directory)
+#   preprocessed   → <web_outputs>/train/<job_id>/preprocessed
+#   output_dir     → <web_outputs>/train/<job_id>/outputs
+model:
+  text_encoder_path: mlx-community/gemma-3-12b-it-4bit
+  training_mode: lora
+
+lora:
+  rank: 64
+  alpha: 64
+  dropout: 0.0
+  target_modules:
+    - to_k
+    - to_q
+    - to_v
+    - to_out.0
+
+optimization:
+  learning_rate: 5.0e-4
+  steps: 2000
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  enable_gradient_checkpointing: false
+  scheduler_type: linear
+  scheduler_params:
+    start_factor: 1.0
+    end_factor: 0.1
+
+training_strategy:
+  name: text_to_video
+  generate_audio: false
+
+flow_matching:
+  timestep_sampling_mode: shifted_logit_normal
+
+validation:
+  prompts:
+    - "a cinematic shot of a cat walking through a sunlit garden"
+  video_dims: [704, 480, 25]
+  frame_rate: 24.0
+  inference_steps: 8
+  interval: 500
+  guidance_scale: 4.0
+  stg_scale: 0.0
+  seed: 42
+  generate_audio: false
+  skip_initial_validation: true
+
+checkpoints:
+  interval: 500
+  keep_last_n: 3
+
+seed: 42
