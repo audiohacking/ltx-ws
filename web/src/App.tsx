@@ -949,6 +949,8 @@ export default function App() {
 
   const needsImageUpload = mode === "i2v" || mode === "keyframe";
   const isA2v = mode === "a2v";
+  const audioTrimAvailable =
+    config?.audio_trim_available ?? config?.ffmpeg_available ?? false;
   const needsEndImageUpload = mode === "keyframe";
   const needsVideoUpload = mode === "retake" || mode === "extend" || mode === "lipdub";
   const showStartImageOptional = mode === "generate";
@@ -1400,7 +1402,7 @@ export default function App() {
     const continuing = willContinueChain;
     if (mode === "i2v" && !imagePath && !continuing) return false;
     if (mode === "a2v" && !audioPath) return false;
-    if (mode === "a2v" && audioStartSeconds > 0 && !config?.ffmpeg_available) return false;
+    if (mode === "a2v" && audioStartSeconds > 0 && !audioTrimAvailable) return false;
     if (audiocontinue && !config?.ffmpeg_available) return false;
     if ((mode === "retake" || mode === "extend" || mode === "lipdub") && !hasVideoSource) {
       return false;
@@ -1415,6 +1417,7 @@ export default function App() {
     audioPath,
     audiocontinue,
     clipMultiplier,
+    audioTrimAvailable,
     config?.ffmpeg_available,
     videoPath,
     sourceClipId,
@@ -2018,8 +2021,10 @@ export default function App() {
                               : "Select source audio above to enable."}
                           </span>
                         </div>
-                        {audioStartSeconds > 0 && !config?.ffmpeg_available && (
-                          <p className="hint hint-inline">Audio start requires ffmpeg.</p>
+                        {audioStartSeconds > 0 && !audioTrimAvailable && (
+                          <p className="hint hint-inline">
+                            Audio start requires ffmpeg (working install) or sox.
+                          </p>
                         )}
                       </div>
                       {showChainedImageHint && chainMethod === "autocontinue" && (

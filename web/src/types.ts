@@ -48,6 +48,7 @@ export interface Config {
   default_lora_preset_id?: string;
   preferred_lora_preset_ids?: string[];
   ffmpeg_available?: boolean;
+  audio_trim_available?: boolean;
 }
 
 export interface Clip {
