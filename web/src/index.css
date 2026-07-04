@@ -1145,6 +1145,123 @@ body {
   color: var(--muted);
 }
 
+.audio-start-control {
+  margin-top: 4px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.audio-start-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.audio-start-label {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.audio-start-value {
+  font-size: 0.8rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.audio-start-slider {
+  width: 100%;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.audio-start-slider:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.audio-start-input-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.audio-start-input-row input[type="number"] {
+  width: 5.5rem;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 0.85rem;
+}
+
+.audio-start-input-row input[type="number"]:disabled {
+  opacity: 0.5;
+}
+
+.audio-start-hint {
+  font-size: 0.75rem;
+  color: var(--muted);
+  line-height: 1.35;
+}
+
+.audio-trim-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 8px;
+}
+
+.audio-trim-audio-hidden {
+  position: absolute;
+  width: 0;
+  height: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.audio-trim-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.audio-trim-timeline-track {
+  position: relative;
+  height: 6px;
+  border-radius: 4px;
+  background: var(--border);
+  overflow: hidden;
+}
+
+.audio-trim-timeline-segment {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  border-radius: 4px;
+  background: var(--accent);
+  opacity: 0.85;
+}
+
+.audio-trim-preview-btn {
+  white-space: nowrap;
+  flex-shrink: 0;
+  min-width: 5.5rem;
+}
+
+.audio-trim-preview-btn.is-playing {
+  accent-color: var(--accent);
+}
+
 .clip-source-picker {
   display: flex;
   flex-direction: column;

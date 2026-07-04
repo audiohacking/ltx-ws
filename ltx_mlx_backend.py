@@ -19,7 +19,7 @@ import random
 import re
 import shutil
 import subprocess
-import tempfile
+from ltx_paths import mk_scratch_dir, mk_scratch_file
 import threading
 import time
 from contextlib import contextmanager
@@ -32,7 +32,7 @@ from urllib.request import url2pathname, urlopen
 log = logging.getLogger("fvserver")
 
 LTX2_SPATIAL_ALIGN = 32
-LTX2_MLX_GIT_TAG = "v0.14.12"
+LTX2_MLX_GIT_TAG = "v0.14.15"
 
 CHAIN_METHOD_AUTOCONTINUE = "autocontinue"
 CHAIN_METHOD_NATIVE_EXTEND = "native_extend"
@@ -100,6 +100,179 @@ class GenerationRequest:
     stage2_steps: int | None = None
     no_regen_audio: bool = False
     reference_strength: float | None = None
+    audio_start_seconds: float | None = None
+
+
+# Pipelines that bind ``load_audio`` at import time (``from … import load_audio``).
+_LOAD_AUDIO_STALE_IMPORTERS = (
+    "ltx_pipelines_mlx.a2vid_two_stage",
+    "ltx_pipelines_mlx.retake",
+    "ltx_pipelines_mlx.lipdub",
+)
+
+
+def _module_dict_attr(mod: Any, attr: str) -> Any:
+    """Return a module-level attribute without triggering lazy ``__getattr__`` loaders."""
+    if mod is None:
+        return _MISSING
+    d = vars(mod)
+    if not isinstance(d, dict) or attr not in d:
+        return _MISSING
+    return d[attr]
+
+
+_MISSING = object()
+
+
+def _rebind_module_attr(
+    module_name: str,
+    attr: str,
+    value: Any,
+    *,
+    stale: Any,
+) -> None:
+    import sys
+
+    mod = sys.modules.get(module_name)
+    if mod is None:
+        return
+    current = _module_dict_attr(mod, attr)
+    if current is _MISSING:
+        return
+    if current is stale or current is value:
+        if current is not value:
+            setattr(mod, attr, value)
+
+
+def _patch_load_audio_pyav_only() -> None:
+    """Replace ltx-core-mlx ffmpeg load_audio with PyAV (pip package ``av``)."""
+    from ltx_media import load_audio_for_inference
+
+    try:
+        import ltx_core_mlx.utils.audio as audio_mod
+    except ImportError:
+        return
+
+    stale = getattr(audio_mod, "_ltx_ws_original_load_audio", None)
+    if stale is None:
+        current = audio_mod.load_audio
+        if current is not load_audio_for_inference:
+            audio_mod._ltx_ws_original_load_audio = current
+            stale = current
+
+    audio_mod.load_audio = load_audio_for_inference
+
+    if stale is not None:
+        for module_name in _LOAD_AUDIO_STALE_IMPORTERS:
+            _rebind_module_attr(
+                module_name,
+                "load_audio",
+                load_audio_for_inference,
+                stale=stale,
+            )
+
+
+def _patch_ltx_pipelines_compat(*, default_fps: float = 24.0) -> None:
+    """Default ``frame_rate`` for ``combined_image_conditionings`` (a2v+i2v on older pipelines)."""
+    try:
+        from ltx_pipelines_mlx.utils import _orchestration as orch
+    except ImportError:
+        return
+    if getattr(orch, "_ltx_ws_frame_rate_patched", False):
+        return
+
+    original = orch.combined_image_conditionings
+    frame_rate_param = inspect.signature(original).parameters.get("frame_rate")
+    if frame_rate_param is None or frame_rate_param.default is not inspect.Parameter.empty:
+        return
+
+    def combined_image_conditionings(
+        images,
+        *,
+        enc_h: int,
+        enc_w: int,
+        spatial_dims: tuple[int, int, int],
+        video_encoder,
+        frame_rate: float = default_fps,
+    ):
+        return original(
+            images,
+            enc_h=enc_h,
+            enc_w=enc_w,
+            spatial_dims=spatial_dims,
+            video_encoder=video_encoder,
+            frame_rate=frame_rate,
+        )
+
+    combined_image_conditionings.__name__ = getattr(original, "__name__", "combined_image_conditionings")
+    orch.combined_image_conditionings = combined_image_conditionings
+    orch._ltx_ws_frame_rate_patched = True
+
+
+def _patch_video_decode_pyav_only() -> None:
+    """Replace upstream ffmpeg stdin pipe video encode with PyAV."""
+    try:
+        from ltx_core_mlx.model.video_vae import video_vae as vv_mod
+    except ImportError:
+        return
+    if getattr(vv_mod, "_ltx_ws_pyav_decode_patched", False):
+        return
+
+    from ltx_media import stream_decoder_latent_to_mp4
+
+    def decode_and_stream(
+        self,
+        latent,
+        output_path: str,
+        frame_rate: float = 24.0,
+        audio_path: str | None = None,
+    ) -> None:
+        stream_decoder_latent_to_mp4(
+            self,
+            latent,
+            output_path,
+            frame_rate=frame_rate,
+            audio_path=audio_path,
+        )
+
+    vv_mod.VideoDecoder.decode_and_stream = decode_and_stream
+    vv_mod._ltx_ws_pyav_decode_patched = True
+
+
+def _patch_media_io_pyav_only() -> None:
+    """Replace ltx-pipelines ffmpeg I2V image preprocess with PyAV libx264."""
+    try:
+        from ltx_pipelines_mlx.utils import media_io as media_mod
+    except ImportError:
+        return
+
+    from ltx_media import decode_single_frame as pyav_decode_single_frame
+    from ltx_media import encode_single_frame as pyav_encode_single_frame
+
+    first = not getattr(media_mod, "_ltx_ws_pyav_media_patched", False)
+    if first:
+        media_mod._ltx_ws_orig_encode = media_mod.encode_single_frame
+        media_mod._ltx_ws_orig_decode = media_mod.decode_single_frame
+
+    media_mod.encode_single_frame = pyav_encode_single_frame
+    media_mod.decode_single_frame = pyav_decode_single_frame
+
+    media_mod._ltx_ws_pyav_media_patched = True
+    if media_mod.encode_single_frame.__module__ != "ltx_media":
+        raise RuntimeError(
+            "Failed to replace ltx_pipelines_mlx image encode with PyAV "
+            "(encode_single_frame still bound to ffmpeg)"
+        )
+    if first:
+        log.debug("PyAV media_io patch applied (I2V image preprocess)")
+
+
+def _apply_ltx_mlx_patches(*, default_fps: float = 24.0) -> None:
+    """Apply all ltx-ws runtime patches (PyAV-only media, pipeline compat)."""
+    _patch_media_io_pyav_only()
+    _patch_load_audio_pyav_only()
+    _patch_ltx_pipelines_compat(default_fps=default_fps)
+    _patch_video_decode_pyav_only()
 
 
 def looks_like_hf_repo_id(model: str) -> bool:
@@ -388,7 +561,7 @@ def _decode_initial_image_dict(image_data: dict) -> str:
     if ext == ".jpe":
         ext = ".jpg"
 
-    fd, path = tempfile.mkstemp(suffix=ext, prefix="fvserver_img_")
+    fd, path = mk_scratch_file(prefix="fvserver_img_", suffix=ext)
     with os.fdopen(fd, "wb") as f:
         f.write(base64.b64decode(encoded))
     return path
@@ -412,7 +585,7 @@ def _download_remote_to_temp(
         raise RuntimeError(
             f"Remote media exceeds {max_bytes // (1024 * 1024)} MiB limit"
         )
-    fd, path = tempfile.mkstemp(prefix=prefix, suffix=suffix_hint)
+    fd, path = mk_scratch_file(prefix=prefix, suffix=suffix_hint)
     with os.fdopen(fd, "wb") as f:
         f.write(payload)
     return path
@@ -627,7 +800,7 @@ def _decode_media_input(
         ext = name_suffix or mimetypes.guess_extension(mime) or default_suffix
         if ext == ".jpe":
             ext = ".jpg"
-        fd, path = tempfile.mkstemp(prefix=temp_prefix, suffix=ext)
+        fd, path = mk_scratch_file(prefix=temp_prefix, suffix=ext)
         with os.fdopen(fd, "wb") as f:
             f.write(base64.b64decode(encoded))
         return path, path
@@ -678,23 +851,43 @@ def _sync_pipeline_load_flag(pipe: Any) -> None:
         pipe._loaded = False
 
 
+def _free_pipeline_blocks(pipe: Any) -> None:
+    """Drop per-job MLX weights held on a cached pipeline instance."""
+    if getattr(pipe, "dit", None) is not None:
+        pipe.dit = None
+    for block_name in (
+        "prompt_encoder",
+        "image_conditioner",
+        "audio_conditioner",
+        "video_decoder_block",
+        "audio_decoder_block",
+    ):
+        block = getattr(pipe, block_name, None)
+        if block is not None and hasattr(block, "free"):
+            try:
+                block.free()
+            except Exception as exc:
+                log.debug("Pipeline block free %s failed: %s", block_name, exc)
+    if hasattr(pipe, "vae_encoder"):
+        pipe.vae_encoder = None
+    _sync_pipeline_load_flag(pipe)
+
+
+def _mlx_aggressive_cleanup() -> None:
+    try:
+        from ltx_core_mlx.utils.memory import aggressive_cleanup
+
+        aggressive_cleanup()
+    except ImportError:
+        pass
+
+
 def _release_pipe_after_generation(pipe: Any) -> None:
-    """Reset per-request state on a cached pipeline instance.
-
-    Always clears request-scoped LoRA specs (``_pending_loras``) so the next job
-    does not inherit the previous clip's adapters.
-
-    When ``low_memory`` is off, leaves DiT / VAE encoder / decoders loaded so
-    back-to-back generations reuse warm weights and fused LoRAs.
-
-    When ``low_memory`` is on, upstream ``generate_and_save`` / decode paths
-    already free blocks between stages; we only reconcile ``_loaded`` if a
-    partial free left the flag set (which would skip ``load()`` and crash on
-    ``assert self.vae_encoder is not None`` on the next job).
-    """
+    """Reset per-request pipeline state and free MLX blocks between jobs."""
     if hasattr(pipe, "_pending_loras"):
         pipe._pending_loras = []
-    _sync_pipeline_load_flag(pipe)
+    _free_pipeline_blocks(pipe)
+    _mlx_aggressive_cleanup()
 
 
 def _unlink_fvserver_temp(path: str | None, marker: str) -> None:
@@ -707,7 +900,7 @@ def _unlink_fvserver_temp(path: str | None, marker: str) -> None:
 
 def _export_output_mp4(source_path: str) -> str:
     """Copy generation output to a standalone temp file (outside per-job workdirs)."""
-    fd, final_path = tempfile.mkstemp(prefix="fvserver_out_", suffix=".mp4")
+    fd, final_path = mk_scratch_file(prefix="fvserver_out_", suffix=".mp4")
     os.close(fd)
     shutil.copy2(source_path, final_path)
     return final_path
@@ -773,6 +966,8 @@ def _apply_optional_generate_kwargs(call_kwargs: dict[str, Any], req: Generation
         call_kwargs["no_regen_audio"] = True
     if req.reference_strength is not None:
         call_kwargs["reference_strength"] = float(req.reference_strength)
+    if req.audio_start_seconds is not None and float(req.audio_start_seconds) > 0:
+        call_kwargs["audio_start_time"] = float(req.audio_start_seconds)
 
 
 def _frame_rate_from_kwargs(kwargs: dict[str, Any], default: float) -> float:
@@ -943,38 +1138,11 @@ def _mux_audio_into_video(
     duration_s: float,
 ) -> None:
     """Mux an audio track into a silent video (a2v chain visual continuation)."""
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg:
-        raise RuntimeError(
-            "ffmpeg is required to mux audio into a2v autocontinue clips"
-        )
-    cmd = [
-        ffmpeg,
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-y",
-        "-i",
-        video_path,
-        "-i",
-        audio_path,
-        "-t",
-        f"{max(0.1, duration_s):.6f}",
-        "-map",
-        "0:v:0",
-        "-map",
-        "1:a:0",
-        "-c:v",
-        "copy",
-        "-c:a",
-        "aac",
-        "-shortest",
-        output_path,
-    ]
-    cp = subprocess.run(cmd, capture_output=True, text=True)
-    if cp.returncode != 0:
-        err = (cp.stderr or cp.stdout or "unknown ffmpeg error").strip()
-        raise RuntimeError(f"ffmpeg audio mux failed: {err}")
+    from ltx_media import media_available, mux_audio_into_video
+
+    if not media_available():
+        raise RuntimeError("PyAV is required to mux audio into a2v autocontinue clips")
+    mux_audio_into_video(video_path, audio_path, output_path, duration_s=duration_s)
 
 
 class _ModelProgressStore:
@@ -1178,6 +1346,7 @@ class LocalVideoGenerator:
         return resolve_mlx_weights_directory(self.model, self.model_dir)
 
     def load(self) -> None:
+        _apply_ltx_mlx_patches(default_fps=self.fps)
         if self._model_path is not None:
             return
         try:
@@ -1266,6 +1435,7 @@ class LocalVideoGenerator:
         log.info("MLX model path resolved ✓ %s", path)
 
     def _get_pipe(self, key: str, *, pipe_kwargs: dict[str, Any] | None = None) -> Any:
+        _apply_ltx_mlx_patches(default_fps=self.fps)
         if not pipe_kwargs and key in self._pipes:
             return self._pipes[key]
         self.load()
@@ -1335,6 +1505,14 @@ class LocalVideoGenerator:
 
     def model_progress_for_ws(self) -> dict[str, Any] | None:
         return self._model_progress.snapshot()
+
+    def cleanup_after_generation(self, pipe: Any | None = None) -> None:
+        """Clear progress state and MLX memory after each job (success or failure)."""
+        self._model_progress.clear()
+        if pipe is not None:
+            _release_pipe_after_generation(pipe)
+        else:
+            _mlx_aggressive_cleanup()
 
     def default_lora_count(self) -> int:
         if self._resolved_default_loras is not None:
@@ -1465,6 +1643,7 @@ class LocalVideoGenerator:
         stage2_steps: int | None = None,
         no_regen_audio: bool = False,
         reference_strength: float | None = None,
+        audio_start_seconds: float | None = None,
     ) -> str:
         self.clear_cancel()
         loop = asyncio.get_event_loop()
@@ -1500,6 +1679,7 @@ class LocalVideoGenerator:
                     stage2_steps=stage2_steps,
                     no_regen_audio=no_regen_audio,
                     reference_strength=reference_strength,
+                    audio_start_seconds=audio_start_seconds,
                 ),
             ),
         )
@@ -1591,7 +1771,7 @@ class LocalVideoGenerator:
         tmp_video_conditioning_cleanup: list[str] = []
         tmp_lora_cleanup: list[str] = []
         prefix = f"fv_{req.job_id[:8]}_" if req.job_id else "fvserver_work_"
-        tmpdir = tempfile.mkdtemp(prefix=prefix)
+        tmpdir = str(mk_scratch_dir(prefix=prefix))
         out_path = os.path.join(tmpdir, "output.mp4")
         last_pipe: Any | None = None
         media_cleanups: list[str] = []
@@ -1712,6 +1892,19 @@ class LocalVideoGenerator:
                     if mode == "a2v":
                         if not tmp_audio:
                             raise RuntimeError("a2v mode requires audio input")
+                        _apply_ltx_mlx_patches(default_fps=self.fps)
+                        from ltx_media import load_audio_for_inference
+
+                        audio_probe = load_audio_for_inference(
+                            tmp_audio,
+                            target_sample_rate=16000,
+                            start_time=float(req.audio_start_seconds or 0),
+                            max_duration=0.25,
+                        )
+                        if audio_probe is None:
+                            raise RuntimeError(
+                                f"Could not decode audio for a2v (PyAV): {tmp_audio}"
+                            )
                         video_duration_s = nf / float(self.fps)
                         if req.a2v_visual_i2v_continue and tmp_image:
                             log.info(
@@ -1998,6 +2191,12 @@ class LocalVideoGenerator:
                             )
             except BaseException as exc:
                 if not isinstance(exc, GenerationCancelledError):
+                    log.exception(
+                        "Generation failed (job %s, mode=%s): %s",
+                        req.job_id[:8] if req.job_id else "?",
+                        mode,
+                        exc,
+                    )
                     self._salvage_mp4_to_spill(
                         tmpdir, out_path, req.job_id, req.prompt, "ENCODE_FAIL"
                     )
@@ -2011,11 +2210,13 @@ class LocalVideoGenerator:
                 raise RuntimeError(
                     f"Generation completed but output file not found: {video_path}"
                 )
-            if last_pipe is not None:
-                _release_pipe_after_generation(last_pipe)
             return _export_output_mp4(video_path)
 
         finally:
+            if last_pipe is not None:
+                self.cleanup_after_generation(last_pipe)
+            else:
+                self.cleanup_after_generation()
             for tmp in media_cleanups:
                 _unlink_fvserver_temp(tmp, "fvserver_")
             for tmp in tmp_video_conditioning_cleanup:
@@ -2023,3 +2224,7 @@ class LocalVideoGenerator:
             for tmp in tmp_lora_cleanup:
                 _unlink_fvserver_temp(tmp, "fvserver_lora_")
             shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# Patch before any ltx-pipelines import binds ffmpeg media helpers.
+_apply_ltx_mlx_patches()

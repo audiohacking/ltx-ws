@@ -15,6 +15,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -26,6 +27,8 @@ from typing import Any, AsyncIterator, Callable, Optional
 
 from starlette.requests import Request
 from starlette.websockets import WebSocket
+
+from ltx_media import media_available, probe_audio_duration, trim_audio_to_temp
 
 REPO_ROOT = Path(__file__).resolve().parent
 log = logging.getLogger("web_ui")
@@ -341,6 +344,28 @@ def resolve_web_dist() -> Path:
     return REPO_ROOT / "web" / "dist"
 
 
+def web_dist_stale() -> bool:
+    """True when built assets are missing or older than web/src sources."""
+    dist = resolve_web_dist()
+    if not dist.is_dir():
+        return True
+    assets = dist / "assets"
+    js_files = list(assets.glob("index-*.js")) if assets.is_dir() else []
+    if not js_files:
+        return True
+    newest_js = max(js_files, key=lambda path: path.stat().st_mtime)
+    src_root = REPO_ROOT / "web" / "src"
+    if not src_root.is_dir():
+        return False
+    try:
+        newest_src = max(
+            path.stat().st_mtime for path in src_root.rglob("*") if path.is_file()
+        )
+    except ValueError:
+        return False
+    return newest_src > newest_js.stat().st_mtime
+
+
 def resolve_favicon_path() -> Path | None:
     """Locate favicon for embedded Web UI (built dist, then source public/)."""
     for candidate in (
@@ -570,10 +595,162 @@ def _delete_upload_paths(paths: list[Path]) -> None:
 
 
 def _cleanup_run_uploads(state: AppState, gen_body: dict[str, Any]) -> None:
+    """Delete upload-dir files from a finished run (session clear uses :meth:`clear_upload_dir`)."""
     paths = _upload_paths_from_body(gen_body, state.upload_dir)
     if paths:
         log.info("Web UI: cleaning %d upload file(s)", len(paths))
         _delete_upload_paths(paths)
+
+
+def clear_upload_dir(upload_dir: Path) -> int:
+    """Remove all files in the Web UI upload directory."""
+    deleted = 0
+    if not upload_dir.is_dir():
+        return deleted
+    for path in upload_dir.iterdir():
+        if not path.is_file():
+            continue
+        try:
+            path.unlink(missing_ok=True)
+            deleted += 1
+        except OSError as exc:
+            log.warning("Could not delete upload %s: %s", path, exc)
+    return deleted
+
+
+def _validate_request_media_paths(body: dict[str, Any]) -> None:
+    """Fail fast when the client references uploads that are no longer on disk."""
+    from fastapi import HTTPException
+
+    for key, label in (
+        ("audio_path", "Audio"),
+        ("image_path", "Image"),
+        ("end_image_path", "End image"),
+        ("video_path", "Video"),
+    ):
+        raw = body.get(key)
+        if not raw:
+            continue
+        path = Path(str(raw)).expanduser()
+        if not path.is_file():
+            raise HTTPException(
+                400,
+                f"{label} file not found: {raw}. Re-upload the file and try again.",
+            )
+
+
+def _clip_audio_duration_seconds(body: dict[str, Any]) -> float:
+    duration_s = body.get("duration_seconds")
+    if duration_s is not None:
+        return max(0.25, float(duration_s))
+    num_frames = body.get("num_frames")
+    if num_frames is not None:
+        return max(0.25, int(num_frames) / float(FPS))
+    return 5.0
+
+
+def _apply_audio_start_offset(body: dict[str, Any]) -> tuple[dict[str, Any], list[Path]]:
+    """Crop a2v/lipdub audio from ``audio_start_seconds`` before generation."""
+    temps: list[Path] = []
+    try:
+        start = float(body.get("audio_start_seconds") or 0)
+    except (TypeError, ValueError):
+        start = 0.0
+    if start <= 0:
+        return body, temps
+    audio_path = str(body.get("audio_path") or "").strip()
+    if not audio_path:
+        return body, temps
+    ui_mode = (body.get("mode") or "generate").strip().lower()
+    if ui_mode not in ("a2v", "lipdub"):
+        return body, temps
+    if not media_available():
+        raise ValueError("Audio start offset requires PyAV — install with: pip install av")
+
+    client_duration = body.get("audio_source_duration_seconds")
+    try:
+        client_duration_s = float(client_duration) if client_duration is not None else None
+        if client_duration_s is not None and client_duration_s <= 0:
+            client_duration_s = None
+    except (TypeError, ValueError):
+        client_duration_s = None
+
+    clip_need = _clip_audio_duration_seconds(body)
+    source_duration = client_duration_s if client_duration_s is not None else probe_audio_duration(audio_path)
+    if source_duration is not None and source_duration - start + 0.05 < clip_need:
+        raise ValueError(
+            f"Only {max(0.0, source_duration - start):.1f}s remains after {start:.1f}s offset, "
+            f"but this clip needs ~{clip_need:.1f}s — lower the start offset or "
+            "shorten the clip"
+        )
+
+    out_file, temp_dir = trim_audio_to_temp(audio_path, start)
+    temps.append(temp_dir)
+    trimmed_duration = probe_audio_duration(out_file)
+    if trimmed_duration is None or trimmed_duration <= 0:
+        raise ValueError("Audio crop produced empty output — check the source file")
+    if trimmed_duration + 0.05 < clip_need:
+        raise ValueError(
+            f"Cropped audio is only {trimmed_duration:.1f}s long, "
+            f"but this clip needs ~{clip_need:.1f}s — lower the start offset or "
+            "shorten the clip"
+        )
+
+    new_body = dict(body)
+    new_body["audio_path"] = str(out_file)
+    new_body["audio_start_seconds"] = 0
+    log.info(
+        "Web UI: audio cropped from %.2fs — %.1fs segment at %s",
+        start,
+        trimmed_duration,
+        out_file,
+    )
+    return new_body, temps
+
+
+@dataclass
+class _RunTempFiles:
+    """Tracks per-run scratch dirs/files; always cleaned in ``cleanup()``."""
+
+    dirs: list[Path] = field(default_factory=list)
+
+    def add_dir(self, path: Path | None) -> None:
+        if path is not None:
+            self.dirs.append(path)
+
+    def add_dirs(self, paths: list[Path]) -> None:
+        for path in paths:
+            self.add_dir(path)
+
+    def cleanup(self) -> None:
+        seen: set[Path] = set()
+        for raw in self.dirs:
+            path = Path(raw)
+            if path in seen:
+                continue
+            seen.add(path)
+            try:
+                if path.is_dir():
+                    shutil.rmtree(path, ignore_errors=True)
+                elif path.is_file():
+                    path.unlink(missing_ok=True)
+            except OSError as exc:
+                log.warning("Could not remove run temp %s: %s", path, exc)
+        self.dirs.clear()
+
+
+def _finish_run_teardown(state: AppState, temps: _RunTempFiles) -> None:
+    temps.cleanup()
+    state.set_active_run(None)
+    vs = state.video_server
+    if vs is not None:
+        gen = getattr(vs, "generator", None)
+        if gen is not None:
+            if hasattr(gen, "clear_cancel"):
+                gen.clear_cancel()
+            cleanup = getattr(gen, "cleanup_after_generation", None)
+            if callable(cleanup):
+                cleanup()
 
 
 def resolve_source_video_path(state: AppState, body: dict[str, Any]) -> str | None:
@@ -721,6 +898,9 @@ class AppState:
         self.http_url = http_url
         self.output_dir = output_dir
         self.upload_dir = upload_dir
+        from ltx_paths import configure_scratch_root
+
+        configure_scratch_root(output_dir / ".scratch")
         self.preferred_model = preferred_model
         self.active_model = active_model or preferred_model
         self.embedded = embedded
@@ -732,7 +912,9 @@ class AppState:
         self.clips: dict[str, ClipRecord] = {}
         self.event_queues: dict[str, asyncio.Queue[dict[str, Any]]] = {}
         self._pending: asyncio.Queue[str] = asyncio.Queue()
+        self._submit_lock = asyncio.Lock()
         self._worker_started = False
+        self._worker_task: asyncio.Task[None] | None = None
         self._cancelled_runs: set[str] = set()
         self._active_run_id: str | None = None
         self._sigint_count: int = 0
@@ -740,12 +922,44 @@ class AppState:
         self._uvicorn_server: Any | None = None
 
     def is_generation_active(self) -> bool:
+        if self._active_run_id is not None:
+            return True
         vs = self.video_server
         if vs is not None:
             sched = getattr(vs, "scheduler", None)
             if sched is not None and sched.running_generation_id:
                 return True
         return False
+
+    def is_pipeline_idle(self) -> bool:
+        """True when no run is active and nothing is waiting in the worker queue."""
+        if self._active_run_id is not None:
+            return False
+        if self._pending.qsize() > 0:
+            return False
+        vs = self.video_server
+        if vs is not None:
+            sched = getattr(vs, "scheduler", None)
+            if sched is not None:
+                if sched.running_generation_id:
+                    return False
+                gen_lock = getattr(sched, "_gen_lock", None)
+                if gen_lock is not None and gen_lock.locked():
+                    return False
+        return True
+
+    async def enqueue_generation_run(self, run_id: str) -> bool:
+        """Queue a run for the worker. Returns True if the pipeline was idle (immediate start)."""
+        _reconcile_generation_scheduler(self)
+        async with self._submit_lock:
+            idle = self.is_pipeline_idle()
+            run = self.runs.get(run_id)
+            if run is not None:
+                run.status = (
+                    RunStatus.RUNNING.value if idle else RunStatus.QUEUED.value
+                )
+            await self._pending.put(run_id)
+            return idle
 
     def request_shutdown(self) -> None:
         uv = self._uvicorn_server
@@ -872,14 +1086,24 @@ class AppState:
         return clean
 
     def ensure_worker(self) -> None:
-        """Start background generation worker (idempotent)."""
-        if self._worker_started:
+        """Start background generation worker (idempotent; restarts if it died)."""
+        task = self._worker_task
+        if self._worker_started and task is not None and not task.done():
             return
+        if task is not None and task.done():
+            try:
+                exc = task.exception()
+            except asyncio.CancelledError:
+                exc = None
+            if exc is not None:
+                log.error("Generation worker exited unexpectedly: %s", exc)
+            else:
+                log.warning("Generation worker stopped; restarting queue processor")
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.upload_dir.mkdir(parents=True, exist_ok=True)
         self.apply_saved_settings()
         self.load_index()
-        asyncio.create_task(_worker_loop(self))
+        self._worker_task = asyncio.create_task(_worker_loop(self))
         self._worker_started = True
 
     def load_index(self) -> None:
@@ -922,7 +1146,7 @@ class AppState:
             except OSError as exc:
                 log.warning("Could not delete clip file %s: %s", path, exc)
         del self.clips[clip_id]
-        for run in self.runs.values():
+        for run in list(self.runs.values()):
             if clip_id in run.clip_ids:
                 run.clip_ids = [cid for cid in run.clip_ids if cid != clip_id]
         return True
@@ -964,8 +1188,13 @@ class AppState:
         self.clips.clear()
         self.runs.clear()
         self.event_queues.clear()
+        upload_deleted = clear_upload_dir(self.upload_dir)
         self.save_index()
-        return {"deleted_clips": clip_count, "deleted_files": deleted_files}
+        return {
+            "deleted_clips": clip_count,
+            "deleted_files": deleted_files,
+            "deleted_uploads": upload_deleted,
+        }
 
     async def emit(self, run_id: str, event: dict[str, Any]) -> None:
         q = self.event_queues.get(run_id)
@@ -1124,6 +1353,16 @@ def _resolve_seed(raw: Any) -> int:
     return int(raw)
 
 
+def _local_file_ref(path: str | None) -> str | None:
+    """Return an absolute path when ``path`` is a readable local file."""
+    if not path:
+        return None
+    p = Path(str(path).strip())
+    if p.is_file():
+        return str(p.resolve())
+    return None
+
+
 def _build_params_from_request(body: dict[str, Any], *, state: AppState | None = None) -> Any:
     (
         GenerationParams,
@@ -1142,10 +1381,26 @@ def _build_params_from_request(body: dict[str, Any], *, state: AppState | None =
             video_path = body.get("video_path")
     load_image_payload, load_media_payload = _import_videofentanyl()[5:7]
 
-    image_payload = load_image_payload(image_path) if image_path else None
-    end_image_payload = load_image_payload(end_image_path) if end_image_path else None
-    audio_payload = load_media_payload(audio_path, kind="audio") if audio_path else None
-    video_payload = load_media_payload(video_path, kind="video") if video_path else None
+    image_payload = (
+        _local_file_ref(image_path) or load_image_payload(image_path)
+        if image_path
+        else None
+    )
+    end_image_payload = (
+        _local_file_ref(end_image_path) or load_image_payload(end_image_path)
+        if end_image_path
+        else None
+    )
+    audio_payload = (
+        _local_file_ref(audio_path) or load_media_payload(audio_path, kind="audio")
+        if audio_path
+        else None
+    )
+    video_payload = (
+        _local_file_ref(video_path) or load_media_payload(video_path, kind="video")
+        if video_path
+        else None
+    )
 
     lora_specs: list[tuple[str, float]] = []
     for item in body.get("lora_specs") or []:
@@ -1164,6 +1419,16 @@ def _build_params_from_request(body: dict[str, Any], *, state: AppState | None =
         num_frames = duration_to_frames(float(duration_s))
     elif num_frames is not None:
         num_frames = snap_frames(int(num_frames))
+
+    audio_start_seconds = None
+    raw_start = body.get("audio_start_seconds")
+    if raw_start not in (None, ""):
+        try:
+            parsed_start = float(raw_start)
+            if parsed_start > 0:
+                audio_start_seconds = parsed_start
+        except (TypeError, ValueError):
+            audio_start_seconds = None
 
     return GenerationParams(
         prompt=str(body.get("prompt") or "").strip(),
@@ -1193,6 +1458,7 @@ def _build_params_from_request(body: dict[str, Any], *, state: AppState | None =
         stage2_steps=body.get("stage2_steps"),
         no_regen_audio=bool(body.get("no_regen_audio", False)),
         reference_strength=body.get("reference_strength"),
+        audio_start_seconds=audio_start_seconds,
     )
 
 
@@ -1204,7 +1470,15 @@ def _cleanup_temp_video(path: str | None) -> None:
         if p.is_file():
             p.unlink(missing_ok=True)
         parent = p.parent
-        if parent.is_dir() and parent.name.startswith(("fv_", "fvserver_work_")):
+        if parent.is_dir() and parent.name.startswith(
+            (
+                "fv_",
+                "fvserver_work_",
+                "web_audio_trim_",
+                "videofentanyl_audio_",
+                "ltx_audio_trim_",
+            )
+        ):
             shutil.rmtree(parent, ignore_errors=True)
     except OSError:
         pass
@@ -1212,6 +1486,15 @@ def _cleanup_temp_video(path: str | None) -> None:
 
 async def _emit_protocol(on_event: Any, payload: dict[str, Any]) -> None:
     await on_event({"type": "protocol", "event": payload})
+
+
+def _reconcile_generation_scheduler(state: AppState) -> None:
+    vs = state.video_server
+    if vs is None:
+        return
+    sched = getattr(vs, "scheduler", None)
+    if sched is not None and hasattr(sched, "reconcile"):
+        sched.reconcile()
 
 
 def _model_progress_payload(video_server: Any) -> dict[str, Any]:
@@ -1286,6 +1569,7 @@ async def _run_clip_inprocess(
         await _emit_protocol(on_event, kwargs)
 
     job.started_at = time.time()
+    video_path: str | None = None
     try:
         async with vs.scheduler.generation_slot(notify) as generation_id:
             await _emit_protocol(
@@ -1355,6 +1639,7 @@ async def _run_clip_inprocess(
                         stage2_steps=getattr(params, "stage2_steps", None),
                         no_regen_audio=bool(getattr(params, "no_regen_audio", False)),
                         reference_strength=getattr(params, "reference_strength", None),
+                        audio_start_seconds=getattr(params, "audio_start_seconds", None),
                     )
                 )
                 while not gen_task.done():
@@ -1402,7 +1687,6 @@ async def _run_clip_inprocess(
                     "e2e_ms": int(job.e2e_latency_ms or 0),
                 },
             )
-            _cleanup_temp_video(video_path)
             job.finished_at = time.time()
             job.status = JobStatus.DONE
             return True
@@ -1432,6 +1716,8 @@ async def _run_clip_inprocess(
             },
         )
         return False
+    finally:
+        _cleanup_temp_video(video_path)
 
 
 def _audiocontinue_segment_seconds(body: dict[str, Any]) -> float:
@@ -1674,10 +1960,14 @@ async def _finish_autoconcat(
         state.clips.pop(clip_id, None)
     merged_id = str(uuid.uuid4())
     max_idx = max(
-        (c.clip_index for c in state.clips.values() if c.chain_id == run.chain_id),
+        (
+            c.clip_index
+            for c in list(state.clips.values())
+            if c.chain_id == run.chain_id
+        ),
         default=-1,
     )
-    for c in state.clips.values():
+    for c in list(state.clips.values()):
         if c.chain_id == run.chain_id and c.label in ("CURRENT", "MERGED"):
             c.label = "EDIT"
     state.clips[merged_id] = ClipRecord(
@@ -1758,7 +2048,8 @@ async def _execute_run_embedded(state: AppState, run_id: str) -> None:
     )
 
     jobs: list[Job] = []
-    gen_body = _RUN_BODIES.get(run_id, {})
+    temps = _RunTempFiles()
+    gen_body = dict(_RUN_BODIES.get(run_id, {}))
     prompts = run.prompts
     total_clips = len(prompts)
     chaining_enabled = run.autocontinue
@@ -1766,14 +2057,22 @@ async def _execute_run_embedded(state: AppState, run_id: str) -> None:
     prefix = sanitize_filename(prompts[0]) or "clip"
 
     audio_segments: list[dict[str, Any]] | None = None
-    temp_audio_dir: Path | None = None
 
     try:
+        try:
+            gen_body, trim_dirs = _apply_audio_start_offset(gen_body)
+            temps.add_dirs(trim_dirs)
+        except Exception as exc:
+            log.exception("Web UI: audio start offset failed")
+            await _fail_run_early(state, run_id, str(exc))
+            return
+
         if gen_body.get("audiocontinue"):
             try:
                 audio_segments, temp_audio_dir = _prepare_audiocontinue_segments(
                     gen_body, len(prompts)
                 )
+                temps.add_dir(temp_audio_dir)
             except Exception as exc:
                 log.exception("Web UI: audiocontinue setup failed")
                 await _fail_run_early(state, run_id, str(exc))
@@ -1877,7 +2176,7 @@ async def _execute_run_embedded(state: AppState, run_id: str) -> None:
                     if _should_stream_clip_video(run, i, total_clips)
                     else ""
                 )
-                for c in state.clips.values():
+                for c in list(state.clips.values()):
                     if c.chain_id == run.chain_id and c.label == "CURRENT":
                         c.label = "EDIT"
                 clip.label = "CURRENT"
@@ -1916,14 +2215,7 @@ async def _execute_run_embedded(state: AppState, run_id: str) -> None:
             {"type": "run_done", "run_id": run_id, "chain_id": run.chain_id},
         )
     finally:
-        state.set_active_run(None)
-        vs = state.video_server
-        if vs is not None:
-            gen = getattr(vs, "generator", None)
-            if gen is not None and hasattr(gen, "clear_cancel"):
-                gen.clear_cancel()
-        if temp_audio_dir is not None:
-            shutil.rmtree(temp_audio_dir, ignore_errors=True)
+        _finish_run_teardown(state, temps)
 
 
 async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
@@ -1963,7 +2255,8 @@ async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
 
     _set_server_override(_run_ws_url(state))
     jobs: list[Job] = []
-    gen_body = _RUN_BODIES.get(run_id, {})
+    temps = _RunTempFiles()
+    gen_body = dict(_RUN_BODIES.get(run_id, {}))
     prompts = run.prompts
     total_clips = len(prompts)
     chaining_enabled = run.autocontinue
@@ -1971,14 +2264,22 @@ async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
     prefix = sanitize_filename(prompts[0]) or "clip"
 
     audio_segments: list[dict[str, Any]] | None = None
-    temp_audio_dir: Path | None = None
 
     try:
+        try:
+            gen_body, trim_dirs = _apply_audio_start_offset(gen_body)
+            temps.add_dirs(trim_dirs)
+        except Exception as exc:
+            log.exception("Web UI: audio start offset failed")
+            await _fail_run_early(state, run_id, str(exc))
+            return
+
         if gen_body.get("audiocontinue"):
             try:
                 audio_segments, temp_audio_dir = _prepare_audiocontinue_segments(
                     gen_body, len(prompts)
                 )
+                temps.add_dir(temp_audio_dir)
             except Exception as exc:
                 log.exception("Web UI: audiocontinue setup failed")
                 await _fail_run_early(state, run_id, str(exc))
@@ -2080,7 +2381,7 @@ async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
                     if _should_stream_clip_video(run, i, total_clips)
                     else ""
                 )
-                for c in state.clips.values():
+                for c in list(state.clips.values()):
                     if c.chain_id == run.chain_id and c.label == "CURRENT":
                         c.label = "EDIT"
                 clip.label = "CURRENT"
@@ -2119,35 +2420,55 @@ async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
             {"type": "run_done", "run_id": run_id, "chain_id": run.chain_id},
         )
     finally:
-        state.set_active_run(None)
-        if temp_audio_dir is not None:
-            shutil.rmtree(temp_audio_dir, ignore_errors=True)
+        _finish_run_teardown(state, temps)
 
 
 async def _worker_loop(state: AppState) -> None:
     while True:
         run_id = await state._pending.get()
         try:
-            await _execute_run(state, run_id)
-        except Exception as exc:
+            try:
+                await _execute_run(state, run_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.exception("Web UI: run %s failed", run_id)
+                run = state.runs.get(run_id)
+                if run and run.status != RunStatus.CANCELLED.value:
+                    run.status = RunStatus.FAILED.value
+                    run.error = str(exc)
+                    state.save_index()
+                    await state.emit(run_id, {"type": "error", "message": str(exc)})
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:
+            log.exception("Web UI: generation worker error on run %s", run_id)
             run = state.runs.get(run_id)
-            if run and run.status != RunStatus.CANCELLED.value:
+            if run and run.status not in (
+                RunStatus.CANCELLED.value,
+                RunStatus.DONE.value,
+            ):
                 run.status = RunStatus.FAILED.value
                 run.error = str(exc)
                 state.save_index()
-                await state.emit(run_id, {"type": "error", "message": str(exc)})
+                try:
+                    await state.emit(run_id, {"type": "error", "message": str(exc)})
+                except Exception:
+                    log.exception("Web UI: failed to emit run error for %s", run_id)
         finally:
-            await state.emit(
-                run_id,
-                {
-                    "type": "run_complete",
-                    "run_id": run_id,
-                    "chain_id": state.runs.get(run_id).chain_id if state.runs.get(run_id) else None,
-                },
-            )
-            gen_body = _RUN_BODIES.pop(run_id, {})
-            if gen_body:
-                _cleanup_run_uploads(state, gen_body)
+            _reconcile_generation_scheduler(state)
+            try:
+                await state.emit(
+                    run_id,
+                    {
+                        "type": "run_complete",
+                        "run_id": run_id,
+                        "chain_id": state.runs.get(run_id).chain_id if state.runs.get(run_id) else None,
+                    },
+                )
+            except Exception:
+                log.exception("Web UI: failed to emit run_complete for %s", run_id)
+            _RUN_BODIES.pop(run_id, None)
 
 
 def create_app(
@@ -2269,7 +2590,8 @@ def create_app(
             "lora_presets": lora_presets,
             "default_lora_preset_id": default_lora_preset_id,
             "preferred_lora_preset_ids": preferred_lora_ids,
-            "ffmpeg_available": bool(shutil.which("ffmpeg")),
+            "pyav_available": media_available(),
+            "audio_trim_available": media_available(),
         }
 
     @app.post("/api/config/loras")
@@ -2472,6 +2794,7 @@ def create_app(
 
     @app.post("/api/generate")
     async def generate(body: dict[str, Any]):
+        state.ensure_worker()
         prompt = str(body.get("prompt") or "").strip()
         prompts = body.get("prompts") or []
         if prompt:
@@ -2508,6 +2831,19 @@ def create_app(
             if len(lora_items) != 1:
                 raise HTTPException(400, "lipdub requires exactly one LoRA preset")
 
+        _validate_request_media_paths(body)
+        try:
+            audio_start = float(body.get("audio_start_seconds") or 0)
+        except (TypeError, ValueError):
+            audio_start = 0.0
+        if audio_start < 0:
+            raise HTTPException(400, "audio_start_seconds must be >= 0")
+        if audio_start > 0 and not media_available():
+            raise HTTPException(
+                400,
+                "audio_start_seconds requires PyAV — install with: pip install av",
+            )
+
         if clip_count > 1 and len(prompts) == 1:
             prompts = [prompts[0]] * clip_count
 
@@ -2517,10 +2853,10 @@ def create_app(
                 raise HTTPException(400, "audiocontinue only supports a2v mode")
             if not body.get("audio_path"):
                 raise HTTPException(400, "audiocontinue requires an audio upload")
-            if not shutil.which("ffmpeg"):
+            if not media_available():
                 raise HTTPException(
                     400,
-                    "audiocontinue requires ffmpeg on PATH to split audio",
+                    "audiocontinue requires PyAV — install with: pip install av",
                 )
 
         chain_method = str(body.get("chain_method") or "autocontinue").strip().lower()
@@ -2599,22 +2935,45 @@ def create_app(
         state.save_index()
 
         state.event_queues[run_id] = asyncio.Queue()
-        await state._pending.put(run_id)
+        started_immediately = await state.enqueue_generation_run(run_id)
+        state.save_index()
         seg_frames = duration_to_frames(float(body.get("duration_seconds") or 5.0))
-        log.info(
-            "Web UI: queued run %s  chain=%s  clips=%d  mode=%s  chain_method=%s  "
-            "duration=%ss (%d frames)  audiocontinue=%s",
-            run_id,
-            chain_id,
-            len(clip_ids),
-            mode,
-            chain_method,
-            body.get("duration_seconds", 5.0),
-            seg_frames,
-            audiocontinue,
-        )
+        if started_immediately:
+            log.info(
+                "Web UI: executing run %s  chain=%s  clips=%d  mode=%s  chain_method=%s  "
+                "duration=%ss (%d frames)  audiocontinue=%s  audio_start=%ss",
+                run_id,
+                chain_id,
+                len(clip_ids),
+                mode,
+                chain_method,
+                body.get("duration_seconds", 5.0),
+                seg_frames,
+                audiocontinue,
+                body.get("audio_start_seconds") or 0,
+            )
+        else:
+            log.info(
+                "Web UI: queued run %s  chain=%s  clips=%d  mode=%s  chain_method=%s  "
+                "duration=%ss (%d frames)  audiocontinue=%s  audio_start=%ss",
+                run_id,
+                chain_id,
+                len(clip_ids),
+                mode,
+                chain_method,
+                body.get("duration_seconds", 5.0),
+                seg_frames,
+                audiocontinue,
+                body.get("audio_start_seconds") or 0,
+            )
 
-        return {"run_id": run_id, "chain_id": chain_id, "clip_ids": clip_ids}
+        return {
+            "run_id": run_id,
+            "chain_id": chain_id,
+            "clip_ids": clip_ids,
+            "status": state.runs[run_id].status,
+            "started_immediately": started_immediately,
+        }
 
     @app.get("/api/runs/{run_id}/events")
     async def run_events(run_id: str):

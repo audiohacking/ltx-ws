@@ -249,6 +249,7 @@ class GenerationParams:
     stage2_steps: Optional[int] = None
     no_regen_audio: bool = False
     reference_strength: Optional[float] = None
+    audio_start_seconds: Optional[float] = None
 
 
 @dataclasses.dataclass
@@ -392,6 +393,8 @@ def msg_simple_generate(p: GenerationParams) -> str:
         d["no_regen_audio"] = True
     if p.reference_strength is not None:
         d["reference_strength"] = float(p.reference_strength)
+    if p.audio_start_seconds is not None and float(p.audio_start_seconds) > 0:
+        d["audio_start_seconds"] = float(p.audio_start_seconds)
     return json.dumps(d)
 
 
@@ -1027,11 +1030,8 @@ class GenerationQueue:
         return done, failed
 
 
-def _ffmpeg_concat_list_line(path: Path) -> str:
-    """One line for ffmpeg's concat demuxer (see ffmpeg -f concat)."""
-    p = path.resolve().as_posix().replace("'", r"'\''")
-    return f"file '{p}'"
 
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def try_finalize_native_extend_chain(
     jobs: list[Job],
@@ -1115,15 +1115,9 @@ def try_autoconcat_clips(
     verbose: bool,
     compact: bool = False,
 ) -> None:
-    """After a successful autocontinue run, merge DONE outputs with ffmpeg and delete fragments.
+    """After a successful autocontinue run, merge DONE outputs with PyAV and delete fragments."""
+    from ltx_media import concat_videos, media_available
 
-    If ffmpeg is not on PATH, logs several lines and leaves all fragment files unchanged.
-    On ffmpeg failure, logs stderr and leaves fragments in place.
-
-    When ``compact`` is True, concat is re-encoded with libx265 (CRF 28, ``faster`` preset)
-    instead of stream copy; ffmpeg is invoked with ``-n`` (no overwrite).  (x264's ``film``
-    tune is not valid for libx265 and is omitted.)
-    """
     done = sorted(
         (j for j in jobs if j.status == JobStatus.DONE),
         key=lambda j: j.id,
@@ -1135,13 +1129,9 @@ def try_autoconcat_clips(
         )
         return
 
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg:
-        print("\n  [autoconcat] ffmpeg was not found on your PATH.")
-        print("  [autoconcat] Install ffmpeg to merge autocontinue fragments into one file.")
+    if not media_available():
+        print("\n  [autoconcat] PyAV is not available (pip install av).")
         print("  [autoconcat] Without it, individual clip files are left as-is.")
-        print("  [autoconcat] Manual merge example (build list.txt with one `file 'path'` per line):")
-        print("  [autoconcat]   ffmpeg -y -f concat -safe 0 -i list.txt -c copy output.mp4")
         print("  [autoconcat] Current fragment paths:")
         for j in done:
             print(f"  [autoconcat]   {j.output_path}")
@@ -1151,99 +1141,15 @@ def try_autoconcat_clips(
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     merged = out_dir / f"{file_prefix}_merged_{ts}.{ext}"
 
-    list_body = "\n".join(_ffmpeg_concat_list_line(j.output_path) for j in done) + "\n"
-    fd, list_path_str = tempfile.mkstemp(
-        suffix=".ffconcat", prefix="videofentanyl_"
-    )
-    list_path = Path(list_path_str)
     try:
-        os.close(fd)
-    except OSError:
-        pass
-    try:
-        list_path.write_text(list_body, encoding="utf-8")
-    except OSError as exc:
-        print(f"\n  [autoconcat] could not write concat list: {exc}")
-        try:
-            list_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        return
-
-    log_level = "info" if verbose else "error"
-    if compact:
-        cmd = [
-            ffmpeg,
-            "-hide_banner",
-            "-n",
-            "-loglevel",
-            log_level,
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            str(list_path),
-            "-vcodec",
-            "libx265",
-            "-crf",
-            "28",
-            "-preset",
-            "faster",
-            str(merged),
-        ]
-        ff_timeout = 3600
-    else:
-        cmd = [
-            ffmpeg,
-            "-hide_banner",
-            "-loglevel",
-            log_level,
-            "-y",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            str(list_path),
-            "-c",
-            "copy",
-            str(merged),
-        ]
-        ff_timeout = 600
-    proc: subprocess.CompletedProcess[str] | None = None
-    try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=ff_timeout,
+        concat_videos(
+            [j.output_path for j in done],
+            merged,
+            reencode_h265=compact,
         )
-    except subprocess.TimeoutExpired:
-        print(
-            f"\n  [autoconcat] ffmpeg timed out after {ff_timeout}s — "
-            "leaving fragments in place."
-        )
-    except FileNotFoundError:
-        print("\n  [autoconcat] ffmpeg executable disappeared — leaving fragments in place.")
-    finally:
-        try:
-            list_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-
-    if proc is None:
-        return
-
-    if proc.returncode != 0:
-        err = (proc.stderr or proc.stdout or "").strip()
-        print("\n  [autoconcat] ffmpeg failed — leaving fragment files in place.")
-        if err:
-            elines = err.splitlines()
-            for line in elines[:40]:
-                print(f"  [autoconcat]   {line}")
-            if len(elines) > 40:
-                print("  [autoconcat]   …")
+    except Exception as exc:
+        print("\n  [autoconcat] merge failed — leaving fragment files in place.")
+        print(f"  [autoconcat]   {exc}")
         if merged.exists():
             try:
                 merged.unlink()
@@ -1476,11 +1382,11 @@ def split_audio_for_jobs(
     Returns: (segment_paths, temp_directory).
     Caller owns cleanup (unlink each segment and remove temp directory).
     """
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg:
+    from ltx_media import media_available, split_audio
+
+    if not media_available():
         raise RuntimeError(
-            "--audiocontinue requires ffmpeg on PATH "
-            "(used to segment input audio)"
+            "--audiocontinue requires PyAV (pip install av) to segment input audio"
         )
     source_temp: Path | None = None
     raw_audio = audio_path.strip()
@@ -1513,45 +1419,20 @@ def split_audio_for_jobs(
         raise ValueError("segment_seconds must be > 0")
 
     temp_dir = Path(tempfile.mkdtemp(prefix="videofentanyl_audio_segments_"))
-    ext = src.suffix if src.suffix else ".wav"
-    out_tpl = temp_dir / f"seg_%04d{ext}"
-    cmd = [
-        ffmpeg,
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-y",
-        "-i",
-        str(src),
-        "-f",
-        "segment",
-        "-segment_time",
-        f"{segment_seconds:.6f}",
-        "-c",
-        "copy",
-        str(out_tpl),
-    ]
-    cp = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        segs = split_audio(
+            src,
+            temp_dir,
+            segment_seconds=segment_seconds,
+            required_segments=required_segments,
+            suffix=".wav",
+        )
+    except Exception:
+        if source_temp is not None:
+            source_temp.unlink(missing_ok=True)
+        raise
     if source_temp is not None:
         source_temp.unlink(missing_ok=True)
-    if cp.returncode != 0:
-        try:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        except OSError:
-            pass
-        err = (cp.stderr or cp.stdout or "unknown ffmpeg error").strip()
-        raise RuntimeError(f"ffmpeg audio segmentation failed: {err}")
-
-    segs = sorted(temp_dir.glob(f"seg_*{ext}"))
-    if len(segs) < required_segments:
-        try:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        except OSError:
-            pass
-        raise RuntimeError(
-            f"Audio produced {len(segs)} segment(s), but {required_segments} job(s) are queued. "
-            "Increase source audio length, reduce --count, or reduce clip duration."
-        )
     return segs[:required_segments], temp_dir
 
 
@@ -2017,9 +1898,9 @@ examples:
     p.add_argument(
         "--autoconcat",
         action="store_true",
-        help="after generation, merge successful autocontinue clips with ffmpeg "
+        help="after generation, merge successful autocontinue clips with PyAV "
              "(-c copy), then delete the fragments (requires --autocontinue; "
-             "needs ffmpeg on PATH)",
+             "pip install av)",
     )
     p.add_argument(
         "--audiocontinue",
@@ -2288,7 +2169,7 @@ async def async_main(args: argparse.Namespace):
             f"Delay: {delay}s  Retries: {args.retries}"
         )
         if args.autoconcat:
-            print("  autoconcat : after run, merge successful clips with ffmpeg; "
+            print("  autoconcat : after run, merge successful clips with PyAV (pip install av); "
                   "remove fragments if merge succeeds")
         if args.audiocontinue:
             print(f"  audiocontinue : ON  ({len(jobs)} segment(s), ~{segment_seconds:.2f}s each)")

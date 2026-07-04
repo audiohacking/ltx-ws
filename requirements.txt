@@ -1,19 +1,12 @@
-# ltx-ws — Python dependencies
-# Python 3.11+ recommended. MLX inference requires macOS + Apple Silicon.
-
-# server.py, videofentanyl.py, ltx_mlx_backend.py
+# ltx-ws runtime dependencies (Python 3.11+, macOS Apple Silicon for MLX)
 websockets>=12.0
 av>=12.0
 Pillow>=10.0
 huggingface_hub>=0.20.0
-
-# Web UI (server.py --web-ui default, web_server.py)
 fastapi>=0.115.0
 starlette>=0.37.0
 uvicorn[standard]>=0.32.0
 python-multipart>=0.0.12
-
-# mcp_server.py
 mcp>=1.0.0
 
 # MLX LTX-2.3 (Apple Silicon) — ltx-2-mlx v0.14.12 (not on PyPI; install after the lines above):

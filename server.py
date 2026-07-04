@@ -541,6 +541,23 @@ class GenerationScheduler:
     def running_generation_id(self) -> str | None:
         return self._running_id
 
+    def reconcile(self) -> None:
+        """Clear stale queue state after a cancelled or crashed generation."""
+        if self._running_id is not None and not self._gen_lock.locked():
+            log.warning(
+                "Clearing stale running_generation_id=%s (lock not held)",
+                self._running_id,
+            )
+            self._running_id = None
+        if self._gen_lock.locked() and self._running_id is None:
+            log.warning("Resetting stale generation lock (no active generation_id)")
+            self._gen_lock = asyncio.Lock()
+        if not self._gen_lock.locked() and self._running_id is None and self._n_waiters > 0:
+            log.debug("Resetting stale generation waiter count (%s)", self._n_waiters)
+            self._n_waiters = 0
+        if self._n_waiters < 0:
+            self._n_waiters = 0
+
     @contextlib.asynccontextmanager
     async def generation_slot(self, notify: NotifyJson):
         """
@@ -552,34 +569,29 @@ class GenerationScheduler:
         async with self._meta:
             self._n_waiters += 1
             ahead = self._n_waiters - 1
-        held = False
         try:
-            if ahead > 0:
+            if self._gen_lock.locked():
                 async with self._meta:
                     active = self._running_id
                 await notify(
                     type="queue_status",
-                    position=ahead,
+                    position=max(1, ahead),
                     available_gpus=0,
                     total_gpus=1,
                     active_generation_id=active,
                 )
-            await self._gen_lock.acquire()
-            held = True
-            gid = str(uuid.uuid4())
-            async with self._meta:
-                self._running_id = gid
-            try:
-                yield gid
-            finally:
+            async with self._gen_lock:
+                gid = str(uuid.uuid4())
                 async with self._meta:
-                    self._running_id = None
-                if held:
-                    self._gen_lock.release()
-                    held = False
+                    self._running_id = gid
+                try:
+                    yield gid
+                finally:
+                    async with self._meta:
+                        self._running_id = None
         finally:
             async with self._meta:
-                self._n_waiters -= 1
+                self._n_waiters = max(0, self._n_waiters - 1)
 
 
 # ── Per-connection request handler ─────────────────────────────────────────────
@@ -851,6 +863,7 @@ class RequestHandler:
                         ),
                         no_regen_audio=_msg_bool(msg, "no_regen_audio"),
                         reference_strength=_msg_float(msg, "reference_strength"),
+                        audio_start_seconds=_msg_float(msg, "audio_start_seconds"),
                     )
                 )
                 try:
@@ -1361,7 +1374,7 @@ def main() -> None:
     if model_auto_note:
         print(f"  RAM pick : {model_auto_note}")
     print(f"  Runtime  : Apple Silicon / MLX")
-    from web_ui import build_server_urls, resolve_web_dist
+    from web_ui import build_server_urls, resolve_web_dist, web_dist_stale
 
     ws_url, http_url = build_server_urls(args.host, args.port)
     print(f"  Endpoint : {ws_url}")
@@ -1370,6 +1383,11 @@ def main() -> None:
         if not resolve_web_dist().is_dir():
             print(
                 "  [warn] web/dist missing — build UI: cd web && npm install && npm run build",
+                flush=True,
+            )
+        elif web_dist_stale():
+            print(
+                "  [warn] web/dist is older than web/src — rebuild UI: cd web && npm run build",
                 flush=True,
             )
     print(f"  Video    : {args.num_frames} frames @ "
@@ -1394,6 +1412,13 @@ def main() -> None:
     spill_dir = Path(args.spill_dir).expanduser().resolve()
     spill_dir.mkdir(parents=True, exist_ok=True)
     log.info("Disconnect spill directory: %s", spill_dir)
+
+    from ltx_paths import REPO_ROOT, configure_scratch_root
+
+    if args.web_output_dir:
+        configure_scratch_root(args.web_output_dir.expanduser().resolve() / ".scratch")
+    else:
+        configure_scratch_root(REPO_ROOT / "tmp")
 
     # ── Resolve model/pipeline registry before WebSocket bind ─
     generator = LocalVideoGenerator(

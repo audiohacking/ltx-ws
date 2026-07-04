@@ -16,7 +16,7 @@ Generate text-to-video, image-to-video, audio-to-video, retake, extend, and mult
 | **Multi-clip chains** | Build longer videos with **autocontinue** (last frame → next clip) or **native extend** (extend prior clip in-place) |
 | **Retake & extend** | Edit a segment of existing footage or append/prepend new motion |
 | **Web UI** | Browser library, progress, LoRA picker, duration presets, clip multiplier |
-| **CLI client** | Scriptable batch runs, autocontinue, optional ffmpeg merge |
+| **CLI client** | Scriptable batch runs, autocontinue, PyAV merge (`autoconcat`) |
 | **MCP tools** | Drive generation from Cursor, Claude, or other MCP clients |
 | **LoRA** | Per-request or server-wide style adapters (optional) |
 | **LoRA training** | `/train` wizard — T2V, AV, and IC-LoRA presets (optional `ltx-trainer-mlx`; see below) |
@@ -30,7 +30,7 @@ Generate text-to-video, image-to-video, audio-to-video, retake, extend, and mult
 - **Apple Silicon Mac** with macOS (Metal / MLX)
 - **Python 3.11+** (3.12 recommended)
 - **Node.js 18+** — only to build the Web UI (`web/dist/`)
-- **ffmpeg** — optional; needed for merging chained clips (`autoconcat`) and some audio workflows
+- **PyAV (`av`)** — bundled via `requirements.txt`; powers audio trim, a2v loading, clip merge (`autoconcat`), and mux (no system ffmpeg install)
 - **Disk / RAM** — depends on model variant (q4 ≈ 12 GB weights, q8 ≈ 21 GB, bf16 ≈ 42 GB). Use a [quantized MLX model](https://huggingface.co/dgrauet/ltx-2.3-mlx-q8) unless you have plenty of unified memory.
 
 Weights must be **MLX-converted** checkpoints from the [ltx-2-mlx](https://github.com/dgrauet/ltx-2-mlx) ecosystem — not standard PyTorch `Lightricks/LTX-2.3` weights.
@@ -47,8 +47,8 @@ cd ltx-ws
 uv venv --python 3.12 --seed && source .venv/bin/activate
 uv pip install -r requirements.txt
 uv pip install \
-  "ltx-core-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@v0.14.12#subdirectory=packages/ltx-core-mlx" \
-  "ltx-pipelines-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@v0.14.12#subdirectory=packages/ltx-pipelines-mlx"
+  "ltx-core-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@v0.14.15#subdirectory=packages/ltx-core-mlx" \
+  "ltx-pipelines-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@v0.14.15#subdirectory=packages/ltx-pipelines-mlx"
 
 # Web UI (first time, or after editing web/)
 cd web && npm install && npm run build && cd ..
@@ -138,7 +138,7 @@ python videofentanyl.py --server ws://127.0.0.1:8765/ws \
 python videofentanyl.py --server ws://127.0.0.1:8765/ws \
   --prompt "street dance at night" --num-frames 121
 
-# Chained clips + merged output (needs ffmpeg on this machine)
+# Chained clips + merged output (PyAV — included in requirements.txt)
 python videofentanyl.py --server ws://127.0.0.1:8765/ws \
   --prompt "drone over coastline" --count 3 --autocontinue --autoconcat
 
@@ -190,7 +190,7 @@ Downloads land in `./models/` (gitignored — safe across `git pull`). Override 
 |--------|----------|----------|
 | **autocontinue** | New scenes, camera moves | Each clip starts from the **last frame** of the previous clip |
 | **native extend** | Same shot, more duration | Clip 1 generates; clip 2+ **extends** the prior MP4 (cumulative length) |
-| **autoconcat** | Deliver one file | Merges successful clips with ffmpeg (stream copy) |
+| **autoconcat** | Deliver one file | Merges successful clips with PyAV (stream copy) |
 
 In the Web UI, set **Clips × duration** and pick the chain method. In the CLI, use `--count N --autocontinue` and optionally `--autoconcat`.
 
@@ -215,8 +215,8 @@ Default catalog includes the OmniNFT RL LoRA; choose **None** in the UI to disab
 | Missing `ltx_pipelines_mlx` | Re-run the two `ltx-2-mlx` install lines from [Install](#install) |
 | Hub / auth errors | `HF_TOKEN` or `huggingface-cli login`; check free disk |
 | Out of memory | `--model dgrauet/ltx-2.3-mlx-q4`, lower resolution or `--num-frames`, or `--mlx-low-memory` |
-| `autoconcat` failed | Install `ffmpeg`; fragment files are kept if merge fails |
-| Player won't open MP4 | Remux: `ffmpeg -i in.mp4 -c copy out.mp4` |
+| `autoconcat` failed | `pip install av` (PyAV); fragment files are kept if merge fails |
+| Player won't open MP4 | Re-mux with PyAV or any standard MP4 tool |
 
 ---
 

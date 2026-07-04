@@ -63,7 +63,7 @@ Directors usually want **one coherent piece** (15–30s+), not a single ~4s clip
 1. **Do not** default to `ltx_generate_video` for narrative, reel, ad, or “make me a video” requests.
 2. **Use** `ltx_generate_sequence` with:
    - `autocontinue: true` — clip N’s **last frame** becomes clip N+1’s start image (visual continuity).
-   - `autoconcat: true` — merge successful clips into one deliverable MP4 (requires `ffmpeg` on the MCP host).
+   - `autoconcat: true` — merge successful clips into one deliverable MP4 (PyAV via `pip install av`).
 3. **Plan in ~5 second segments** using `num_frames: 121` (~5.0s at 24 fps).
 4. **Write one prompt per segment** — establish in clip 1; continuation language in clips 2+.
 
@@ -198,9 +198,9 @@ If `ok=false`, tell the user to start `python server.py` or fix `--server-url`.
 
 **Autoconcat behavior:**
 
-- After all clips succeed, runs `ffmpeg` concat (stream copy).
+- After all clips succeed, runs PyAV concat (stream copy).
 - Deletes fragment MP4s on success.
-- Requires `ffmpeg` on PATH; if missing, fragments remain and `merged_output_path` is null.
+- Requires PyAV (`pip install av`); if missing, fragments remain and `merged_output_path` is null.
 
 **Returns:**
 

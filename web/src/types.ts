@@ -47,7 +47,8 @@ export interface Config {
   lora_presets?: LoraPreset[];
   default_lora_preset_id?: string;
   preferred_lora_preset_ids?: string[];
-  ffmpeg_available?: boolean;
+  pyav_available?: boolean;
+  audio_trim_available?: boolean;
 }
 
 export interface Clip {
