@@ -211,6 +211,58 @@ def _patch_video_decode_pyav_only() -> None:
     vv_mod._ltx_ws_pyav_decode_patched = True
 
 
+def _patch_media_io_pyav_only() -> None:
+    """Replace ltx-pipelines ffmpeg I2V image preprocess with PyAV libx264."""
+    import sys
+
+    try:
+        from ltx_pipelines_mlx.utils import media_io as media_mod
+    except ImportError:
+        return
+
+    from ltx_media import decode_single_frame as pyav_decode_single_frame
+    from ltx_media import encode_single_frame as pyav_encode_single_frame
+
+    first = not getattr(media_mod, "_ltx_ws_pyav_media_patched", False)
+    if first:
+        media_mod._ltx_ws_orig_encode = media_mod.encode_single_frame
+        media_mod._ltx_ws_orig_decode = media_mod.decode_single_frame
+
+    media_mod.encode_single_frame = pyav_encode_single_frame
+    media_mod.decode_single_frame = pyav_decode_single_frame
+
+    orig_encode = media_mod._ltx_ws_orig_encode
+    orig_decode = media_mod._ltx_ws_orig_decode
+    for mod in sys.modules.values():
+        if mod is None:
+            continue
+        bound_encode = getattr(mod, "encode_single_frame", None)
+        if bound_encode is orig_encode or bound_encode is pyav_encode_single_frame:
+            if bound_encode is not pyav_encode_single_frame:
+                mod.encode_single_frame = pyav_encode_single_frame
+        bound_decode = getattr(mod, "decode_single_frame", None)
+        if bound_decode is orig_decode or bound_decode is pyav_decode_single_frame:
+            if bound_decode is not pyav_decode_single_frame:
+                mod.decode_single_frame = pyav_decode_single_frame
+
+    media_mod._ltx_ws_pyav_media_patched = True
+    if media_mod.encode_single_frame.__module__ != "ltx_media":
+        raise RuntimeError(
+            "Failed to replace ltx_pipelines_mlx image encode with PyAV "
+            "(encode_single_frame still bound to ffmpeg)"
+        )
+    if first:
+        log.debug("PyAV media_io patch applied (I2V image preprocess)")
+
+
+def _apply_ltx_mlx_patches(*, default_fps: float = 24.0) -> None:
+    """Apply all ltx-ws runtime patches (PyAV-only media, pipeline compat)."""
+    _patch_media_io_pyav_only()
+    _patch_load_audio_pyav_only()
+    _patch_ltx_pipelines_compat(default_fps=default_fps)
+    _patch_video_decode_pyav_only()
+
+
 def looks_like_hf_repo_id(model: str) -> bool:
     """True if ``model`` looks like ``author/repo`` and is not an existing directory path."""
     s = (model or "").strip()
@@ -1214,9 +1266,7 @@ class LocalVideoGenerator:
         return resolve_mlx_weights_directory(self.model, self.model_dir)
 
     def load(self) -> None:
-        _patch_load_audio_pyav_only()
-        _patch_ltx_pipelines_compat(default_fps=self.fps)
-        _patch_video_decode_pyav_only()
+        _apply_ltx_mlx_patches(default_fps=self.fps)
         if self._model_path is not None:
             return
         try:
@@ -1305,9 +1355,7 @@ class LocalVideoGenerator:
         log.info("MLX model path resolved ✓ %s", path)
 
     def _get_pipe(self, key: str, *, pipe_kwargs: dict[str, Any] | None = None) -> Any:
-        _patch_load_audio_pyav_only()
-        _patch_ltx_pipelines_compat(default_fps=self.fps)
-        _patch_video_decode_pyav_only()
+        _apply_ltx_mlx_patches(default_fps=self.fps)
         if not pipe_kwargs and key in self._pipes:
             return self._pipes[key]
         self.load()
@@ -1756,7 +1804,7 @@ class LocalVideoGenerator:
                     if mode == "a2v":
                         if not tmp_audio:
                             raise RuntimeError("a2v mode requires audio input")
-                        _patch_load_audio_pyav_only()
+                        _apply_ltx_mlx_patches(default_fps=self.fps)
                         from ltx_media import load_audio_for_inference
 
                         audio_probe = load_audio_for_inference(
@@ -2088,7 +2136,5 @@ class LocalVideoGenerator:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-# Patch before any ltx-pipelines import binds ffmpeg load_audio.
-_patch_load_audio_pyav_only()
-_patch_ltx_pipelines_compat()
-_patch_video_decode_pyav_only()
+# Patch before any ltx-pipelines import binds ffmpeg media helpers.
+_apply_ltx_mlx_patches()

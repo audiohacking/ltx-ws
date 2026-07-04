@@ -516,6 +516,76 @@ def stream_decoder_latent_to_mp4(
     return output_path
 
 
+def encode_single_frame(
+    output_file: Any,
+    image_array: Any,
+    crf: float,
+) -> None:
+    """Encode one RGB frame to a 1-frame H.264 MP4 via PyAV (I2V preprocess)."""
+    import numpy as np
+
+    require_media()
+    if image_array.dtype != np.uint8:
+        image_array = image_array.astype(np.uint8)
+    if image_array.ndim != 3 or image_array.shape[2] != 3:
+        raise ValueError(
+            f"encode_single_frame expects HxWx3 RGB, got {image_array.shape}"
+        )
+
+    height, width, _ = image_array.shape
+    pad_w = width + (width & 1)
+    pad_h = height + (height & 1)
+    if (pad_w, pad_h) != (width, height):
+        padded = np.zeros((pad_h, pad_w, 3), dtype=np.uint8)
+        padded[:height, :width, :] = image_array
+        image_array = padded
+
+    from io import BytesIO
+
+    if isinstance(output_file, BytesIO):
+        output_file.seek(0)
+        output_file.truncate(0)
+        container = av.open(output_file, mode="w", format="mp4")
+    else:
+        container = av.open(str(output_file), mode="w")
+
+    with container:
+        stream = container.add_stream(
+            "libx264", rate=1, width=pad_w, height=pad_h
+        )
+        stream.pix_fmt = "yuv420p"
+        stream.options = {"crf": str(int(crf)), "preset": "veryfast"}
+        frame = av.VideoFrame.from_ndarray(image_array, format="rgb24")
+        frame = frame.reformat(format="yuv420p")
+        frame.pts = 0
+        for packet in stream.encode(frame):
+            container.mux(packet)
+        for packet in stream.encode(None):
+            container.mux(packet)
+
+
+def decode_single_frame(video_file: Any) -> Any:
+    """Decode the first frame of an H.264 MP4 buffer/file back to HxWx3 RGB."""
+    import numpy as np
+
+    require_media()
+    from io import BytesIO
+
+    if isinstance(video_file, BytesIO):
+        video_file.seek(0)
+        inp: Any = video_file
+    else:
+        inp = str(video_file)
+
+    with av.open(inp, mode="r") as container:
+        if not container.streams.video:
+            raise RuntimeError("decode_single_frame: no video stream")
+        stream = container.streams.video[0]
+        for frame in container.decode(stream):
+            return np.asarray(frame.reformat(format="rgb24").to_ndarray()).copy()
+    raise RuntimeError("decode_single_frame: no frames decoded")
+
+
 def trim_audio_to_temp(audio_path: str, start_seconds: float) -> tuple[Path, Path]:
     """Trim ``audio_path`` into a scratch WAV; returns (file, temp_dir)."""
     from ltx_paths import mk_scratch_dir
