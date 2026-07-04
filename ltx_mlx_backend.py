@@ -103,10 +103,49 @@ class GenerationRequest:
     audio_start_seconds: float | None = None
 
 
-def _patch_load_audio_pyav_only() -> None:
-    """Replace ltx-core-mlx ffmpeg load_audio with PyAV (pip package ``av``)."""
+# Pipelines that bind ``load_audio`` at import time (``from … import load_audio``).
+_LOAD_AUDIO_STALE_IMPORTERS = (
+    "ltx_pipelines_mlx.a2vid_two_stage",
+    "ltx_pipelines_mlx.retake",
+    "ltx_pipelines_mlx.lipdub",
+)
+
+
+def _module_dict_attr(mod: Any, attr: str) -> Any:
+    """Return a module-level attribute without triggering lazy ``__getattr__`` loaders."""
+    if mod is None:
+        return _MISSING
+    d = vars(mod)
+    if not isinstance(d, dict) or attr not in d:
+        return _MISSING
+    return d[attr]
+
+
+_MISSING = object()
+
+
+def _rebind_module_attr(
+    module_name: str,
+    attr: str,
+    value: Any,
+    *,
+    stale: Any,
+) -> None:
     import sys
 
+    mod = sys.modules.get(module_name)
+    if mod is None:
+        return
+    current = _module_dict_attr(mod, attr)
+    if current is _MISSING:
+        return
+    if current is stale or current is value:
+        if current is not value:
+            setattr(mod, attr, value)
+
+
+def _patch_load_audio_pyav_only() -> None:
+    """Replace ltx-core-mlx ffmpeg load_audio with PyAV (pip package ``av``)."""
     from ltx_media import load_audio_for_inference
 
     try:
@@ -124,15 +163,17 @@ def _patch_load_audio_pyav_only() -> None:
     audio_mod.load_audio = load_audio_for_inference
 
     if stale is not None:
-        for mod in list(sys.modules.values()):
-            if mod is not None and getattr(mod, "load_audio", None) is stale:
-                mod.load_audio = load_audio_for_inference
+        for module_name in _LOAD_AUDIO_STALE_IMPORTERS:
+            _rebind_module_attr(
+                module_name,
+                "load_audio",
+                load_audio_for_inference,
+                stale=stale,
+            )
 
 
 def _patch_ltx_pipelines_compat(*, default_fps: float = 24.0) -> None:
     """Default ``frame_rate`` for ``combined_image_conditionings`` (a2v+i2v on older pipelines)."""
-    import sys
-
     try:
         from ltx_pipelines_mlx.utils import _orchestration as orch
     except ImportError:
@@ -165,16 +206,11 @@ def _patch_ltx_pipelines_compat(*, default_fps: float = 24.0) -> None:
 
     combined_image_conditionings.__name__ = getattr(original, "__name__", "combined_image_conditionings")
     orch.combined_image_conditionings = combined_image_conditionings
-    for mod in list(sys.modules.values()):
-        if mod is not None and getattr(mod, "combined_image_conditionings", None) is original:
-            mod.combined_image_conditionings = combined_image_conditionings
     orch._ltx_ws_frame_rate_patched = True
 
 
 def _patch_video_decode_pyav_only() -> None:
     """Replace upstream ffmpeg stdin pipe video encode with PyAV."""
-    import sys
-
     try:
         from ltx_core_mlx.model.video_vae import video_vae as vv_mod
     except ImportError:
@@ -183,8 +219,6 @@ def _patch_video_decode_pyav_only() -> None:
         return
 
     from ltx_media import stream_decoder_latent_to_mp4
-
-    original = vv_mod.VideoDecoder.decode_and_stream
 
     def decode_and_stream(
         self,
@@ -202,19 +236,11 @@ def _patch_video_decode_pyav_only() -> None:
         )
 
     vv_mod.VideoDecoder.decode_and_stream = decode_and_stream
-    for mod in list(sys.modules.values()):
-        if mod is not None and getattr(mod, "VideoDecoder", None) is vv_mod.VideoDecoder:
-            mod.VideoDecoder.decode_and_stream = decode_and_stream
-        bound = getattr(mod, "decode_and_stream", None) if mod is not None else None
-        if bound is original:
-            mod.decode_and_stream = decode_and_stream  # type: ignore[attr-defined]
     vv_mod._ltx_ws_pyav_decode_patched = True
 
 
 def _patch_media_io_pyav_only() -> None:
     """Replace ltx-pipelines ffmpeg I2V image preprocess with PyAV libx264."""
-    import sys
-
     try:
         from ltx_pipelines_mlx.utils import media_io as media_mod
     except ImportError:
@@ -230,20 +256,6 @@ def _patch_media_io_pyav_only() -> None:
 
     media_mod.encode_single_frame = pyav_encode_single_frame
     media_mod.decode_single_frame = pyav_decode_single_frame
-
-    orig_encode = media_mod._ltx_ws_orig_encode
-    orig_decode = media_mod._ltx_ws_orig_decode
-    for mod in list(sys.modules.values()):
-        if mod is None:
-            continue
-        bound_encode = getattr(mod, "encode_single_frame", None)
-        if bound_encode is orig_encode or bound_encode is pyav_encode_single_frame:
-            if bound_encode is not pyav_encode_single_frame:
-                mod.encode_single_frame = pyav_encode_single_frame
-        bound_decode = getattr(mod, "decode_single_frame", None)
-        if bound_decode is orig_decode or bound_decode is pyav_decode_single_frame:
-            if bound_decode is not pyav_decode_single_frame:
-                mod.decode_single_frame = pyav_decode_single_frame
 
     media_mod._ltx_ws_pyav_media_patched = True
     if media_mod.encode_single_frame.__module__ != "ltx_media":
