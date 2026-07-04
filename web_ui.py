@@ -650,7 +650,7 @@ def _clip_audio_duration_seconds(body: dict[str, Any]) -> float:
 
 
 def _apply_audio_start_offset(body: dict[str, Any]) -> tuple[dict[str, Any], list[Path]]:
-    """Optional a2v/lipdub audio skip — web-layer trim only, inference unchanged."""
+    """Crop a2v/lipdub audio from ``audio_start_seconds`` before generation."""
     temps: list[Path] = []
     try:
         start = float(body.get("audio_start_seconds") or 0)
@@ -675,27 +675,35 @@ def _apply_audio_start_offset(body: dict[str, Any]) -> tuple[dict[str, Any], lis
     except (TypeError, ValueError):
         client_duration_s = None
 
+    clip_need = _clip_audio_duration_seconds(body)
+    source_duration = client_duration_s if client_duration_s is not None else probe_audio_duration(audio_path)
+    if source_duration is not None and source_duration - start + 0.05 < clip_need:
+        raise ValueError(
+            f"Only {max(0.0, source_duration - start):.1f}s remains after {start:.1f}s offset, "
+            f"but this clip needs ~{clip_need:.1f}s — lower the start offset or "
+            "shorten the clip"
+        )
+
     out_file, temp_dir = trim_audio_to_temp(audio_path, start)
     temps.append(temp_dir)
     trimmed_duration = probe_audio_duration(out_file)
-    if not body.get("audiocontinue"):
-        clip_need = _clip_audio_duration_seconds(body)
-        if trimmed_duration is not None and trimmed_duration + 0.05 < clip_need:
-            raise ValueError(
-                f"Trimmed audio is only {trimmed_duration:.1f}s long, "
-                f"but this clip needs ~{clip_need:.1f}s — lower the start offset or "
-                "shorten the clip"
-            )
+    if trimmed_duration is None or trimmed_duration <= 0:
+        raise ValueError("Audio crop produced empty output — check the source file")
+    if trimmed_duration + 0.05 < clip_need:
+        raise ValueError(
+            f"Cropped audio is only {trimmed_duration:.1f}s long, "
+            f"but this clip needs ~{clip_need:.1f}s — lower the start offset or "
+            "shorten the clip"
+        )
 
     new_body = dict(body)
     new_body["audio_path"] = str(out_file)
+    new_body["audio_start_seconds"] = 0
     log.info(
-        "Web UI: audio start trim offset=%.2fs client_dur=%s trimmed_dur=%s -> %s (%d bytes)",
+        "Web UI: audio cropped from %.2fs — %.1fs segment at %s",
         start,
-        f"{client_duration_s:.1f}s" if client_duration_s is not None else "?",
-        f"{trimmed_duration:.1f}s" if trimmed_duration is not None else "?",
-        out_file.name,
-        out_file.stat().st_size,
+        trimmed_duration,
+        out_file,
     )
     return new_body, temps
 
@@ -886,6 +894,9 @@ class AppState:
         self.http_url = http_url
         self.output_dir = output_dir
         self.upload_dir = upload_dir
+        from ltx_paths import configure_scratch_root
+
+        configure_scratch_root(output_dir / ".scratch")
         self.preferred_model = preferred_model
         self.active_model = active_model or preferred_model
         self.embedded = embedded
@@ -1338,6 +1349,16 @@ def _resolve_seed(raw: Any) -> int:
     return int(raw)
 
 
+def _local_file_ref(path: str | None) -> str | None:
+    """Return an absolute path when ``path`` is a readable local file."""
+    if not path:
+        return None
+    p = Path(str(path).strip())
+    if p.is_file():
+        return str(p.resolve())
+    return None
+
+
 def _build_params_from_request(body: dict[str, Any], *, state: AppState | None = None) -> Any:
     (
         GenerationParams,
@@ -1356,10 +1377,26 @@ def _build_params_from_request(body: dict[str, Any], *, state: AppState | None =
             video_path = body.get("video_path")
     load_image_payload, load_media_payload = _import_videofentanyl()[5:7]
 
-    image_payload = load_image_payload(image_path) if image_path else None
-    end_image_payload = load_image_payload(end_image_path) if end_image_path else None
-    audio_payload = load_media_payload(audio_path, kind="audio") if audio_path else None
-    video_payload = load_media_payload(video_path, kind="video") if video_path else None
+    image_payload = (
+        _local_file_ref(image_path) or load_image_payload(image_path)
+        if image_path
+        else None
+    )
+    end_image_payload = (
+        _local_file_ref(end_image_path) or load_image_payload(end_image_path)
+        if end_image_path
+        else None
+    )
+    audio_payload = (
+        _local_file_ref(audio_path) or load_media_payload(audio_path, kind="audio")
+        if audio_path
+        else None
+    )
+    video_payload = (
+        _local_file_ref(video_path) or load_media_payload(video_path, kind="video")
+        if video_path
+        else None
+    )
 
     lora_specs: list[tuple[str, float]] = []
     for item in body.get("lora_specs") or []:
@@ -1378,6 +1415,16 @@ def _build_params_from_request(body: dict[str, Any], *, state: AppState | None =
         num_frames = duration_to_frames(float(duration_s))
     elif num_frames is not None:
         num_frames = snap_frames(int(num_frames))
+
+    audio_start_seconds = None
+    raw_start = body.get("audio_start_seconds")
+    if raw_start not in (None, ""):
+        try:
+            parsed_start = float(raw_start)
+            if parsed_start > 0:
+                audio_start_seconds = parsed_start
+        except (TypeError, ValueError):
+            audio_start_seconds = None
 
     return GenerationParams(
         prompt=str(body.get("prompt") or "").strip(),
@@ -1407,6 +1454,7 @@ def _build_params_from_request(body: dict[str, Any], *, state: AppState | None =
         stage2_steps=body.get("stage2_steps"),
         no_regen_audio=bool(body.get("no_regen_audio", False)),
         reference_strength=body.get("reference_strength"),
+        audio_start_seconds=audio_start_seconds,
     )
 
 
@@ -1581,6 +1629,7 @@ async def _run_clip_inprocess(
                         stage2_steps=getattr(params, "stage2_steps", None),
                         no_regen_audio=bool(getattr(params, "no_regen_audio", False)),
                         reference_strength=getattr(params, "reference_strength", None),
+                        audio_start_seconds=getattr(params, "audio_start_seconds", None),
                     )
                 )
                 while not gen_task.done():
@@ -2519,7 +2568,6 @@ def create_app(
             "default_lora_preset_id": default_lora_preset_id,
             "preferred_lora_preset_ids": preferred_lora_ids,
             "pyav_available": media_available(),
-            "ffmpeg_available": media_available(),
             "audio_trim_available": media_available(),
         }
 

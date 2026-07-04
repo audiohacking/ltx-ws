@@ -1,8 +1,8 @@
 """
 PyAV-backed audio/video helpers for ltx-ws.
 
-All media trimming, segmentation, concat, and muxing goes through this module
-instead of invoking the ffmpeg/sox CLI.
+All media trimming, segmentation, concat, muxing, and inference audio loading
+goes through this module (PyAV / ``pip install av``).
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ import logging
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 log = logging.getLogger(__name__)
 
@@ -66,30 +66,85 @@ def probe_audio_duration(path: Path | str) -> float | None:
         return last_time if last_time > 0 else None
 
 
-def _frame_bounds(frame: av.AudioFrame, decoded_seconds: float) -> tuple[float, float]:
-    frame_start = decoded_seconds
-    if frame.time is not None:
-        frame_start = float(frame.time)
-    if frame.samples and frame.sample_rate:
-        frame_len = float(frame.samples) / float(frame.sample_rate)
-    else:
-        frame_len = 0.0
-    return frame_start, frame_start + frame_len
+def _decode_audio_planar_f32(
+    path: Path | str,
+    *,
+    target_sample_rate: int,
+    mono: bool,
+) -> tuple[Any, int] | None:
+    """Decode all audio from ``path`` to planar float32 (channels, samples)."""
+    import numpy as np
+
+    require_media()
+    layout = "mono" if mono else "stereo"
+    resampler = AudioResampler(format="fltp", layout=layout, rate=target_sample_rate)
+    parts: list[Any] = []
+
+    with av.open(str(path)) as container:
+        if not container.streams.audio:
+            return None
+        stream = container.streams.audio[0]
+        for frame in container.decode(stream):
+            for resampled in resampler.resample(frame):
+                arr = resampled.to_ndarray()
+                if arr.ndim == 1:
+                    arr = arr.reshape(1, -1)
+                parts.append(np.asarray(arr, dtype=np.float32))
+        for resampled in resampler.resample(None):
+            arr = resampled.to_ndarray()
+            if arr.ndim == 1:
+                arr = arr.reshape(1, -1)
+            parts.append(np.asarray(arr, dtype=np.float32))
+
+    if not parts:
+        return None
+    data = np.concatenate(parts, axis=1)
+    if data.shape[1] == 0:
+        return None
+    return data, target_sample_rate
 
 
-def _slice_audio_frame(frame: av.AudioFrame, skip_samples: int) -> av.AudioFrame:
-    if skip_samples <= 0:
-        return frame
-    if skip_samples >= frame.samples:
-        raise ValueError("skip_samples exceeds frame length")
-    sliced = frame.to_ndarray()[:, skip_samples:]
-    out = av.AudioFrame.from_ndarray(sliced, format=frame.format, layout=frame.layout)
-    out.sample_rate = frame.sample_rate
-    if frame.pts is not None:
-        out.pts = frame.pts + skip_samples
-    if frame.time_base is not None:
-        out.time_base = frame.time_base
-    return out
+def _write_pcm_wav_from_planar_f32(
+    dst: Path | str,
+    data: Any,
+    *,
+    sample_rate: int,
+) -> None:
+    """Encode planar float32 (channels, samples) to PCM WAV."""
+    import numpy as np
+
+    dst = Path(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    resampler = AudioResampler(
+        format=AUDIO_OUTPUT_FORMAT,
+        layout=AUDIO_OUTPUT_LAYOUT,
+        rate=sample_rate,
+    )
+    chunk = 4096
+    n_samples = int(data.shape[1])
+
+    with av.open(str(dst), "w", format="wav") as out_container:
+        out_stream = out_container.add_stream(
+            "pcm_s16le",
+            rate=sample_rate,
+            layout=AUDIO_OUTPUT_LAYOUT,
+        )
+        for offset in range(0, n_samples, chunk):
+            block = np.asarray(data[:, offset : offset + chunk], dtype=np.float32)
+            frame = av.AudioFrame.from_ndarray(
+                block,
+                format="fltp",
+                layout=AUDIO_OUTPUT_LAYOUT,
+            )
+            frame.sample_rate = sample_rate
+            for resampled in resampler.resample(frame):
+                for packet in out_stream.encode(resampled):
+                    out_container.mux(packet)
+        for resampled in resampler.resample(None):
+            for packet in out_stream.encode(resampled):
+                out_container.mux(packet)
+        for packet in out_stream.encode(None):
+            out_container.mux(packet)
 
 
 def trim_audio_start(
@@ -101,52 +156,21 @@ def trim_audio_start(
     require_media()
     src = Path(src)
     dst = Path(dst)
-    dst.parent.mkdir(parents=True, exist_ok=True)
     start_seconds = max(0.0, float(start_seconds))
 
-    resampler = AudioResampler(
-        format=AUDIO_OUTPUT_FORMAT,
-        layout=AUDIO_OUTPUT_LAYOUT,
-        rate=AUDIO_OUTPUT_RATE,
+    decoded = _decode_audio_planar_f32(
+        src,
+        target_sample_rate=AUDIO_OUTPUT_RATE,
+        mono=False,
     )
+    if decoded is None:
+        raise RuntimeError(f"No audio stream found in {src}")
 
-    with av.open(str(src)) as in_container:
-        if not in_container.streams.audio:
-            raise RuntimeError(f"No audio stream found in {src}")
-        in_stream = in_container.streams.audio[0]
-        decoded_seconds = 0.0
-
-        with av.open(str(dst), "w", format="wav") as out_container:
-            out_stream = out_container.add_stream(
-                "pcm_s16le",
-                rate=AUDIO_OUTPUT_RATE,
-                layout=AUDIO_OUTPUT_LAYOUT,
-            )
-            for frame in in_container.decode(in_stream):
-                frame_start, frame_end = _frame_bounds(frame, decoded_seconds)
-                if frame.samples and frame.sample_rate:
-                    decoded_seconds = max(
-                        decoded_seconds,
-                        frame_end,
-                    )
-
-                if frame_end <= start_seconds:
-                    continue
-
-                if frame_start < start_seconds:
-                    skip_samples = min(
-                        frame.samples,
-                        int((start_seconds - frame_start) * frame.sample_rate),
-                    )
-                    if skip_samples >= frame.samples:
-                        continue
-                    frame = _slice_audio_frame(frame, skip_samples)
-
-                for resampled in resampler.resample(frame):
-                    for packet in out_stream.encode(resampled):
-                        out_container.mux(packet)
-            for packet in out_stream.encode(None):
-                out_container.mux(packet)
+    data, sample_rate = decoded
+    start_sample = int(start_seconds * sample_rate)
+    if start_sample >= data.shape[1]:
+        raise RuntimeError(f"Audio trim produced empty output: {dst}")
+    _write_pcm_wav_from_planar_f32(dst, data[:, start_sample:], sample_rate=sample_rate)
 
     if not dst.is_file() or dst.stat().st_size <= _MIN_WAV_BYTES:
         raise RuntimeError(f"Audio trim produced empty output: {dst}")
@@ -405,8 +429,53 @@ def mux_audio_into_video(
 
 
 def trim_audio_to_temp(audio_path: str, start_seconds: float) -> tuple[Path, Path]:
-    """Trim ``audio_path`` into a temp WAV; returns (file, temp_dir)."""
-    temp_dir = Path(tempfile.mkdtemp(prefix="ltx_audio_trim_"))
+    """Trim ``audio_path`` into a scratch WAV; returns (file, temp_dir)."""
+    from ltx_paths import mk_scratch_dir
+
+    temp_dir = mk_scratch_dir("ltx_audio_trim_")
     out_path = temp_dir / "segment.wav"
     trim_audio_start(audio_path, out_path, start_seconds)
     return out_path, temp_dir
+
+
+def load_audio_for_inference(
+    path: str | Path,
+    target_sample_rate: int = 16000,
+    start_time: float = 0.0,
+    max_duration: float | None = None,
+    mono: bool = False,
+) -> Any | None:
+    """
+    Load audio for MLX inference via PyAV.
+
+    Same contract as ``ltx_core_mlx.utils.audio.load_audio``; ltx-ws patches
+    upstream to call this implementation exclusively (no system ffmpeg).
+    """
+    import mlx.core as mx
+
+    try:
+        from ltx_core_mlx.utils.audio import AudioData
+    except ImportError:  # pragma: no cover - only when ltx-core-mlx missing
+        return None
+
+    decoded = _decode_audio_planar_f32(
+        path,
+        target_sample_rate=target_sample_rate,
+        mono=mono,
+    )
+    if decoded is None:
+        return None
+
+    data, sample_rate = decoded
+    start_sample = int(max(0.0, float(start_time)) * sample_rate)
+    if start_sample >= data.shape[1]:
+        return None
+    data = data[:, start_sample:]
+    if max_duration is not None:
+        end_sample = int(float(max_duration) * sample_rate)
+        data = data[:, : max(0, end_sample)]
+    if data.shape[1] == 0:
+        return None
+
+    waveform = mx.array(data)[None, :, :]
+    return AudioData(waveform=waveform, sample_rate=sample_rate)

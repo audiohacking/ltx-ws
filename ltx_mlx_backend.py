@@ -19,7 +19,7 @@ import random
 import re
 import shutil
 import subprocess
-import tempfile
+from ltx_paths import mk_scratch_dir, mk_scratch_file
 import threading
 import time
 from contextlib import contextmanager
@@ -100,6 +100,33 @@ class GenerationRequest:
     stage2_steps: int | None = None
     no_regen_audio: bool = False
     reference_strength: float | None = None
+    audio_start_seconds: float | None = None
+
+
+def _patch_load_audio_pyav_only() -> None:
+    """Replace ltx-core-mlx ffmpeg load_audio with PyAV (pip package ``av``)."""
+    import sys
+
+    from ltx_media import load_audio_for_inference
+
+    try:
+        import ltx_core_mlx.utils.audio as audio_mod
+    except ImportError:
+        return
+
+    stale = getattr(audio_mod, "_ltx_ws_original_load_audio", None)
+    if stale is None:
+        current = audio_mod.load_audio
+        if current is not load_audio_for_inference:
+            audio_mod._ltx_ws_original_load_audio = current
+            stale = current
+
+    audio_mod.load_audio = load_audio_for_inference
+
+    if stale is not None:
+        for mod in sys.modules.values():
+            if mod is not None and getattr(mod, "load_audio", None) is stale:
+                mod.load_audio = load_audio_for_inference
 
 
 def looks_like_hf_repo_id(model: str) -> bool:
@@ -340,7 +367,7 @@ def _decode_initial_image_dict(image_data: dict) -> str:
     if ext == ".jpe":
         ext = ".jpg"
 
-    fd, path = tempfile.mkstemp(suffix=ext, prefix="fvserver_img_")
+    fd, path = mk_scratch_file(prefix="fvserver_img_", suffix=ext)
     with os.fdopen(fd, "wb") as f:
         f.write(base64.b64decode(encoded))
     return path
@@ -364,7 +391,7 @@ def _download_remote_to_temp(
         raise RuntimeError(
             f"Remote media exceeds {max_bytes // (1024 * 1024)} MiB limit"
         )
-    fd, path = tempfile.mkstemp(prefix=prefix, suffix=suffix_hint)
+    fd, path = mk_scratch_file(prefix=prefix, suffix=suffix_hint)
     with os.fdopen(fd, "wb") as f:
         f.write(payload)
     return path
@@ -579,7 +606,7 @@ def _decode_media_input(
         ext = name_suffix or mimetypes.guess_extension(mime) or default_suffix
         if ext == ".jpe":
             ext = ".jpg"
-        fd, path = tempfile.mkstemp(prefix=temp_prefix, suffix=ext)
+        fd, path = mk_scratch_file(prefix=temp_prefix, suffix=ext)
         with os.fdopen(fd, "wb") as f:
             f.write(base64.b64decode(encoded))
         return path, path
@@ -659,7 +686,7 @@ def _unlink_fvserver_temp(path: str | None, marker: str) -> None:
 
 def _export_output_mp4(source_path: str) -> str:
     """Copy generation output to a standalone temp file (outside per-job workdirs)."""
-    fd, final_path = tempfile.mkstemp(prefix="fvserver_out_", suffix=".mp4")
+    fd, final_path = mk_scratch_file(prefix="fvserver_out_", suffix=".mp4")
     os.close(fd)
     shutil.copy2(source_path, final_path)
     return final_path
@@ -725,6 +752,8 @@ def _apply_optional_generate_kwargs(call_kwargs: dict[str, Any], req: Generation
         call_kwargs["no_regen_audio"] = True
     if req.reference_strength is not None:
         call_kwargs["reference_strength"] = float(req.reference_strength)
+    if req.audio_start_seconds is not None and float(req.audio_start_seconds) > 0:
+        call_kwargs["audio_start_time"] = float(req.audio_start_seconds)
 
 
 def _frame_rate_from_kwargs(kwargs: dict[str, Any], default: float) -> float:
@@ -1103,6 +1132,7 @@ class LocalVideoGenerator:
         return resolve_mlx_weights_directory(self.model, self.model_dir)
 
     def load(self) -> None:
+        _patch_load_audio_pyav_only()
         if self._model_path is not None:
             return
         try:
@@ -1191,6 +1221,7 @@ class LocalVideoGenerator:
         log.info("MLX model path resolved ✓ %s", path)
 
     def _get_pipe(self, key: str, *, pipe_kwargs: dict[str, Any] | None = None) -> Any:
+        _patch_load_audio_pyav_only()
         if not pipe_kwargs and key in self._pipes:
             return self._pipes[key]
         self.load()
@@ -1390,6 +1421,7 @@ class LocalVideoGenerator:
         stage2_steps: int | None = None,
         no_regen_audio: bool = False,
         reference_strength: float | None = None,
+        audio_start_seconds: float | None = None,
     ) -> str:
         self.clear_cancel()
         loop = asyncio.get_event_loop()
@@ -1425,6 +1457,7 @@ class LocalVideoGenerator:
                     stage2_steps=stage2_steps,
                     no_regen_audio=no_regen_audio,
                     reference_strength=reference_strength,
+                    audio_start_seconds=audio_start_seconds,
                 ),
             ),
         )
@@ -1516,7 +1549,7 @@ class LocalVideoGenerator:
         tmp_video_conditioning_cleanup: list[str] = []
         tmp_lora_cleanup: list[str] = []
         prefix = f"fv_{req.job_id[:8]}_" if req.job_id else "fvserver_work_"
-        tmpdir = tempfile.mkdtemp(prefix=prefix)
+        tmpdir = str(mk_scratch_dir(prefix=prefix))
         out_path = os.path.join(tmpdir, "output.mp4")
         last_pipe: Any | None = None
         media_cleanups: list[str] = []
@@ -1637,6 +1670,19 @@ class LocalVideoGenerator:
                     if mode == "a2v":
                         if not tmp_audio:
                             raise RuntimeError("a2v mode requires audio input")
+                        _patch_load_audio_pyav_only()
+                        from ltx_media import load_audio_for_inference
+
+                        audio_probe = load_audio_for_inference(
+                            tmp_audio,
+                            target_sample_rate=16000,
+                            start_time=float(req.audio_start_seconds or 0),
+                            max_duration=0.25,
+                        )
+                        if audio_probe is None:
+                            raise RuntimeError(
+                                f"Could not decode audio for a2v (PyAV): {tmp_audio}"
+                            )
                         video_duration_s = nf / float(self.fps)
                         if req.a2v_visual_i2v_continue and tmp_image:
                             log.info(
@@ -1954,3 +2000,7 @@ class LocalVideoGenerator:
             for tmp in tmp_lora_cleanup:
                 _unlink_fvserver_temp(tmp, "fvserver_lora_")
             shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# Patch before any ltx-pipelines import binds ffmpeg load_audio.
+_patch_load_audio_pyav_only()

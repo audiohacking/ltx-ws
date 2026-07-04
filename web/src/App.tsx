@@ -950,7 +950,7 @@ export default function App() {
   const needsImageUpload = mode === "i2v" || mode === "keyframe";
   const isA2v = mode === "a2v";
   const pyavAvailable =
-    config?.pyav_available ?? config?.audio_trim_available ?? config?.ffmpeg_available ?? false;
+    config?.pyav_available ?? config?.audio_trim_available ?? false;
   const audioTrimAvailable = pyavAvailable;
   const needsEndImageUpload = mode === "keyframe";
   const needsVideoUpload = mode === "retake" || mode === "extend" || mode === "lipdub";

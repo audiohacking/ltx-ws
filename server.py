@@ -863,6 +863,7 @@ class RequestHandler:
                         ),
                         no_regen_audio=_msg_bool(msg, "no_regen_audio"),
                         reference_strength=_msg_float(msg, "reference_strength"),
+                        audio_start_seconds=_msg_float(msg, "audio_start_seconds"),
                     )
                 )
                 try:
@@ -1411,6 +1412,13 @@ def main() -> None:
     spill_dir = Path(args.spill_dir).expanduser().resolve()
     spill_dir.mkdir(parents=True, exist_ok=True)
     log.info("Disconnect spill directory: %s", spill_dir)
+
+    from ltx_paths import REPO_ROOT, configure_scratch_root
+
+    if args.web_output_dir:
+        configure_scratch_root(args.web_output_dir.expanduser().resolve() / ".scratch")
+    else:
+        configure_scratch_root(REPO_ROOT / "tmp")
 
     # ── Resolve model/pipeline registry before WebSocket bind ─
     generator = LocalVideoGenerator(

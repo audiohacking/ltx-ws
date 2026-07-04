@@ -48,7 +48,6 @@ export interface Config {
   default_lora_preset_id?: string;
   preferred_lora_preset_ids?: string[];
   pyav_available?: boolean;
-  ffmpeg_available?: boolean;
   audio_trim_available?: boolean;
 }
 

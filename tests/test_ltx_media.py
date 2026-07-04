@@ -89,3 +89,17 @@ def test_trim_near_end_produces_short_remainder(wav_174s: Path, tmp_path: Path):
     trimmed = ltx_media.probe_audio_duration(out)
     assert trimmed is not None
     assert trimmed < 15.0
+
+
+def test_load_audio_for_inference_trim(wav_174s: Path):
+    pytest.importorskip("mlx.core")
+    pytest.importorskip("ltx_core_mlx")
+    loaded = ltx_media.load_audio_for_inference(
+        wav_174s,
+        target_sample_rate=16000,
+        start_time=98.0,
+        max_duration=15.0,
+    )
+    assert loaded is not None
+    assert loaded.sample_rate == 16000
+    assert int(loaded.waveform.shape[-1]) == pytest.approx(15 * 16000, rel=0.05)
