@@ -1029,6 +1029,8 @@ class GenerationQueue:
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
+
+def try_finalize_native_extend_chain(
     jobs: list[Job],
     file_prefix: str,
     ext: str,
