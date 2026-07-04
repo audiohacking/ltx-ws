@@ -1085,14 +1085,14 @@ export default function App() {
         const chainLabel =
           msg.chain_method === "native_extend" ? "extend video" : "autocontinue";
         setProgress({
-          phase: "queued",
+          phase: "starting",
           message: audiocontinueRun
             ? `Music video: ${msg.clip_count ?? "?"} clips (audiocontinue)…`
             : autoconcatRun
               ? `Generating ${msg.clip_count ?? "?"} clips (${chainLabel} + autoconcat)…`
               : streamFinalOnly
                 ? `Generating ${msg.clip_count ?? "?"} clips (${chainLabel})…`
-                : "Generation queued…",
+                : "Starting generation…",
         });
       } else if (msg.type === "clip_started") {
         const idx = typeof msg.index === "number" ? msg.index + 1 : "?";
@@ -1344,7 +1344,11 @@ export default function App() {
       setChainId(data.chain_id);
       setSelectedClipId(null);
       setPrompt("");
-      setProgress({ phase: "queued", message: "Queued — starting…" });
+      setProgress(
+        data.started_immediately
+          ? { phase: "starting", message: "Starting…" }
+          : { phase: "queued", message: "Queued — waiting for current job…" },
+      );
       subscribeRun(data.run_id, data.chain_id);
       const chainClips = await fetchClips(data.chain_id);
       setClips((prev) => mergeClips(prev, chainClips));

@@ -552,6 +552,9 @@ class GenerationScheduler:
         if self._gen_lock.locked() and self._running_id is None:
             log.warning("Resetting stale generation lock (no active generation_id)")
             self._gen_lock = asyncio.Lock()
+        if not self._gen_lock.locked() and self._running_id is None and self._n_waiters > 0:
+            log.debug("Resetting stale generation waiter count (%s)", self._n_waiters)
+            self._n_waiters = 0
         if self._n_waiters < 0:
             self._n_waiters = 0
 
@@ -567,12 +570,12 @@ class GenerationScheduler:
             self._n_waiters += 1
             ahead = self._n_waiters - 1
         try:
-            if ahead > 0:
+            if self._gen_lock.locked():
                 async with self._meta:
                     active = self._running_id
                 await notify(
                     type="queue_status",
-                    position=ahead,
+                    position=max(1, ahead),
                     available_gpus=0,
                     total_gpus=1,
                     active_generation_id=active,

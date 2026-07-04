@@ -885,6 +885,7 @@ class AppState:
         self.clips: dict[str, ClipRecord] = {}
         self.event_queues: dict[str, asyncio.Queue[dict[str, Any]]] = {}
         self._pending: asyncio.Queue[str] = asyncio.Queue()
+        self._submit_lock = asyncio.Lock()
         self._worker_started = False
         self._worker_task: asyncio.Task[None] | None = None
         self._cancelled_runs: set[str] = set()
@@ -894,12 +895,44 @@ class AppState:
         self._uvicorn_server: Any | None = None
 
     def is_generation_active(self) -> bool:
+        if self._active_run_id is not None:
+            return True
         vs = self.video_server
         if vs is not None:
             sched = getattr(vs, "scheduler", None)
             if sched is not None and sched.running_generation_id:
                 return True
         return False
+
+    def is_pipeline_idle(self) -> bool:
+        """True when no run is active and nothing is waiting in the worker queue."""
+        if self._active_run_id is not None:
+            return False
+        if self._pending.qsize() > 0:
+            return False
+        vs = self.video_server
+        if vs is not None:
+            sched = getattr(vs, "scheduler", None)
+            if sched is not None:
+                if sched.running_generation_id:
+                    return False
+                gen_lock = getattr(sched, "_gen_lock", None)
+                if gen_lock is not None and gen_lock.locked():
+                    return False
+        return True
+
+    async def enqueue_generation_run(self, run_id: str) -> bool:
+        """Queue a run for the worker. Returns True if the pipeline was idle (immediate start)."""
+        _reconcile_generation_scheduler(self)
+        async with self._submit_lock:
+            idle = self.is_pipeline_idle()
+            run = self.runs.get(run_id)
+            if run is not None:
+                run.status = (
+                    RunStatus.RUNNING.value if idle else RunStatus.QUEUED.value
+                )
+            await self._pending.put(run_id)
+            return idle
 
     def request_shutdown(self) -> None:
         uv = self._uvicorn_server
@@ -2814,22 +2847,43 @@ def create_app(
         state.save_index()
 
         state.event_queues[run_id] = asyncio.Queue()
-        await state._pending.put(run_id)
+        started_immediately = await state.enqueue_generation_run(run_id)
+        state.save_index()
         seg_frames = duration_to_frames(float(body.get("duration_seconds") or 5.0))
-        log.info(
-            "Web UI: queued run %s  chain=%s  clips=%d  mode=%s  chain_method=%s  "
-            "duration=%ss (%d frames)  audiocontinue=%s",
-            run_id,
-            chain_id,
-            len(clip_ids),
-            mode,
-            chain_method,
-            body.get("duration_seconds", 5.0),
-            seg_frames,
-            audiocontinue,
-        )
+        if started_immediately:
+            log.info(
+                "Web UI: executing run %s  chain=%s  clips=%d  mode=%s  chain_method=%s  "
+                "duration=%ss (%d frames)  audiocontinue=%s",
+                run_id,
+                chain_id,
+                len(clip_ids),
+                mode,
+                chain_method,
+                body.get("duration_seconds", 5.0),
+                seg_frames,
+                audiocontinue,
+            )
+        else:
+            log.info(
+                "Web UI: queued run %s  chain=%s  clips=%d  mode=%s  chain_method=%s  "
+                "duration=%ss (%d frames)  audiocontinue=%s",
+                run_id,
+                chain_id,
+                len(clip_ids),
+                mode,
+                chain_method,
+                body.get("duration_seconds", 5.0),
+                seg_frames,
+                audiocontinue,
+            )
 
-        return {"run_id": run_id, "chain_id": chain_id, "clip_ids": clip_ids}
+        return {
+            "run_id": run_id,
+            "chain_id": chain_id,
+            "clip_ids": clip_ids,
+            "status": state.runs[run_id].status,
+            "started_immediately": started_immediately,
+        }
 
     @app.get("/api/runs/{run_id}/events")
     async def run_events(run_id: str):
