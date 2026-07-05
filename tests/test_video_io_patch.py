@@ -73,7 +73,7 @@ def test_video_io_patch_replaces_ffmpeg_helpers():
     assert video_mod.load_video_frames_normalized is ltx_media.load_video_frames_normalized
 
 
-def test_iclora_utils_uses_pyav_probe(tmp_path: Path):
+def test_iclora_utils_uses_pyav_probe():
     pytest.importorskip("ltx_pipelines_mlx")
     from ltx_mlx_backend import _apply_ltx_mlx_patches
     import ltx_media
@@ -82,3 +82,13 @@ def test_iclora_utils_uses_pyav_probe(tmp_path: Path):
     _apply_ltx_mlx_patches(default_fps=24.0)
     assert iclora_utils.probe_video_info is ltx_media.probe_video_info
     assert iclora_utils.load_video_frames_normalized is ltx_media.load_video_frames_normalized
+
+
+def test_lipdub_uses_pyav_probe():
+    pytest.importorskip("ltx_pipelines_mlx")
+    from ltx_mlx_backend import _apply_ltx_mlx_patches
+    import ltx_media
+    from ltx_pipelines_mlx import lipdub
+
+    _apply_ltx_mlx_patches(default_fps=24.0)
+    assert lipdub.probe_video_info is ltx_media.probe_video_info

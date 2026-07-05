@@ -115,6 +115,7 @@ _LOAD_AUDIO_STALE_IMPORTERS = (
 _VIDEO_IO_STALE_IMPORTERS = (
     "ltx_pipelines_mlx.iclora_utils",
     "ltx_pipelines_mlx.ic_lora",
+    "ltx_pipelines_mlx.lipdub",
 )
 
 
@@ -1390,6 +1391,7 @@ def _invoke_lipdub_style(
     req: GenerationRequest,
 ) -> None:
     """LipDub / face-swap: reference video + optional face image + source audio conditioning."""
+    _apply_ltx_mlx_patches(default_fps=float(common_gen_kwargs.get("frame_rate") or 24.0))
     lip_kwargs = dict(common_gen_kwargs)
     lip_kwargs["reference_video_path"] = reference_video
     if tmp_image:
