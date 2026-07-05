@@ -80,7 +80,10 @@ PIPELINE_PROFILES = [
 
 CLIP_MULTIPLIER_MAX = 10
 IC_LORA_PRESET_ID = "ic_lora_hdr"
-IC_LORA_DEFAULT_SPEC = "Lightricks/LTX-2.3-22b-IC-LoRA-HDR"
+IC_LORA_DEFAULT_SPEC = (
+    "https://huggingface.co/buckets/audiohacking/LTX-2.3-22b-IC-LoRA-HDR-bucket/"
+    "resolve/ltx-2.3-22b-ic-lora-hdr-0.9.safetensors"
+)
 IC_LORA_DEFAULT_SCALE = 1.0
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "web_outputs"
 DEFAULT_UPLOAD_DIR = REPO_ROOT / "web_uploads"
@@ -313,8 +316,8 @@ def _lora_catalog(output_dir: Path | None = None) -> tuple[list[dict[str, Any]],
 
     _add(
         "ic_lora_hdr",
-        "IC-LoRA HDR (Lightricks)",
-        "Lightricks/LTX-2.3-22b-IC-LoRA-HDR",
+        "IC-LoRA HDR",
+        IC_LORA_DEFAULT_SPEC,
         1.0,
     )
 

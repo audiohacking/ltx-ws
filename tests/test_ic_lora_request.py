@@ -9,24 +9,24 @@ import pytest
 
 
 def test_build_params_includes_image_for_ic_lora(tmp_path: Path):
+    from web_ui import IC_LORA_DEFAULT_SPEC, _build_params_from_request
+
     img = tmp_path / "char.jpg"
     img.write_bytes(b"\xff\xd8\xff\xd9")
-
-    from web_ui import _build_params_from_request
 
     body = {
         "mode": "ic_lora",
         "prompt": "cinematic portrait",
         "image_path": str(img),
         "video_conditioning": [[str(tmp_path / "motion.mp4"), 1.0]],
-        "lora_specs": [["Lightricks/LTX-2.3-22b-IC-LoRA-HDR", 1.0]],
+        "lora_specs": [[IC_LORA_DEFAULT_SPEC, 1.0]],
     }
     (tmp_path / "motion.mp4").write_bytes(b"fake")
 
     params = _build_params_from_request(body)
     assert params.generation_mode == "ic_lora"
     assert params.initial_image is not None
-    assert params.lora_specs == [("Lightricks/LTX-2.3-22b-IC-LoRA-HDR", 1.0)]
+    assert params.lora_specs == [(IC_LORA_DEFAULT_SPEC, 1.0)]
     assert len(params.video_conditioning_specs) == 1
 
 
@@ -88,13 +88,13 @@ def test_apply_ic_lora_defaults_injects_hdr_lora():
 
 
 def test_ic_lora_t2v_allows_missing_video_conditioning():
-    from web_ui import _build_params_from_request
+    from web_ui import IC_LORA_DEFAULT_SPEC, _build_params_from_request
 
     params = _build_params_from_request(
         {
             "mode": "ic_lora",
             "prompt": "sunset over ocean",
-            "lora_specs": [["Lightricks/LTX-2.3-22b-IC-LoRA-HDR", 1.0]],
+            "lora_specs": [[IC_LORA_DEFAULT_SPEC, 1.0]],
         }
     )
     assert params.generation_mode == "ic_lora"

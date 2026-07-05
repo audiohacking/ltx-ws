@@ -1456,7 +1456,8 @@ export default function App() {
     if (mode === "ic_lora") {
       body.lora_specs = [
         [
-          config?.ic_lora_default_spec ?? "Lightricks/LTX-2.3-22b-IC-LoRA-HDR",
+          config?.ic_lora_default_spec ??
+            "https://huggingface.co/buckets/audiohacking/LTX-2.3-22b-IC-LoRA-HDR-bucket/resolve/ltx-2.3-22b-ic-lora-hdr-0.9.safetensors",
           1.0,
         ],
       ];

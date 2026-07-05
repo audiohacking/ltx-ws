@@ -25,7 +25,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import unquote, urlparse
 from urllib.request import url2pathname, urlopen
 
@@ -632,7 +632,86 @@ def _pick_safetensors_file(root: Path) -> Path | None:
     for c in candidates:
         if "loras" in {p.lower() for p in c.parts}:
             return c
+    # Prefer main IC-LoRA weight over auxiliary embeddings when both exist.
+    non_emb = [c for c in candidates if "scene-emb" not in c.name.lower()]
+    if non_emb:
+        return non_emb[0]
     return candidates[0]
+
+
+class _HfLoraResolve(NamedTuple):
+    cache_dir_name: str
+    filename: str
+    repo_id: str | None
+    revision: str | None
+    url: str
+
+
+def _parse_hf_lora_resolve_url(url: str) -> _HfLoraResolve | None:
+    """Parse Hugging Face model or bucket resolve URLs into cache/download targets."""
+    parsed = urlparse(url)
+    if not parsed.netloc.endswith("huggingface.co") or "/resolve/" not in parsed.path:
+        return None
+    parts = [part for part in parsed.path.strip("/").split("/") if part]
+    if len(parts) >= 5 and parts[0] == "buckets" and parts[3] == "resolve":
+        return _HfLoraResolve(
+            cache_dir_name=f"{parts[1]}__{parts[2]}",
+            filename="/".join(parts[4:]),
+            repo_id=None,
+            revision=None,
+            url=url,
+        )
+    if len(parts) >= 5 and parts[2] == "resolve":
+        repo_id = f"{parts[0]}/{parts[1]}"
+        return _HfLoraResolve(
+            cache_dir_name=repo_id.replace("/", "__"),
+            filename="/".join(parts[4:]),
+            repo_id=repo_id,
+            revision=parts[3],
+            url=url,
+        )
+    return None
+
+
+def _hf_lora_cache_file(resolved: _HfLoraResolve) -> Path:
+    return (_local_lora_cache_dir() / resolved.cache_dir_name / resolved.filename).resolve()
+
+
+def _download_hf_lora_resolve(resolved: _HfLoraResolve) -> Path:
+    """Download a Hugging Face resolve URL into the persistent LoRA cache."""
+    dest = _hf_lora_cache_file(resolved)
+    if dest.is_file():
+        return dest
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if resolved.repo_id and resolved.revision:
+        try:
+            from huggingface_hub import hf_hub_download
+        except ImportError as e:
+            raise RuntimeError(
+                "huggingface_hub is required to download LoRA from Hugging Face"
+            ) from e
+        log.info(
+            "Downloading LoRA %s (%s @ %s) …",
+            resolved.repo_id,
+            resolved.filename,
+            resolved.revision,
+        )
+        local = hf_hub_download(
+            repo_id=resolved.repo_id,
+            filename=resolved.filename,
+            revision=resolved.revision,
+            local_dir=str(_local_lora_cache_dir() / resolved.cache_dir_name),
+        )
+        return Path(local).resolve()
+    log.info("Downloading public LoRA from %s …", resolved.url)
+    with urlopen(resolved.url, timeout=300) as resp:
+        with dest.open("wb") as handle:
+            while True:
+                chunk = resp.read(1024 * 1024)
+                if not chunk:
+                    break
+                handle.write(chunk)
+    return dest
 
 
 def _lora_cached_path(spec: str) -> Path | None:
@@ -646,23 +725,16 @@ def _lora_cached_path(spec: str) -> Path | None:
         return p.resolve()
 
     if raw.startswith(("http://", "https://")):
-        parsed = urlparse(raw)
-        if parsed.netloc.endswith("huggingface.co") and "/resolve/" in parsed.path:
-            parts = [part for part in parsed.path.strip("/").split("/") if part]
-            if len(parts) >= 5 and parts[2] == "resolve":
-                repo_id = f"{parts[0]}/{parts[1]}"
-                revision = parts[3]
-                filename = "/".join(parts[4:])
-                cache_root = _local_lora_cache_dir()
-                local_dir = cache_root / repo_id.replace("/", "__")
-                candidate = local_dir / filename
-                if candidate.is_file():
-                    return candidate.resolve()
-                # hf_hub_download may also use hub cache layout under local_dir
-                if local_dir.is_dir():
-                    for match in local_dir.rglob(Path(filename).name):
-                        if match.is_file():
-                            return match.resolve()
+        resolved = _parse_hf_lora_resolve_url(raw)
+        if resolved is not None:
+            candidate = _hf_lora_cache_file(resolved)
+            if candidate.is_file():
+                return candidate
+            cache_dir = candidate.parent
+            if cache_dir.is_dir():
+                for match in cache_dir.rglob(Path(resolved.filename).name):
+                    if match.is_file():
+                        return match.resolve()
 
     if looks_like_hf_repo_id(raw):
         dest = (_local_lora_cache_dir() / raw.replace("/", "__")).resolve()
@@ -692,37 +764,9 @@ def _resolve_lora_path(spec: str) -> tuple[str, str | None]:
     if p.is_file():
         return str(p.resolve()), None
     if raw.startswith(("http://", "https://")):
-        parsed = urlparse(raw)
-        # Support Hugging Face resolve URLs directly by routing through hf_hub_download,
-        # which handles large files and cache efficiently.
-        if parsed.netloc.endswith("huggingface.co") and "/resolve/" in parsed.path:
-            parts = [p for p in parsed.path.strip("/").split("/") if p]
-            # Expected: <repo_owner>/<repo_name>/resolve/<revision>/<filename...>
-            if len(parts) >= 5 and parts[2] == "resolve":
-                repo_id = f"{parts[0]}/{parts[1]}"
-                revision = parts[3]
-                filename = "/".join(parts[4:])
-                try:
-                    from huggingface_hub import hf_hub_download
-                except ImportError as e:
-                    raise RuntimeError(
-                        "huggingface_hub is required to download LoRA from Hugging Face"
-                    ) from e
-                cache_root = _local_lora_cache_dir()
-                cache_root.mkdir(parents=True, exist_ok=True)
-                log.info(
-                    "Downloading LoRA %s (%s @ %s) …",
-                    repo_id,
-                    filename,
-                    revision,
-                )
-                local = hf_hub_download(
-                    repo_id=repo_id,
-                    filename=filename,
-                    revision=revision,
-                    local_dir=str(cache_root / repo_id.replace("/", "__")),
-                )
-                return str(Path(local).resolve()), None
+        resolved = _parse_hf_lora_resolve_url(raw)
+        if resolved is not None:
+            return str(_download_hf_lora_resolve(resolved)), None
 
         # Generic URL fallback (no 512MiB cap for LoRA artifacts).
         tmp = _download_remote_to_temp(
