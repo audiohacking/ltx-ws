@@ -1447,16 +1447,18 @@ def _ic_lora_has_motion_reference(body: dict[str, Any]) -> bool:
 
 
 def _apply_ic_lora_defaults(body: dict[str, Any]) -> dict[str, Any]:
-    """Pick HDR vs Union Control IC-LoRA weights for the requested inputs."""
+    """Pick HDR vs Union Control IC-LoRA weights for the requested inputs.
+
+  - Motion video + character image → Union Control (pose motion transfer).
+  - Motion video only → HDR IC-LoRA (V2V / T2V + reference video, testing mode).
+  - No motion video → HDR IC-LoRA (pure T2V).
+    """
     if (body.get("mode") or "generate").strip().lower() != "ic_lora":
         return body
     new_body = dict(body)
     has_motion = _ic_lora_has_motion_reference(new_body)
     has_character = bool(new_body.get("image_path"))
     if has_motion and has_character:
-        new_body["lora_specs"] = [[IC_LORA_UNION_MOTION_SPEC, IC_LORA_DEFAULT_SCALE]]
-    elif has_motion:
-        # Motion-only: pose-controlled generation (not HDR V2V color upgrade).
         new_body["lora_specs"] = [[IC_LORA_UNION_MOTION_SPEC, IC_LORA_DEFAULT_SCALE]]
     else:
         new_body["lora_specs"] = [[IC_LORA_DEFAULT_SPEC, IC_LORA_DEFAULT_SCALE]]

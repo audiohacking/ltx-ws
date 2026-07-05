@@ -2065,14 +2065,14 @@ export default function App() {
                     <>
                       <span className="media-panel-title">IC-LoRA inputs</span>
                       <p className="hint hint-inline">
-                        Motion transfer uses Union Control: motion video is converted to
-                        pose skeletons (requires mediapipe); your character image anchors
-                        frame 0 (who to render). HDR LoRA is used only for pure T2V / SDR→HDR
-                        V2V without a character swap.
+                        <strong>Motion video only</strong> — HDR IC-LoRA: T2V or V2V guided by
+                        the reference clip (no character image).{" "}
+                        <strong>Motion + character image</strong> — Union Control: motion video
+                        becomes pose skeletons (mediapipe); the image anchors who to render.
                         {!config?.pose_control_available && (
                           <>
                             {" "}
-                            Install mediapipe for motion transfer:{" "}
+                            Motion+character needs mediapipe:{" "}
                             <code>pip install mediapipe</code>
                           </>
                         )}

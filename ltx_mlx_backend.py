@@ -1256,8 +1256,7 @@ def _build_ic_lora_image_conditionings(
 
     IC-LoRA stage 2 accepts ``VideoConditionByLatentIndex`` (frame_idx==0) but
     not ``VideoConditionByKeyframeIndex`` — a last-frame keyframe appends extra
-    tokens and breaks stage-2 ``unpatchify``. Per-frame identity when motion
-    video is also present comes from the identity-hold ``video_conditioning``.
+    tokens and breaks stage-2 ``unpatchify``.
     """
     del num_frames  # frame-0 only; see docstring
     return [(image_path, 0, 1.0, IC_LORA_IMAGE_CRF)]
