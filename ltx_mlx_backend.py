@@ -1338,9 +1338,9 @@ def _prepare_ic_lora_video_conditioning(
         fps=fps,
     )
     cleanup.append(pose_path)
-    log.info(
-        "IC-LoRA motion transfer: pose control from %s (Union Control, %dx%d, %d frames)",
-        motion_path,
+        log.info(
+            "IC-LoRA motion transfer: OpenPose control from %s (Union Control, %dx%d, %d frames)",
+            motion_path,
         width,
         height,
         num_frames,

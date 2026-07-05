@@ -1,4 +1,4 @@
-"""IC-LoRA control-signal preprocessing (pose maps for motion transfer)."""
+"""IC-LoRA control-signal preprocessing (OpenPose maps for Union Control)."""
 
 from __future__ import annotations
 
@@ -8,49 +8,52 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-POSE_LANDMARKER_LITE_URL = (
+POSE_LANDMARKER_FULL_URL = (
     "https://storage.googleapis.com/mediapipe-models/"
-    "pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
+    "pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task"
 )
 
-# BlazePose 33-landmark topology (legacy mp.solutions.pose.POSE_CONNECTIONS).
-POSE_CONNECTIONS: tuple[tuple[int, int], ...] = (
-    (0, 1),
+# OpenPose COCO-18 body pairs (Union Control / DWPreprocessor topology).
+OPENPOSE_COCO18_PAIRS: tuple[tuple[int, int], ...] = (
+    (1, 0),
+    (0, 14),
+    (14, 16),
+    (0, 15),
+    (15, 17),
     (1, 2),
     (2, 3),
-    (3, 7),
-    (0, 4),
-    (4, 5),
+    (3, 4),
+    (1, 5),
     (5, 6),
-    (6, 8),
+    (6, 7),
+    (1, 8),
+    (8, 9),
     (9, 10),
+    (1, 11),
     (11, 12),
-    (11, 13),
-    (13, 15),
-    (15, 17),
-    (15, 19),
-    (15, 21),
-    (17, 19),
-    (12, 14),
-    (14, 16),
-    (16, 18),
-    (16, 20),
-    (16, 22),
-    (18, 20),
-    (11, 23),
-    (12, 24),
-    (23, 24),
-    (23, 25),
-    (24, 26),
-    (25, 27),
-    (26, 28),
-    (27, 29),
-    (28, 30),
-    (29, 31),
-    (30, 32),
-    (27, 31),
-    (28, 32),
+    (12, 13),
 )
+
+# MediaPipe Pose → OpenPose COCO-18 index (neck computed from shoulders).
+_MP_TO_OPENPOSE: dict[int, int] = {
+    0: 0,  # nose
+    2: 14,  # left eye
+    5: 15,  # right eye
+    7: 16,  # left ear
+    8: 17,  # right ear
+    12: 2,  # right shoulder
+    14: 3,  # right elbow
+    16: 4,  # right wrist
+    11: 5,  # left shoulder
+    13: 6,  # left elbow
+    15: 7,  # left wrist
+    24: 8,  # right hip
+    26: 9,  # right knee
+    28: 10,  # right ankle
+    23: 11,  # left hip
+    25: 12,  # left knee
+    27: 13,  # left ankle
+}
 
 
 def _pose_model_cache_path() -> Path:
@@ -58,16 +61,16 @@ def _pose_model_cache_path() -> Path:
 
     root = REPO_ROOT / "models" / "mediapipe"
     root.mkdir(parents=True, exist_ok=True)
-    return root / "pose_landmarker_lite.task"
+    return root / "pose_landmarker_full.task"
 
 
 def _ensure_pose_landmarker_model() -> Path:
     path = _pose_model_cache_path()
     if path.is_file() and path.stat().st_size > 0:
         return path
-    log.info("Downloading MediaPipe pose landmarker model to %s", path)
+    log.info("Downloading MediaPipe pose landmarker (full) to %s", path)
     tmp = path.with_suffix(".task.download")
-    urllib.request.urlretrieve(POSE_LANDMARKER_LITE_URL, tmp)
+    urllib.request.urlretrieve(POSE_LANDMARKER_FULL_URL, tmp)
     tmp.replace(path)
     return path
 
@@ -105,65 +108,112 @@ def require_pose_control() -> None:
         )
 
 
-def _landmark_point(lm: object, *, width: int, height: int) -> tuple[int, int] | None:
+def _mp_point(
+    landmarks: list[object],
+    idx: int,
+    *,
+    width: int,
+    height: int,
+    min_score: float = 0.35,
+) -> tuple[float, float] | None:
+    if idx >= len(landmarks):
+        return None
+    lm = landmarks[idx]
     vis = getattr(lm, "visibility", None)
-    if vis is not None and float(vis) < 0.5:
+    if vis is not None and float(vis) < min_score:
         return None
     pres = getattr(lm, "presence", None)
-    if pres is not None and float(pres) < 0.5:
+    if pres is not None and float(pres) < min_score:
         return None
-    return (int(float(lm.x) * width), int(float(lm.y) * height))
+    return (float(lm.x) * width, float(lm.y) * height)
 
 
-def _draw_pose_skeleton(
+def mediapipe_landmarks_to_openpose18(
+    landmarks: list[object] | None,
+    *,
+    width: int,
+    height: int,
+) -> list[tuple[int, int] | None]:
+    """Map MediaPipe Pose landmarks to OpenPose COCO-18 pixel keypoints."""
+    pts: list[tuple[int, int] | None] = [None] * 18
+    if not landmarks:
+        return pts
+
+    for mp_idx, op_idx in _MP_TO_OPENPOSE.items():
+        p = _mp_point(landmarks, mp_idx, width=width, height=height)
+        if p is not None:
+            pts[op_idx] = (int(p[0]), int(p[1]))
+
+    l_sh = _mp_point(landmarks, 11, width=width, height=height)
+    r_sh = _mp_point(landmarks, 12, width=width, height=height)
+    if l_sh is not None and r_sh is not None:
+        pts[1] = (int((l_sh[0] + r_sh[0]) / 2), int((l_sh[1] + r_sh[1]) / 2))
+
+    return pts
+
+
+def _draw_openpose_skeleton(
+    canvas: "object",
+    openpose_pts: list[tuple[int, int] | None],
+    *,
+    line_thickness: int = 6,
+    joint_radius: int = 4,
+) -> None:
+    import numpy as np
+
+    h, w = canvas.shape[:2]
+    for i, j in OPENPOSE_COCO18_PAIRS:
+        a = openpose_pts[i] if i < len(openpose_pts) else None
+        b = openpose_pts[j] if j < len(openpose_pts) else None
+        if a is None or b is None:
+            continue
+        _draw_thick_line(canvas, a, b, thickness=line_thickness)
+
+    for p in openpose_pts:
+        if p is None:
+            continue
+        x, y = p
+        y0, y1 = max(0, y - joint_radius), min(h, y + joint_radius + 1)
+        x0, x1 = max(0, x - joint_radius), min(w, x + joint_radius + 1)
+        canvas[y0:y1, x0:x1] = 255
+
+
+def _draw_thick_line(
+    canvas: "object",
+    a: tuple[int, int],
+    b: tuple[int, int],
+    *,
+    thickness: int,
+) -> None:
+    import numpy as np
+
+    x0, y0 = a
+    x1, y1 = b
+    steps = max(abs(x1 - x0), abs(y1 - y0), 1)
+    for t in np.linspace(0.0, 1.0, num=steps + 1):
+        x = int(round(x0 + (x1 - x0) * t))
+        y = int(round(y0 + (y1 - y0) * t))
+        y0b, y1b = max(0, y - thickness), min(canvas.shape[0], y + thickness + 1)
+        x0b, x1b = max(0, x - thickness), min(canvas.shape[1], x + thickness + 1)
+        canvas[y0b:y1b, x0b:x1b] = 255
+
+
+def _pose_frame_energy(frame: "object") -> int:
+    import numpy as np
+
+    gray = np.asarray(frame).max(axis=2)
+    return int((gray > 16).sum())
+
+
+def _draw_pose_from_landmarks(
     canvas: "object",
     landmarks: list[object] | None,
     *,
     width: int,
     height: int,
 ) -> None:
-    """Draw white stick-figure pose lines on a black RGB uint8 canvas."""
-    if not landmarks:
-        return
-
-    pts = [_landmark_point(lm, width=width, height=height) for lm in landmarks]
-    for i, j in POSE_CONNECTIONS:
-        a = pts[i] if i < len(pts) else None
-        b = pts[j] if j < len(pts) else None
-        if a is None or b is None:
-            continue
-        _bresenham_line(canvas, a, b)
-
-    for p in pts:
-        if p is None:
-            continue
-        x, y = p
-        y0, y1 = max(0, y - 2), min(height, y + 3)
-        x0, x1 = max(0, x - 2), min(width, x + 3)
-        canvas[y0:y1, x0:x1] = 255
-
-
-def _bresenham_line(canvas: "object", a: tuple[int, int], b: tuple[int, int]) -> None:
-    x0, y0 = a
-    x1, y1 = b
-    h, w = canvas.shape[:2]
-    dx = abs(x1 - x0)
-    dy = -abs(y1 - y0)
-    sx = 1 if x0 < x1 else -1
-    sy = 1 if y0 < y1 else -1
-    err = dx + dy
-    while True:
-        if 0 <= x0 < w and 0 <= y0 < h:
-            canvas[y0, x0] = 255
-        if x0 == x1 and y0 == y1:
-            break
-        e2 = 2 * err
-        if e2 >= dy:
-            err += dy
-            x0 += sx
-        if e2 <= dx:
-            err += dx
-            y0 += sy
+    openpose_pts = mediapipe_landmarks_to_openpose18(landmarks, width=width, height=height)
+    _draw_openpose_skeleton(canvas, openpose_pts)
 
 
 def _pad_frame(canvas: "object", *, width: int, height: int, pad_w: int, pad_h: int) -> "object":
@@ -199,7 +249,7 @@ def _decode_motion_frames(
             if len(frames_rgb) >= num_frames:
                 break
             rgb = frame.reformat(width=width, height=height, format="rgb24")
-            frames_rgb.append(np.asarray(rgb.to_ndarray(), dtype=np.uint8))
+            frames_rgb.append(np.ascontiguousarray(rgb.to_ndarray(), dtype=np.uint8))
     if not frames_rgb:
         raise RuntimeError(f"No frames decoded from {source_video}")
     while len(frames_rgb) < num_frames:
@@ -212,18 +262,19 @@ def _pose_frames_legacy(
     *,
     width: int,
     height: int,
-) -> list["object"]:
+) -> tuple[list["object"], int]:
     import numpy as np
     import mediapipe as mp
 
     out: list[np.ndarray] = []
     last_landmarks: list[object] | None = None
+    detected = 0
     with mp.solutions.pose.Pose(
         static_image_mode=False,
-        model_complexity=1,
+        model_complexity=2,
         enable_segmentation=False,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
+        min_detection_confidence=0.35,
+        min_tracking_confidence=0.35,
     ) as pose:
         for arr in frames_rgb:
             result = pose.process(arr)
@@ -234,9 +285,11 @@ def _pose_frames_legacy(
                 last_landmarks = landmarks_list
             elif last_landmarks is not None:
                 landmarks_list = last_landmarks
-            _draw_pose_skeleton(canvas, landmarks_list, width=width, height=height)
+            _draw_pose_from_landmarks(canvas, landmarks_list, width=width, height=height)
+            if _pose_frame_energy(canvas) > 500:
+                detected += 1
             out.append(canvas)
-    return out
+    return out, detected
 
 
 def _pose_frames_tasks(
@@ -245,7 +298,7 @@ def _pose_frames_tasks(
     width: int,
     height: int,
     fps: float,
-) -> list["object"]:
+) -> tuple[list["object"], int]:
     import numpy as np
     import mediapipe as mp
     from mediapipe.tasks import python as mp_tasks
@@ -256,18 +309,21 @@ def _pose_frames_tasks(
         base_options=mp_tasks.BaseOptions(model_asset_path=model_path),
         running_mode=vision.RunningMode.VIDEO,
         num_poses=1,
-        min_pose_detection_confidence=0.5,
-        min_pose_presence_confidence=0.5,
-        min_tracking_confidence=0.5,
+        min_pose_detection_confidence=0.35,
+        min_pose_presence_confidence=0.35,
+        min_tracking_confidence=0.35,
     )
     out: list[np.ndarray] = []
     last_landmarks: list[object] | None = None
+    detected = 0
     frame_ms = 1000.0 / max(fps, 1.0)
 
     with vision.PoseLandmarker.create_from_options(options) as landmarker:
         for idx, arr in enumerate(frames_rgb):
+            arr = np.ascontiguousarray(arr, dtype=np.uint8)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=arr)
-            result = landmarker.detect_for_video(mp_image, int(idx * frame_ms))
+            timestamp_ms = int(round(idx * frame_ms))
+            result = landmarker.detect_for_video(mp_image, timestamp_ms)
             canvas = np.zeros((height, width, 3), dtype=np.uint8)
             landmarks_list = None
             if result.pose_landmarks:
@@ -275,9 +331,11 @@ def _pose_frames_tasks(
                 last_landmarks = landmarks_list
             elif last_landmarks is not None:
                 landmarks_list = last_landmarks
-            _draw_pose_skeleton(canvas, landmarks_list, width=width, height=height)
+            _draw_pose_from_landmarks(canvas, landmarks_list, width=width, height=height)
+            if _pose_frame_energy(canvas) > 500:
+                detected += 1
             out.append(canvas)
-    return out
+    return out, detected
 
 
 def render_pose_control_video(
@@ -289,7 +347,7 @@ def render_pose_control_video(
     num_frames: int,
     fps: float = 24.0,
 ) -> Path:
-    """Render per-frame pose stick figures (Union Control signal) from a motion clip."""
+    """Render OpenPose COCO-18 stick figures for Union Control IC-LoRA."""
     from ltx_media import _pyav_frame_rate, require_media
 
     require_pose_control()
@@ -310,15 +368,25 @@ def render_pose_control_video(
         source_video, width=width, height=height, num_frames=num_frames
     )
     if _mediapipe_has_tasks_pose():
-        pose_frames = _pose_frames_tasks(
+        pose_frames, detected = _pose_frames_tasks(
             frames_rgb, width=width, height=height, fps=float(fps)
         )
     elif _mediapipe_has_legacy_solutions():
-        pose_frames = _pose_frames_legacy(frames_rgb, width=width, height=height)
+        pose_frames, detected = _pose_frames_legacy(
+            frames_rgb, width=width, height=height
+        )
     else:
         raise RuntimeError(
             "Installed mediapipe has no pose API (legacy solutions or tasks). "
             "Upgrade/downgrade mediapipe or reinstall: pip install -U mediapipe"
+        )
+
+    min_detected = max(3, int(len(pose_frames) * 0.15))
+    if detected < min_detected:
+        raise RuntimeError(
+            f"Pose extraction found bodies in only {detected}/{len(pose_frames)} frames "
+            f"(need >={min_detected}). Use a clearer full-body motion reference, or "
+            "motion-only mode (video without character image) with HDR IC-LoRA."
         )
 
     with av.open(str(output_path), "w") as out:
@@ -338,11 +406,13 @@ def render_pose_control_video(
     if not output_path.is_file() or output_path.stat().st_size == 0:
         raise RuntimeError(f"Pose control encode produced empty output: {output_path}")
     log.info(
-        "IC-LoRA pose control: %s → %s (%d frames, %dx%d)",
+        "IC-LoRA OpenPose control: %s → %s (%d frames, %dx%d, detected=%d/%d)",
         source_video,
         output_path,
         num_frames,
         width,
         height,
+        detected,
+        len(pose_frames),
     )
     return output_path
