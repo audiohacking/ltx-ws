@@ -610,6 +610,36 @@ body {
   box-shadow: var(--shadow);
 }
 
+.prompt-field-wrap {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.btn-prompt-clear {
+  align-self: flex-end;
+  border: none;
+  background: none;
+  padding: 0 2px 2px;
+  font: inherit;
+  font-size: 0.65rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.btn-prompt-clear:hover:not(:disabled) {
+  color: var(--text);
+}
+
+.btn-prompt-clear:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
 .prompt-input {
   flex: 1;
   border: none;
