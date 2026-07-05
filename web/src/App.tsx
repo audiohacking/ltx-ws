@@ -372,6 +372,29 @@ export default function App() {
   const hasVideoSource = Boolean(videoPath || sourceClipId);
   const hasConditioningVideo = Boolean(conditioningVideoPath || conditioningClipId);
 
+  const icLoraSubMode = useMemo(() => {
+    if (!hasConditioningVideo) return "t2v" as const;
+    if (imagePath) return "motion_transfer" as const;
+    return "v2v" as const;
+  }, [hasConditioningVideo, imagePath]);
+
+  const icLoraPresetId = useMemo(() => {
+    const hdrId = config?.ic_lora_preset_id ?? "ic_lora_hdr";
+    const motionId = config?.ic_lora_motion_preset_id ?? "ic_lora_union_motion";
+    return icLoraSubMode === "motion_transfer" ? motionId : hdrId;
+  }, [config?.ic_lora_motion_preset_id, config?.ic_lora_preset_id, icLoraSubMode]);
+
+  const icLoraModeLabel = useMemo(() => {
+    switch (icLoraSubMode) {
+      case "motion_transfer":
+        return "Union Control — motion transfer (video + character)";
+      case "v2v":
+        return "HDR — reference video only (V2V / T2V + video)";
+      default:
+        return "HDR — text to video (no reference video)";
+    }
+  }, [icLoraSubMode]);
+
   const chainParts = useMemo(() => {
     if (!chainId || !selectedClipId) return [];
     return clips
@@ -593,25 +616,24 @@ export default function App() {
   }, [ensureLoraPresets]);
 
   useEffect(() => {
-    const hdrId = config?.ic_lora_preset_id ?? "ic_lora_hdr";
-    const motionId = config?.ic_lora_motion_preset_id ?? "ic_lora_union_motion";
     const entered = mode === "ic_lora" && prevModeRef.current !== "ic_lora";
     const left = mode !== "ic_lora" && prevModeRef.current === "ic_lora";
     prevModeRef.current = mode;
 
     if (entered) {
       preIcLoraPresetIdsRef.current = loraPresetIds;
-      const wantsMotion =
-        Boolean(conditioningVideoPath || conditioningClipId) && Boolean(imagePath);
-      const presetId = wantsMotion ? motionId : hdrId;
-      setLoraPresetIds([presetId]);
-      void ensureLoraPresets([presetId], config?.lora_presets, { interactive: true });
     } else if (left && preIcLoraPresetIdsRef.current !== null) {
       setLoraPresetIds(preIcLoraPresetIdsRef.current);
       preIcLoraPresetIdsRef.current = null;
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- only on mode transitions
-  }, [mode, config?.ic_lora_preset_id, config?.ic_lora_motion_preset_id, config?.lora_presets, ensureLoraPresets]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- snapshot on mode enter only
+  }, [mode]);
+
+  useEffect(() => {
+    if (mode !== "ic_lora" || !icLoraPresetId) return;
+    setLoraPresetIds([icLoraPresetId]);
+    void ensureLoraPresets([icLoraPresetId], config?.lora_presets, { interactive: true });
+  }, [mode, icLoraPresetId, config?.lora_presets, ensureLoraPresets]);
 
   const persistLoraSelection = useCallback(async (ids: string[]) => {
     try {
@@ -1893,10 +1915,9 @@ export default function App() {
               <div className="lora-row">
                 {isIcLora ? (
                   <p className="hint hint-inline lora-ic-auto">
-                    <strong>IC-LoRA HDR</strong> weights are selected and downloaded
-                    automatically for this mode.
+                    <strong>Auto:</strong> {icLoraModeLabel}
                     {loraActivity.phase === "working" && loraActivity.label
-                      ? ` (${loraActivity.label}…)`
+                      ? ` — downloading ${loraActivity.label}…`
                       : ""}
                   </p>
                 ) : (
@@ -2064,15 +2085,16 @@ export default function App() {
                   {isIcLora && (
                     <>
                       <span className="media-panel-title">IC-LoRA inputs</span>
+                      <p className="hint hint-inline ic-lora-active-mode">
+                        Active: <strong>{icLoraModeLabel}</strong>
+                      </p>
                       <p className="hint hint-inline">
-                        <strong>Motion video only</strong> — HDR IC-LoRA: T2V or V2V guided by
-                        the reference clip (no character image).{" "}
-                        <strong>Motion + character image</strong> — Union Control: motion video
-                        becomes pose skeletons (mediapipe); the image anchors who to render.
-                        {!config?.pose_control_available && (
+                        Add or remove the character image to switch between HDR reference-video
+                        mode and Union Control motion transfer. Weights download automatically.
+                        {!config?.pose_control_available && icLoraSubMode === "motion_transfer" && (
                           <>
                             {" "}
-                            Motion+character needs mediapipe:{" "}
+                            Motion transfer needs mediapipe:{" "}
                             <code>pip install mediapipe</code>
                           </>
                         )}
