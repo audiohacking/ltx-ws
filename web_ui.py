@@ -90,6 +90,7 @@ IC_LORA_UNION_MOTION_SPEC = (
     "resolve/main/ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors"
 )
 IC_LORA_DEFAULT_SCALE = 1.0
+IC_LORA_BUILTIN_SPECS = frozenset({IC_LORA_DEFAULT_SPEC, IC_LORA_UNION_MOTION_SPEC})
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "web_outputs"
 
 
@@ -1472,6 +1473,8 @@ def _apply_ic_lora_defaults(body: dict[str, Any]) -> dict[str, Any]:
             continue
         spec = str(item[0]).strip()
         if not spec or spec in seen:
+            continue
+        if spec in IC_LORA_BUILTIN_SPECS and spec != primary:
             continue
         try:
             scale = float(item[1])

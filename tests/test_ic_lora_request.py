@@ -151,6 +151,29 @@ def test_apply_ic_lora_defaults_keeps_extra_loras():
     assert len(out["lora_specs"]) == 2
 
 
+def test_apply_ic_lora_defaults_strips_alternate_builtin():
+    from web_ui import (
+        IC_LORA_DEFAULT_SCALE,
+        IC_LORA_DEFAULT_SPEC,
+        IC_LORA_UNION_MOTION_SPEC,
+        _apply_ic_lora_defaults,
+    )
+
+    out = _apply_ic_lora_defaults(
+        {
+            "mode": "ic_lora",
+            "prompt": "v2v",
+            "video_conditioning": [["/tmp/motion.mp4", 1.0]],
+            "lora_specs": [
+                [IC_LORA_UNION_MOTION_SPEC, 1.0],
+                [IC_LORA_DEFAULT_SPEC, 1.0],
+            ],
+        }
+    )
+    specs = [row[0] for row in out["lora_specs"]]
+    assert specs == [IC_LORA_DEFAULT_SPEC]
+
+
 def test_ic_lora_t2v_allows_missing_video_conditioning():
     from web_ui import IC_LORA_DEFAULT_SPEC, _build_params_from_request
 

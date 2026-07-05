@@ -672,15 +672,24 @@ export default function App() {
     (presetId: string, checked: boolean) => {
       if (loraBusy) return;
       setLoraPresetIds((prev) => {
-        const next = checked
+        let next = checked
           ? [...prev.filter((id) => id !== presetId), presetId]
           : prev.filter((id) => id !== presetId);
+        if (mode === "ic_lora") {
+          const hdrId = config?.ic_lora_preset_id ?? "ic_lora_hdr";
+          const motionId = config?.ic_lora_motion_preset_id ?? "ic_lora_union_motion";
+          if (presetId === hdrId && checked) {
+            next = next.filter((id) => id !== motionId);
+          } else if (presetId === motionId && checked) {
+            next = next.filter((id) => id !== hdrId);
+          }
+        }
         void persistLoraSelection(next);
         void ensureLoraPresets(next, undefined, { interactive: true });
         return next;
       });
     },
-    [ensureLoraPresets, loraBusy, persistLoraSelection],
+    [config?.ic_lora_motion_preset_id, config?.ic_lora_preset_id, ensureLoraPresets, loraBusy, mode, persistLoraSelection],
   );
 
   async function addCustomLora() {

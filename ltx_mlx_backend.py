@@ -1236,16 +1236,57 @@ class GenerationCancelledError(RuntimeError):
     """Raised when generation is cancelled via ``request_cancel()``."""
 
 
+def _ic_lora_primary_lora(
+    resolved_loras: list[tuple[str, float]],
+) -> tuple[str, float] | None:
+    if not resolved_loras:
+        return None
+    return resolved_loras[0]
+
+
 def _ic_lora_uses_hdr_pipeline(resolved_loras: list[tuple[str, float]]) -> bool:
-    """True when any resolved LoRA declares HDR metadata (use HDRICLoraPipeline)."""
+    """True when the primary LoRA is HDR (HDRICLoraPipeline + raw RGB ref video)."""
+    primary = _ic_lora_primary_lora(resolved_loras)
+    if primary is None:
+        return False
+    path, _ = primary
     try:
         from ltx_core_mlx.loader.hdr_metadata import read_hdr_lora_config
-    except ImportError:
-        return False
-    for path, _ in resolved_loras:
+
         if read_hdr_lora_config(path):
             return True
-    return False
+    except ImportError:
+        pass
+    lowered = path.lower()
+    return "ic-lora-hdr" in lowered or "ic_lora_hdr" in lowered
+
+
+def _ic_lora_reference_downscale_factor(lora_path: str) -> int:
+    """IC-LoRA ref scale from safetensors metadata (Union Control = 2, HDR = 1)."""
+    try:
+        from ltx_pipelines_mlx.iclora_utils import read_lora_reference_downscale_factor
+
+        return int(read_lora_reference_downscale_factor(lora_path))
+    except ImportError:
+        lowered = lora_path.lower()
+        if "ref0.5" in lowered or "union-control" in lowered:
+            return 2
+        return 1
+
+
+def _needs_pose_control_preprocessing(
+    resolved_loras: list[tuple[str, float]],
+    vc_items: list[tuple[str, float]],
+) -> bool:
+    """Control IC-LoRAs (ref downscale > 1) need pose/canny/depth — not raw RGB."""
+    if not vc_items:
+        return False
+    primary = _ic_lora_primary_lora(resolved_loras)
+    if primary is None:
+        return False
+    if _ic_lora_uses_hdr_pipeline(resolved_loras):
+        return False
+    return _ic_lora_reference_downscale_factor(primary[0]) != 1
 
 
 def _build_ic_lora_image_conditionings(
@@ -1262,18 +1303,6 @@ def _build_ic_lora_image_conditionings(
     return [(image_path, 0, 1.0, IC_LORA_IMAGE_CRF)]
 
 
-def _needs_pose_control_preprocessing(
-    resolved_loras: list[tuple[str, float]],
-    vc_items: list[tuple[str, float]],
-) -> bool:
-    """Union Control expects pose/depth/canny — not raw RGB motion video."""
-    if not vc_items:
-        return False
-    if _ic_lora_uses_hdr_pipeline(resolved_loras):
-        return False
-    return True
-
-
 def _prepare_ic_lora_video_conditioning(
     vc_items: list[tuple[str, float]],
     *,
@@ -1288,6 +1317,11 @@ def _prepare_ic_lora_video_conditioning(
     cleanup: list[str] = []
     combined = [(str(p), float(s)) for p, s in vc_items]
     if not _needs_pose_control_preprocessing(resolved_loras, vc_items):
+        log.info(
+            "IC-LoRA video conditioning: %d raw reference clip(s) (primary=%s)",
+            len(combined),
+            _ic_lora_primary_lora(resolved_loras)[0] if _ic_lora_primary_lora(resolved_loras) else "?",
+        )
         return combined, cleanup
 
     from ltx_ic_lora_preprocess import render_pose_control_video, require_pose_control
@@ -2230,6 +2264,17 @@ class LocalVideoGenerator:
                             "hdr_ic_lora"
                             if _ic_lora_uses_hdr_pipeline(resolved_loras)
                             else "ic_lora"
+                        )
+                        primary_lora = _ic_lora_primary_lora(resolved_loras)
+                        log.info(
+                            "IC-LoRA invoke: pipe=%s primary=%s vcond_in=%d image=%s pose_preprocess=%s",
+                            ic_pipe_key,
+                            primary_lora[0] if primary_lora else "?",
+                            len(vc_items),
+                            "yes" if tmp_image else "no",
+                            "yes"
+                            if _needs_pose_control_preprocessing(resolved_loras, vc_items)
+                            else "no",
                         )
                         pipe = self._get_pipe(
                             ic_pipe_key,
