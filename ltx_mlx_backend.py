@@ -2042,8 +2042,6 @@ class LocalVideoGenerator:
                     elif mode == "ic_lora":
                         if not resolved_loras:
                             raise RuntimeError("ic_lora mode requires at least one LoRA spec")
-                        if not vc_items:
-                            raise RuntimeError("ic_lora mode requires video_conditioning entries")
                         pipe = self._get_pipe(
                             "ic_lora",
                             pipe_kwargs={
@@ -2051,18 +2049,26 @@ class LocalVideoGenerator:
                             },
                         )
                         last_pipe = pipe
-                        _invoke_generate_and_save(
-                            pipe,
-                            prompt=req.prompt,
-                            output_path=out_path,
-                            video_conditioning=[(str(p), float(s)) for p, s in vc_items],
-                            height=height,
-                            width=width,
-                            num_frames=nf,
-                            fps=float(self.fps),
-                            seed=seed,
-                            num_steps=steps,
-                        )
+                        ic_kwargs: dict[str, Any] = {
+                            "prompt": req.prompt,
+                            "output_path": out_path,
+                            "video_conditioning": [(str(p), float(s)) for p, s in vc_items],
+                            "height": height,
+                            "width": width,
+                            "num_frames": nf,
+                            "frame_rate": float(self.fps),
+                            "seed": seed,
+                            "stage1_steps": int(steps),
+                        }
+                        if tmp_image:
+                            ic_kwargs["images"] = [(tmp_image, 0, 1.0)]
+                        if req.reference_strength is not None:
+                            ic_kwargs["conditioning_attention_strength"] = float(
+                                req.reference_strength
+                            )
+                        if req.stage2_steps is not None:
+                            ic_kwargs["stage2_steps"] = int(req.stage2_steps)
+                        _invoke_generate_and_save(pipe, **ic_kwargs)
                     elif tmp_image:
                         try:
                             from PIL import Image as PILImage

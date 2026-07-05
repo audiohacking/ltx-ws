@@ -55,7 +55,7 @@ GENERATION_MODES = [
     {"id": "extend", "label": "Extend video"},
     {"id": "keyframe", "label": "Keyframe interpolation"},
     {"id": "lipdub", "label": "LipDub (experimental)"},
-    {"id": "ic_lora", "label": "IC LoRA conditioning"},
+    {"id": "ic_lora", "label": "IC-LoRA (motion / character ref)"},
 ]
 
 CHAIN_METHODS = [
@@ -307,6 +307,13 @@ def _lora_catalog(output_dir: Path | None = None) -> tuple[list[dict[str, Any]],
                 float(entry["scale"]),
             )
             presets[-1]["custom"] = True
+
+    _add(
+        "ic_lora_hdr",
+        "IC-LoRA HDR (Lightricks)",
+        "Lightricks/LTX-2.3-22b-IC-LoRA-HDR",
+        1.0,
+    )
 
     if output_dir is not None:
         hidden = _read_hidden_lora_ids(output_dir)
@@ -567,8 +574,26 @@ def _upload_paths_from_body(body: dict[str, Any], upload_dir: Path) -> list[Path
         upload_root = upload_dir.resolve()
     except OSError:
         return paths
-    for key in ("image_path", "audio_path", "video_path", "end_image_path"):
+    for key in ("image_path", "audio_path", "video_path", "end_image_path", "conditioning_video_path"):
         raw = body.get(key)
+        if not raw:
+            continue
+        try:
+            candidate = Path(str(raw)).resolve()
+        except (OSError, ValueError):
+            continue
+        if not candidate.is_file():
+            continue
+        try:
+            if candidate.is_relative_to(upload_root):
+                paths.append(candidate)
+        except AttributeError:
+            if str(candidate).startswith(str(upload_root)):
+                paths.append(candidate)
+    for item in body.get("video_conditioning") or []:
+        if not isinstance(item, list) or not item:
+            continue
+        raw = item[0]
         if not raw:
             continue
         try:
@@ -627,6 +652,7 @@ def _validate_request_media_paths(body: dict[str, Any]) -> None:
         ("image_path", "Image"),
         ("end_image_path", "End image"),
         ("video_path", "Video"),
+        ("conditioning_video_path", "Conditioning video"),
     ):
         raw = body.get(key)
         if not raw:
@@ -636,6 +662,18 @@ def _validate_request_media_paths(body: dict[str, Any]) -> None:
             raise HTTPException(
                 400,
                 f"{label} file not found: {raw}. Re-upload the file and try again.",
+            )
+    for item in body.get("video_conditioning") or []:
+        if not isinstance(item, list) or not item:
+            continue
+        raw = item[0]
+        if not raw:
+            continue
+        path = Path(str(raw)).expanduser()
+        if not path.is_file():
+            raise HTTPException(
+                400,
+                f"Conditioning video file not found: {raw}. Re-upload the file and try again.",
             )
 
 
@@ -1338,6 +1376,40 @@ async def healthcheck_ws(url: str) -> bool:
         return False
 
 
+def _resolve_ic_lora_video_conditioning(
+    state: AppState,
+    body: dict[str, Any],
+) -> dict[str, Any]:
+    """Normalize IC-LoRA motion-reference fields into ``video_conditioning``."""
+    body = dict(body)
+    if (body.get("mode") or "generate").strip().lower() != "ic_lora":
+        return body
+    if body.get("video_conditioning"):
+        return body
+    try:
+        scale = float(body.get("conditioning_video_scale", 1.0))
+    except (TypeError, ValueError):
+        scale = 1.0
+    clip_id = str(body.get("conditioning_clip_id") or "").strip()
+    if clip_id:
+        clip = state.clips.get(clip_id)
+        if not clip:
+            raise HTTPException(400, f"Conditioning clip not found: {clip_id}")
+        if clip.status != RunStatus.DONE.value:
+            raise HTTPException(400, f"Conditioning clip is not ready (status={clip.status})")
+        if not clip.filename:
+            raise HTTPException(400, "Conditioning clip has no video file")
+        path = state.output_dir / clip.filename
+        if not path.is_file():
+            raise HTTPException(400, f"Conditioning clip file missing on disk: {clip.filename}")
+        body["video_conditioning"] = [[str(path.resolve()), scale]]
+        return body
+    raw = body.get("conditioning_video_path")
+    if raw:
+        body["video_conditioning"] = [[str(raw), scale]]
+    return body
+
+
 def _api_mode(mode: str) -> str:
     """Map Web UI mode to generation_mode (i2v → generate + initial_image; a2v stays a2v)."""
     m = (mode or "generate").strip().lower()
@@ -1370,7 +1442,7 @@ def _build_params_from_request(body: dict[str, Any], *, state: AppState | None =
     ) = _import_videofentanyl()
     ui_mode = (body.get("mode") or "generate").strip().lower()
     mode = _api_mode(ui_mode)
-    image_path = body.get("image_path") if ui_mode in ("i2v", "a2v", "generate", "keyframe") else None
+    image_path = body.get("image_path") if ui_mode in ("i2v", "a2v", "generate", "keyframe", "ic_lora") else None
     end_image_path = body.get("end_image_path") if ui_mode == "keyframe" else None
     audio_path = body.get("audio_path") if ui_mode in ("a2v", "lipdub") else None
     video_path: str | None = None
@@ -2810,11 +2882,10 @@ def create_app(
         if ui_mode == "a2v" and not body.get("audio_path"):
             raise HTTPException(400, "a2v mode requires an audio upload")
         _validate_source_video_request(state, body, ui_mode)
+        body = _resolve_ic_lora_video_conditioning(state, body)
         if ui_mode == "ic_lora":
             if not body.get("lora_specs"):
-                raise HTTPException(400, "ic_lora requires lora_specs")
-            if not body.get("video_conditioning"):
-                raise HTTPException(400, "ic_lora requires video_conditioning")
+                raise HTTPException(400, "ic_lora requires at least one IC-LoRA in lora_specs")
         if ui_mode == "keyframe" and (not body.get("image_path") or not body.get("end_image_path")):
             raise HTTPException(400, "keyframe mode requires start and end image uploads")
         if ui_mode == "lipdub":

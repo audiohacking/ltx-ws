@@ -324,6 +324,10 @@ export default function App() {
   const [audioDurationSeconds, setAudioDurationSeconds] = useState<number | null>(null);
   const [audioStartSeconds, setAudioStartSeconds] = useState(0);
   const [videoPath, setVideoPath] = useState<string | null>(null);
+  const [conditioningVideoPath, setConditioningVideoPath] = useState<string | null>(null);
+  const [conditioningVideoName, setConditioningVideoName] = useState<string | null>(null);
+  const [conditioningClipId, setConditioningClipId] = useState<string | null>(null);
+  const [conditioningVideoScale, setConditioningVideoScale] = useState(1.0);
   const [sourceClipId, setSourceClipId] = useState<string | null>(null);
   const [retakeStart, setRetakeStart] = useState(1);
   const [retakeEnd, setRetakeEnd] = useState(1);
@@ -345,6 +349,7 @@ export default function App() {
   const endImageRef = useRef<HTMLInputElement>(null);
   const audioRef = useRef<HTMLInputElement>(null);
   const videoRef = useRef<HTMLInputElement>(null);
+  const conditioningVideoRef = useRef<HTMLInputElement>(null);
   const ensuredLoraSpecsRef = useRef<Set<string>>(readEnsuredLoraSpecs());
   const loraPresetsRef = useRef<LoraPreset[]>([]);
   const ensurePromisesRef = useRef<Map<string, Promise<void>>>(new Map());
@@ -363,6 +368,7 @@ export default function App() {
   );
 
   const hasVideoSource = Boolean(videoPath || sourceClipId);
+  const hasConditioningVideo = Boolean(conditioningVideoPath || conditioningClipId);
 
   const chainParts = useMemo(() => {
     if (!chainId || !selectedClipId) return [];
@@ -920,13 +926,18 @@ export default function App() {
     resetAudioSelection();
     setVideoPath(null);
     setSourceClipId(null);
+    setConditioningVideoPath(null);
+    setConditioningVideoName(null);
+    setConditioningClipId(null);
+    setConditioningVideoScale(1.0);
     if (imageRef.current) imageRef.current.value = "";
     if (endImageRef.current) endImageRef.current.value = "";
     if (videoRef.current) videoRef.current.value = "";
+    if (conditioningVideoRef.current) conditioningVideoRef.current.value = "";
   }
 
   function clearMediaForMode(nextMode: string) {
-    if (!["i2v", "generate", "a2v", "keyframe"].includes(nextMode)) {
+    if (!["i2v", "generate", "a2v", "keyframe", "ic_lora"].includes(nextMode)) {
       setImagePath(null);
       setImageName(null);
       if (imageRef.current) imageRef.current.value = "";
@@ -945,8 +956,20 @@ export default function App() {
       setSourceClipId(null);
       if (videoRef.current) videoRef.current.value = "";
     }
+    if (nextMode !== "ic_lora") {
+      setConditioningVideoPath(null);
+      setConditioningVideoName(null);
+      setConditioningClipId(null);
+      setConditioningVideoScale(1.0);
+      if (conditioningVideoRef.current) conditioningVideoRef.current.value = "";
+    }
     if (nextMode === "a2v") {
       setChainMethod("autocontinue");
+    }
+    if (nextMode === "ic_lora") {
+      setClipMultiplier(1);
+      setAutocontinue(false);
+      setAutoconcat(false);
     }
   }
 
@@ -980,6 +1003,7 @@ export default function App() {
 
   const needsImageUpload = mode === "i2v" || mode === "keyframe";
   const isA2v = mode === "a2v";
+  const isIcLora = mode === "ic_lora";
   const pyavAvailable =
     config?.pyav_available ?? config?.audio_trim_available ?? false;
   const audioTrimAvailable = pyavAvailable;
@@ -1359,7 +1383,7 @@ export default function App() {
       body.extend_direction = extendDirection;
     }
     if (
-      (mode === "i2v" || mode === "generate" || mode === "a2v" || mode === "keyframe") &&
+      (mode === "i2v" || mode === "generate" || mode === "a2v" || mode === "keyframe" || mode === "ic_lora") &&
       imagePath
     ) {
       body.image_path = imagePath;
@@ -1381,6 +1405,15 @@ export default function App() {
         }
       }
     }
+    if (mode === "ic_lora") {
+      if (conditioningVideoPath) {
+        body.conditioning_video_path = conditioningVideoPath;
+        body.conditioning_video_scale = conditioningVideoScale;
+      } else if (conditioningClipId) {
+        body.conditioning_clip_id = conditioningClipId;
+        body.conditioning_video_scale = conditioningVideoScale;
+      }
+    }
     if ((mode === "retake" || mode === "extend" || mode === "lipdub") && sourceClipId) {
       body.source_clip_id = sourceClipId;
     } else if ((mode === "retake" || mode === "extend" || mode === "lipdub") && videoPath) {
@@ -1397,6 +1430,12 @@ export default function App() {
     );
     if (mode === "lipdub" && selectedLoras.length !== 1) {
       setError("LipDub requires exactly one LoRA — select a single preset.");
+      setBusy(false);
+      setProgress(null);
+      return;
+    }
+    if (mode === "ic_lora" && selectedLoras.length === 0) {
+      setError("IC-LoRA requires at least one IC-LoRA preset — select one above.");
       setBusy(false);
       setProgress(null);
       return;
@@ -1459,6 +1498,12 @@ export default function App() {
     if ((mode === "retake" || mode === "extend" || mode === "lipdub") && !hasVideoSource) {
       return false;
     }
+    if (mode === "ic_lora") {
+      const icLoras = (config?.lora_presets ?? []).filter(
+        (p) => loraPresetIds.includes(p.id) && p.spec,
+      );
+      if (icLoras.length === 0) return false;
+    }
     return true;
   }, [
     prompt,
@@ -1478,6 +1523,8 @@ export default function App() {
     autocontinue,
     activeClip,
     chainId,
+    loraPresetIds,
+    config?.lora_presets,
   ]);
 
   const fitPromptHeight = useCallback(() => {
@@ -1760,6 +1807,7 @@ export default function App() {
                   Clips
                   <select
                     value={clipMultiplier}
+                    disabled={isIcLora}
                     onChange={(e) => setClipMultiplier(Number(e.target.value))}
                   >
                     {Array.from(
@@ -1916,7 +1964,7 @@ export default function App() {
                   />
                   Enhance prompt
                 </label>
-                {!isMultiClip && !audiocontinue && (
+                {!isMultiClip && !audiocontinue && !isIcLora && (
                   <label className="check">
                     <input
                       type="checkbox"
@@ -1931,7 +1979,7 @@ export default function App() {
                     type="checkbox"
                     checked={autoconcat}
                     onChange={(e) => setAutoconcat(e.target.checked)}
-                    disabled={isMultiClip || audiocontinue}
+                    disabled={isMultiClip || audiocontinue || isIcLora}
                   />
                   Autoconcat
                 </label>
@@ -1977,8 +2025,120 @@ export default function App() {
                 </div>
               )}
 
-              {(isA2v || needsImageUpload || showStartImageOptional || needsVideoUpload || needsEndImageUpload) && (
+              {(isA2v || isIcLora || needsImageUpload || showStartImageOptional || needsVideoUpload || needsEndImageUpload) && (
                 <div className="media-panel">
+                  {isIcLora && (
+                    <>
+                      <span className="media-panel-title">IC-LoRA inputs</span>
+                      <p className="hint hint-inline">
+                        Select an IC-LoRA preset above (e.g. HDR). Motion reference video drives
+                        v2v transfer; character image is optional. Omit motion video for pure T2V.
+                      </p>
+                      <div className="media-upload-row">
+                        <label className="media-upload">
+                          <span className="media-upload-label">
+                            Motion reference video (optional)
+                          </span>
+                          <input
+                            ref={conditioningVideoRef}
+                            type="file"
+                            accept="video/*"
+                            onChange={async (e) => {
+                              const f = e.target.files?.[0];
+                              if (f) {
+                                setConditioningClipId(null);
+                                setConditioningVideoPath(await uploadFile(f, "video"));
+                                setConditioningVideoName(f.name);
+                              }
+                            }}
+                          />
+                          <span className="media-upload-hint">
+                            {conditioningVideoName ?? "Choose motion reference…"}
+                          </span>
+                        </label>
+                        <label className="media-upload">
+                          <span className="media-upload-label">
+                            Character reference image (optional)
+                          </span>
+                          <input
+                            ref={imageRef}
+                            type="file"
+                            accept="image/*"
+                            onChange={async (e) => {
+                              const f = e.target.files?.[0];
+                              if (f) {
+                                setImagePath(await uploadFile(f, "image"));
+                                setImageName(f.name);
+                              }
+                            }}
+                          />
+                          <span className="media-upload-hint">
+                            {imageName ?? "Choose character image…"}
+                          </span>
+                        </label>
+                      </div>
+                      {videoLibraryClips.length > 0 && (
+                        <label className="clip-source-picker">
+                          <span className="media-upload-label">
+                            Or motion reference from library
+                          </span>
+                          <select
+                            value={conditioningClipId ?? ""}
+                            onChange={(e) => {
+                              const id = e.target.value || null;
+                              setConditioningClipId(id);
+                              if (id) {
+                                setConditioningVideoPath(null);
+                                setConditioningVideoName(null);
+                                if (conditioningVideoRef.current) {
+                                  conditioningVideoRef.current.value = "";
+                                }
+                              }
+                            }}
+                          >
+                            <option value="">Select a clip…</option>
+                            {videoLibraryClips.map((c) => {
+                              const label = clipDisplayPrompt(c.prompt);
+                              const meta = [
+                                c.label,
+                                c.width && c.height ? `${c.width}×${c.height}` : null,
+                              ]
+                                .filter(Boolean)
+                                .join(" · ");
+                              return (
+                                <option key={c.id} value={c.id}>
+                                  {meta ? `${label} (${meta})` : label}
+                                </option>
+                              );
+                            })}
+                          </select>
+                        </label>
+                      )}
+                      <label className="ic-lora-scale">
+                        Motion conditioning strength
+                        <input
+                          type="number"
+                          min={0}
+                          max={2}
+                          step={0.05}
+                          value={conditioningVideoScale}
+                          disabled={!hasConditioningVideo}
+                          onChange={(e) =>
+                            setConditioningVideoScale(
+                              Math.min(2, Math.max(0, Number(e.target.value) || 0)),
+                            )
+                          }
+                        />
+                      </label>
+                      {hasConditioningVideo && (
+                        <p className="media-source-note">
+                          {conditioningClipId
+                            ? "Using library clip as motion reference."
+                            : "Using uploaded file as motion reference."}
+                        </p>
+                      )}
+                    </>
+                  )}
                   {isA2v && (
                     <>
                       <span className="media-panel-title">Audio to video inputs</span>

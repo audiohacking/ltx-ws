@@ -1262,6 +1262,23 @@ body {
   accent-color: var(--accent);
 }
 
+.ic-lora-scale {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 0.85rem;
+  max-width: 12rem;
+}
+
+.ic-lora-scale input[type="number"] {
+  font-size: 0.8rem;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+}
+
 .clip-source-picker {
   display: flex;
   flex-direction: column;

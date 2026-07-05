@@ -273,8 +273,6 @@ async def ltx_generate_video(
     if mode == "ic_lora":
         if not lora_specs:
             raise ValueError("mode=ic_lora requires lora_specs")
-        if not video_conditioning:
-            raise ValueError("mode=ic_lora requires video_conditioning")
     if mode == "keyframe":
         if not image or not end_image:
             raise ValueError("mode=keyframe requires image and end_image")

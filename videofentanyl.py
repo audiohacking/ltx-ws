@@ -1995,9 +1995,6 @@ async def async_main(args: argparse.Namespace):
         if not args.lora:
             print("Error: --generation-mode ic_lora requires at least one --lora <path_or_repo> <scale>")
             sys.exit(2)
-        if not args.video_conditioning:
-            print("Error: --generation-mode ic_lora requires --video-conditioning <video> <scale>")
-            sys.exit(2)
     if args.generation_mode == "keyframe":
         if not args.image or not args.end_image:
             print("Error: --generation-mode keyframe requires --image and --end-image")
