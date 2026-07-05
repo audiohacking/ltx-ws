@@ -80,12 +80,28 @@ PIPELINE_PROFILES = [
 
 CLIP_MULTIPLIER_MAX = 10
 IC_LORA_PRESET_ID = "ic_lora_hdr"
+IC_LORA_MOTION_PRESET_ID = "ic_lora_union_motion"
 IC_LORA_DEFAULT_SPEC = (
     "https://huggingface.co/buckets/audiohacking/LTX-2.3-22b-IC-LoRA-HDR-bucket/"
     "resolve/ltx-2.3-22b-ic-lora-hdr-0.9.safetensors"
 )
+IC_LORA_UNION_MOTION_SPEC = (
+    "https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control/"
+    "resolve/main/ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors"
+)
 IC_LORA_DEFAULT_SCALE = 1.0
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "web_outputs"
+
+
+def _pose_control_available() -> bool:
+    try:
+        from ltx_ic_lora_preprocess import pose_control_available
+
+        return pose_control_available()
+    except ImportError:
+        return False
+
+
 DEFAULT_UPLOAD_DIR = REPO_ROOT / "web_uploads"
 INDEX_FILE = "index.json"
 SETTINGS_FILE = "settings.json"
@@ -318,6 +334,12 @@ def _lora_catalog(output_dir: Path | None = None) -> tuple[list[dict[str, Any]],
         "ic_lora_hdr",
         "IC-LoRA HDR",
         IC_LORA_DEFAULT_SPEC,
+        1.0,
+    )
+    _add(
+        "ic_lora_union_motion",
+        "IC-LoRA Union Control (motion transfer)",
+        IC_LORA_UNION_MOTION_SPEC,
         1.0,
     )
 
@@ -1416,12 +1438,28 @@ def _resolve_ic_lora_video_conditioning(
     return body
 
 
+def _ic_lora_has_motion_reference(body: dict[str, Any]) -> bool:
+    if body.get("video_conditioning"):
+        return True
+    if body.get("conditioning_video_path") or body.get("conditioning_clip_id"):
+        return True
+    return False
+
+
 def _apply_ic_lora_defaults(body: dict[str, Any]) -> dict[str, Any]:
-    """IC-LoRA mode always uses the dedicated HDR IC-LoRA weights."""
+    """Pick HDR vs Union Control IC-LoRA weights for the requested inputs."""
     if (body.get("mode") or "generate").strip().lower() != "ic_lora":
         return body
     new_body = dict(body)
-    new_body["lora_specs"] = [[IC_LORA_DEFAULT_SPEC, IC_LORA_DEFAULT_SCALE]]
+    has_motion = _ic_lora_has_motion_reference(new_body)
+    has_character = bool(new_body.get("image_path"))
+    if has_motion and has_character:
+        new_body["lora_specs"] = [[IC_LORA_UNION_MOTION_SPEC, IC_LORA_DEFAULT_SCALE]]
+    elif has_motion:
+        # Motion-only: pose-controlled generation (not HDR V2V color upgrade).
+        new_body["lora_specs"] = [[IC_LORA_UNION_MOTION_SPEC, IC_LORA_DEFAULT_SCALE]]
+    else:
+        new_body["lora_specs"] = [[IC_LORA_DEFAULT_SPEC, IC_LORA_DEFAULT_SCALE]]
     return new_body
 
 
@@ -2669,7 +2707,10 @@ def create_app(
             "default_lora_preset_id": default_lora_preset_id,
             "preferred_lora_preset_ids": preferred_lora_ids,
             "ic_lora_preset_id": IC_LORA_PRESET_ID,
+            "ic_lora_motion_preset_id": IC_LORA_MOTION_PRESET_ID,
             "ic_lora_default_spec": IC_LORA_DEFAULT_SPEC,
+            "ic_lora_union_motion_spec": IC_LORA_UNION_MOTION_SPEC,
+            "pose_control_available": _pose_control_available(),
             "pyav_available": media_available(),
             "audio_trim_available": media_available(),
         }
@@ -2902,13 +2943,17 @@ def create_app(
         body = _resolve_ic_lora_video_conditioning(state, body)
         if ui_mode == "ic_lora":
             body = _apply_ic_lora_defaults(body)
-            try:
-                await asyncio.to_thread(_ensure_lora_downloaded, IC_LORA_DEFAULT_SPEC)
-            except Exception as exc:
-                raise HTTPException(
-                    400,
-                    f"Could not download IC-LoRA weights ({IC_LORA_DEFAULT_SPEC}): {exc}",
-                ) from exc
+            for lora_item in body.get("lora_specs") or []:
+                if not isinstance(lora_item, (list, tuple)) or not lora_item:
+                    continue
+                spec = str(lora_item[0])
+                try:
+                    await asyncio.to_thread(_ensure_lora_downloaded, spec)
+                except Exception as exc:
+                    raise HTTPException(
+                        400,
+                        f"Could not download IC-LoRA weights ({spec}): {exc}",
+                    ) from exc
         if ui_mode == "keyframe" and (not body.get("image_path") or not body.get("end_image_path")):
             raise HTTPException(400, "keyframe mode requires start and end image uploads")
         if ui_mode == "lipdub":

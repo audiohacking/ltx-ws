@@ -87,6 +87,28 @@ def test_apply_ic_lora_defaults_injects_hdr_lora():
     assert unchanged["lora_specs"] == [["x", 1.0]]
 
 
+def test_apply_ic_lora_defaults_union_for_motion_transfer(tmp_path: Path):
+    from web_ui import (
+        IC_LORA_DEFAULT_SCALE,
+        IC_LORA_UNION_MOTION_SPEC,
+        _apply_ic_lora_defaults,
+    )
+
+    img = tmp_path / "char.jpg"
+    img.write_bytes(b"x")
+    motion = tmp_path / "motion.mp4"
+    motion.write_bytes(b"x")
+    out = _apply_ic_lora_defaults(
+        {
+            "mode": "ic_lora",
+            "prompt": "portrait walking",
+            "image_path": str(img),
+            "video_conditioning": [[str(motion), 1.0]],
+        }
+    )
+    assert out["lora_specs"] == [[IC_LORA_UNION_MOTION_SPEC, IC_LORA_DEFAULT_SCALE]]
+
+
 def test_ic_lora_t2v_allows_missing_video_conditioning():
     from web_ui import IC_LORA_DEFAULT_SPEC, _build_params_from_request
 

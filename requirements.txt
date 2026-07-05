@@ -9,5 +9,8 @@ uvicorn[standard]>=0.32.0
 python-multipart>=0.0.12
 mcp>=1.0.0
 
+# Optional: IC-LoRA motion transfer (pose control video from motion reference)
+# mediapipe>=0.10.0
+
 # MLX LTX-2.3 (not on PyPI) — install after the lines above:
 # uv pip install "ltx-core-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@v0.14.15#subdirectory=packages/ltx-core-mlx" "ltx-pipelines-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@v0.14.15#subdirectory=packages/ltx-pipelines-mlx"

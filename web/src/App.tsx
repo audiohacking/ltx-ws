@@ -593,21 +593,25 @@ export default function App() {
   }, [ensureLoraPresets]);
 
   useEffect(() => {
-    const icId = config?.ic_lora_preset_id ?? "ic_lora_hdr";
+    const hdrId = config?.ic_lora_preset_id ?? "ic_lora_hdr";
+    const motionId = config?.ic_lora_motion_preset_id ?? "ic_lora_union_motion";
     const entered = mode === "ic_lora" && prevModeRef.current !== "ic_lora";
     const left = mode !== "ic_lora" && prevModeRef.current === "ic_lora";
     prevModeRef.current = mode;
 
     if (entered) {
       preIcLoraPresetIdsRef.current = loraPresetIds;
-      setLoraPresetIds([icId]);
-      void ensureLoraPresets([icId], config?.lora_presets, { interactive: true });
+      const wantsMotion =
+        Boolean(conditioningVideoPath || conditioningClipId) && Boolean(imagePath);
+      const presetId = wantsMotion ? motionId : hdrId;
+      setLoraPresetIds([presetId]);
+      void ensureLoraPresets([presetId], config?.lora_presets, { interactive: true });
     } else if (left && preIcLoraPresetIdsRef.current !== null) {
       setLoraPresetIds(preIcLoraPresetIdsRef.current);
       preIcLoraPresetIdsRef.current = null;
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- only on mode transitions
-  }, [mode, config?.ic_lora_preset_id, config?.lora_presets, ensureLoraPresets]);
+  }, [mode, config?.ic_lora_preset_id, config?.ic_lora_motion_preset_id, config?.lora_presets, ensureLoraPresets]);
 
   const persistLoraSelection = useCallback(async (ids: string[]) => {
     try {
@@ -1453,13 +1457,7 @@ export default function App() {
       return;
     }
     if (mode === "ic_lora") {
-      body.lora_specs = [
-        [
-          config?.ic_lora_default_spec ??
-            "https://huggingface.co/buckets/audiohacking/LTX-2.3-22b-IC-LoRA-HDR-bucket/resolve/ltx-2.3-22b-ic-lora-hdr-0.9.safetensors",
-          1.0,
-        ],
-      ];
+      // Server picks HDR vs Union Control from motion/character inputs.
     } else if (selectedLoras.length) {
       body.lora_specs = selectedLoras.map((p) => [p.spec, p.scale]);
     }
@@ -2067,11 +2065,17 @@ export default function App() {
                     <>
                       <span className="media-panel-title">IC-LoRA inputs</span>
                       <p className="hint hint-inline">
-                        IC-LoRA HDR weights load automatically. Motion reference video drives
-                        v2v transfer; character image is optional. With both inputs, the
-                        character still is expanded into per-frame conditioning so identity
-                        persists across the clip (not only frame 1). Omit motion video for
-                        pure T2V.
+                        Motion transfer uses Union Control: motion video is converted to
+                        pose skeletons (requires mediapipe); your character image anchors
+                        frame 0 (who to render). HDR LoRA is used only for pure T2V / SDR→HDR
+                        V2V without a character swap.
+                        {!config?.pose_control_available && (
+                          <>
+                            {" "}
+                            Install mediapipe for motion transfer:{" "}
+                            <code>pip install mediapipe</code>
+                          </>
+                        )}
                       </p>
                       <div className="media-upload-row">
                         <label className="media-upload">

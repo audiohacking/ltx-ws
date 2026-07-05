@@ -33,7 +33,6 @@ log = logging.getLogger("fvserver")
 
 LTX2_SPATIAL_ALIGN = 32
 IC_LORA_IMAGE_CRF = 33  # ltx_pipelines_mlx.utils.media_io.DEFAULT_IMAGE_CRF
-IC_LORA_IDENTITY_HOLD_STRENGTH = 1.0
 LTX2_MLX_GIT_TAG = "v0.14.15"
 
 CHAIN_METHOD_AUTOCONTINUE = "autocontinue"
@@ -1264,43 +1263,56 @@ def _build_ic_lora_image_conditionings(
     return [(image_path, 0, 1.0, IC_LORA_IMAGE_CRF)]
 
 
-def _compose_ic_lora_video_conditioning(
+def _needs_pose_control_preprocessing(
+    resolved_loras: list[tuple[str, float]],
+    vc_items: list[tuple[str, float]],
+) -> bool:
+    """Union Control expects pose/depth/canny — not raw RGB motion video."""
+    if not vc_items:
+        return False
+    if _ic_lora_uses_hdr_pipeline(resolved_loras):
+        return False
+    return True
+
+
+def _prepare_ic_lora_video_conditioning(
     vc_items: list[tuple[str, float]],
     *,
-    identity_image_path: str | None,
+    resolved_loras: list[tuple[str, float]],
     width: int,
     height: int,
     num_frames: int,
     fps: float,
     tmpdir: str,
-    identity_strength: float = IC_LORA_IDENTITY_HOLD_STRENGTH,
 ) -> tuple[list[tuple[str, float]], list[str]]:
-    """Merge motion refs with a per-frame identity hold clip when both are present."""
-    from ltx_media import encode_image_hold_video
-
+    """Build IC-LoRA ``video_conditioning`` list (pose maps for motion transfer)."""
     cleanup: list[str] = []
     combined = [(str(p), float(s)) for p, s in vc_items]
-    if identity_image_path and vc_items:
-        hold_path = os.path.join(tmpdir, "ic_lora_identity_hold.mp4")
-        encode_image_hold_video(
-            identity_image_path,
-            hold_path,
-            width=width,
-            height=height,
-            num_frames=num_frames,
-            fps=fps,
-        )
-        cleanup.append(hold_path)
-        combined.append((hold_path, float(identity_strength)))
-        log.info(
-            "IC-LoRA V2V+I2V: %d motion ref(s) + identity hold (%dx%d, %d frames, strength=%.2f)",
-            len(vc_items),
-            width,
-            height,
-            num_frames,
-            identity_strength,
-        )
-    return combined, cleanup
+    if not _needs_pose_control_preprocessing(resolved_loras, vc_items):
+        return combined, cleanup
+
+    from ltx_ic_lora_preprocess import render_pose_control_video, require_pose_control
+
+    require_pose_control()
+    motion_path, motion_scale = combined[0]
+    pose_path = os.path.join(tmpdir, "ic_lora_pose_control.mp4")
+    render_pose_control_video(
+        motion_path,
+        pose_path,
+        width=width,
+        height=height,
+        num_frames=num_frames,
+        fps=fps,
+    )
+    cleanup.append(pose_path)
+    log.info(
+        "IC-LoRA motion transfer: pose control from %s (Union Control, %dx%d, %d frames)",
+        motion_path,
+        width,
+        height,
+        num_frames,
+    )
+    return [(pose_path, motion_scale)], cleanup
 
 
 def _stage_from_tqdm_desc(desc: str) -> str:
@@ -2227,9 +2239,9 @@ class LocalVideoGenerator:
                             },
                         )
                         last_pipe = pipe
-                        ic_vcond, ic_vcond_cleanup = _compose_ic_lora_video_conditioning(
+                        ic_vcond, ic_vcond_cleanup = _prepare_ic_lora_video_conditioning(
                             vc_items,
-                            identity_image_path=tmp_image,
+                            resolved_loras=resolved_loras,
                             width=width,
                             height=height,
                             num_frames=nf,
