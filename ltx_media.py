@@ -581,6 +581,81 @@ def mux_audio_into_video(
     return output_path
 
 
+def extract_audio_from_video(
+    video_path: Path | str,
+    output_path: Path | str,
+    *,
+    duration_s: float | None = None,
+) -> bool:
+    """Extract the audio track from ``video_path`` to AAC in ``output_path``.
+
+    Returns ``False`` when the source has no audio stream.
+    """
+    require_media()
+    video_path = Path(video_path)
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with av.open(str(video_path)) as vin:
+        if not vin.streams.audio:
+            return False
+        a_in = vin.streams.audio[0]
+
+        with av.open(str(output_path), "w") as out:
+            a_out = out.add_stream("aac", rate=AUDIO_OUTPUT_RATE, layout=AUDIO_OUTPUT_LAYOUT)
+            resampler = AudioResampler(
+                format="fltp",
+                layout=AUDIO_OUTPUT_LAYOUT,
+                rate=AUDIO_OUTPUT_RATE,
+            )
+            for frame in vin.decode(a_in):
+                frame_time = _media_time_seconds(frame, a_in)
+                if duration_s is not None and frame_time is not None and frame_time > duration_s:
+                    break
+                for resampled in resampler.resample(frame):
+                    for packet in a_out.encode(resampled):
+                        out.mux(packet)
+            for packet in a_out.encode(None):
+                out.mux(packet)
+
+    if not output_path.is_file() or output_path.stat().st_size == 0:
+        return False
+    return True
+
+
+def replace_output_audio_from_source(
+    generated_video: Path | str,
+    audio_source_video: Path | str,
+    output_path: Path | str | None = None,
+) -> Path:
+    """Keep generated visuals; replace audio with the source clip's audio track."""
+    generated_video = Path(generated_video)
+    audio_source_video = Path(audio_source_video)
+    if output_path is None:
+        output_path = generated_video
+    else:
+        output_path = Path(output_path)
+
+    info = probe_video_info(generated_video)
+    duration_s = max(0.1, float(info.duration or 0.0))
+    if duration_s <= 0.1 and info.num_frames > 0 and info.fps > 0:
+        duration_s = max(0.1, (info.num_frames - 1) / info.fps)
+
+    tmp_audio = output_path.with_suffix(".source_audio.m4a")
+    try:
+        if not extract_audio_from_video(audio_source_video, tmp_audio, duration_s=duration_s):
+            if output_path != generated_video:
+                shutil.copy2(generated_video, output_path)
+            return Path(output_path)
+        tmp_out = output_path.with_suffix(".remux.mp4") if output_path == generated_video else output_path
+        mux_audio_into_video(generated_video, tmp_audio, tmp_out, duration_s=duration_s)
+        if tmp_out != output_path:
+            tmp_out.replace(output_path)
+        return Path(output_path)
+    finally:
+        tmp_audio.unlink(missing_ok=True)
+
+
 def stream_decoder_latent_to_mp4(
     decoder: Any,
     latent: Any,

@@ -229,7 +229,7 @@ class GenerationParams:
     height:                     Optional[int] = None
     width:                      Optional[int] = None
     num_steps:                  Optional[int] = None
-    generation_mode:            str           = "generate"  # generate|a2v|retake|extend|ic_lora|keyframe|lipdub
+    generation_mode:            str           = "generate"  # generate|a2v|retake|extend|ic_lora|keyframe|lipdub|face_swap
     audio_input:            Optional[dict] = None
     source_video:           Optional[dict] = None
     end_image:              Optional[dict] = None
@@ -1737,7 +1737,7 @@ examples:
     )
     gen.add_argument(
         "--generation-mode",
-        choices=("generate", "a2v", "retake", "extend", "ic_lora", "keyframe", "lipdub"),
+        choices=("generate", "a2v", "retake", "extend", "ic_lora", "keyframe", "lipdub", "face_swap"),
         default="generate",
         help="local generation route (default: generate)",
     )
@@ -2005,6 +2005,16 @@ async def async_main(args: argparse.Namespace):
             sys.exit(2)
         if not args.lora or len(args.lora) != 1:
             print("Error: --generation-mode lipdub requires exactly one --lora")
+            sys.exit(2)
+    if args.generation_mode == "face_swap":
+        if not args.video:
+            print("Error: --generation-mode face_swap requires --video (reference video)")
+            sys.exit(2)
+        if not args.image:
+            print("Error: --generation-mode face_swap requires --image (face identity)")
+            sys.exit(2)
+        if not args.lora or len(args.lora) != 1:
+            print("Error: --generation-mode face_swap requires exactly one --lora (head swap)")
             sys.exit(2)
     if args.chain_method == CHAIN_METHOD_NATIVE_EXTEND:
         if not args.autocontinue:

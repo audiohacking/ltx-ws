@@ -1348,6 +1348,58 @@ def _prepare_ic_lora_video_conditioning(
     return [(pose_path, motion_scale)], cleanup
 
 
+def _maybe_preserve_reference_audio(
+    output_path: str,
+    reference_video_paths: list[str],
+    *,
+    job_id: str | None = None,
+) -> None:
+    """Replace generated audio with the first reference clip that has an audio track."""
+    from ltx_media import media_available, probe_video_info, replace_output_audio_from_source
+
+    if not media_available():
+        return
+    for ref in reference_video_paths:
+        if not ref or not os.path.isfile(ref):
+            continue
+        try:
+            info = probe_video_info(ref)
+        except Exception:
+            continue
+        if not info.has_audio:
+            continue
+        try:
+            replace_output_audio_from_source(output_path, ref)
+            log.info(
+                "Preserved reference audio from %s (job=%s)",
+                ref,
+                (job_id or "?")[:8],
+            )
+            return
+        except Exception as exc:
+            log.warning("Could not preserve reference audio from %s: %s", ref, exc)
+
+
+def _invoke_lipdub_style(
+    pipe: Any,
+    *,
+    common_gen_kwargs: dict[str, Any],
+    reference_video: str,
+    tmp_image: str | None,
+    num_frames: int,
+    req: GenerationRequest,
+) -> None:
+    """LipDub / face-swap: reference video + optional face image + source audio conditioning."""
+    lip_kwargs = dict(common_gen_kwargs)
+    lip_kwargs["reference_video_path"] = reference_video
+    if tmp_image:
+        lip_kwargs["images"] = _build_ic_lora_image_conditionings(tmp_image, num_frames)
+    if req.reference_strength is not None:
+        lip_kwargs["reference_strength"] = float(req.reference_strength)
+    _apply_optional_generate_kwargs(lip_kwargs, req)
+    _invoke_generate_and_save(pipe, **lip_kwargs)
+
+
 def _stage_from_tqdm_desc(desc: str) -> str:
     d = (desc or "").strip().lower()
     if "denois" in d:
@@ -2251,11 +2303,44 @@ class LocalVideoGenerator:
                             },
                         )
                         last_pipe = pipe
-                        _invoke_generate_and_save(
+                        _invoke_lipdub_style(
                             pipe,
-                            **common_gen_kwargs,
-                            video_path=tmp_video,
+                            common_gen_kwargs=common_gen_kwargs,
                             reference_video=tmp_video,
+                            tmp_image=tmp_image,
+                            num_frames=nf,
+                            req=req,
+                        )
+                    elif mode in ("face_swap", "face-swap"):
+                        if not tmp_video:
+                            raise RuntimeError("face_swap mode requires reference video")
+                        if not tmp_image:
+                            raise RuntimeError("face_swap mode requires face identity image")
+                        if len(resolved_loras) != 1:
+                            raise RuntimeError("face_swap mode requires exactly one LoRA spec")
+                        log.info(
+                            "Face swap: reference video + identity image "
+                            "(LipDub-style audio conditioning from reference)"
+                        )
+                        pipe = self._get_pipe(
+                            "lipdub",
+                            pipe_kwargs={
+                                "lora_paths": [(str(p), float(s)) for p, s in resolved_loras],
+                            },
+                        )
+                        last_pipe = pipe
+                        _invoke_lipdub_style(
+                            pipe,
+                            common_gen_kwargs=common_gen_kwargs,
+                            reference_video=tmp_video,
+                            tmp_image=tmp_image,
+                            num_frames=nf,
+                            req=req,
+                        )
+                        _maybe_preserve_reference_audio(
+                            out_path,
+                            [tmp_video],
+                            job_id=req.job_id,
                         )
                     elif mode == "ic_lora":
                         if not resolved_loras:
@@ -2342,6 +2427,12 @@ class LocalVideoGenerator:
                                 log.info("IC-LoRA pose control saved → %s", dest)
                             except OSError as exc:
                                 log.warning("Could not save pose control debug copy: %s", exc)
+                        if vc_items:
+                            _maybe_preserve_reference_audio(
+                                out_path,
+                                [str(p) for p, _ in vc_items],
+                                job_id=req.job_id,
+                            )
                     elif tmp_image:
                         try:
                             from PIL import Image as PILImage

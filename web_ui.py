@@ -56,6 +56,7 @@ GENERATION_MODES = [
     {"id": "keyframe", "label": "Keyframe interpolation"},
     {"id": "lipdub", "label": "LipDub (experimental)"},
     {"id": "ic_lora", "label": "IC-LoRA (motion / character ref)"},
+    {"id": "face_swap", "label": "Face swap (LTX 2.3)"},
 ]
 
 CHAIN_METHODS = [
@@ -91,6 +92,12 @@ IC_LORA_UNION_MOTION_SPEC = (
 )
 IC_LORA_DEFAULT_SCALE = 1.0
 IC_LORA_BUILTIN_SPECS = frozenset({IC_LORA_DEFAULT_SPEC, IC_LORA_UNION_MOTION_SPEC})
+FACE_SWAP_PRESET_ID = "face_swap_head"
+FACE_SWAP_DEFAULT_SPEC = (
+    "https://huggingface.co/Alissonerdx/BFS-Best-Face-Swap-Video/"
+    "resolve/main/ltx-2.3/head_swap_v3_rank_adaptive_fro_098.safetensors"
+)
+FACE_SWAP_DEFAULT_SCALE = 0.98
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "web_outputs"
 
 
@@ -342,6 +349,12 @@ def _lora_catalog(output_dir: Path | None = None) -> tuple[list[dict[str, Any]],
         "IC-LoRA Union Control (motion transfer)",
         IC_LORA_UNION_MOTION_SPEC,
         1.0,
+    )
+    _add(
+        FACE_SWAP_PRESET_ID,
+        "Face swap — head swap LoRA (LTX 2.3)",
+        FACE_SWAP_DEFAULT_SPEC,
+        FACE_SWAP_DEFAULT_SCALE,
     )
 
     if output_dir is not None:
@@ -846,7 +859,7 @@ def resolve_source_video_path(state: AppState, body: dict[str, Any]) -> str | No
 
 
 def _validate_source_video_request(state: AppState, body: dict[str, Any], ui_mode: str) -> None:
-    if ui_mode not in ("retake", "extend", "lipdub"):
+    if ui_mode not in ("retake", "extend", "lipdub", "face_swap"):
         return
     if not body.get("video_path") and not body.get("source_clip_id"):
         raise HTTPException(400, f"{ui_mode} mode requires a source video (upload or library clip)")
@@ -1518,11 +1531,18 @@ def _build_params_from_request(body: dict[str, Any], *, state: AppState | None =
     ) = _import_videofentanyl()
     ui_mode = (body.get("mode") or "generate").strip().lower()
     mode = _api_mode(ui_mode)
-    image_path = body.get("image_path") if ui_mode in ("i2v", "a2v", "generate", "keyframe", "ic_lora") else None
+    image_path = body.get("image_path") if ui_mode in (
+        "i2v",
+        "a2v",
+        "generate",
+        "keyframe",
+        "ic_lora",
+        "face_swap",
+    ) else None
     end_image_path = body.get("end_image_path") if ui_mode == "keyframe" else None
     audio_path = body.get("audio_path") if ui_mode in ("a2v", "lipdub") else None
     video_path: str | None = None
-    if ui_mode in ("retake", "extend", "lipdub"):
+    if ui_mode in ("retake", "extend", "lipdub", "face_swap"):
         if state is not None:
             video_path = resolve_source_video_path(state, body)
         else:
@@ -2733,6 +2753,8 @@ def create_app(
             "ic_lora_motion_preset_id": IC_LORA_MOTION_PRESET_ID,
             "ic_lora_default_spec": IC_LORA_DEFAULT_SPEC,
             "ic_lora_union_motion_spec": IC_LORA_UNION_MOTION_SPEC,
+            "face_swap_preset_id": FACE_SWAP_PRESET_ID,
+            "face_swap_default_spec": FACE_SWAP_DEFAULT_SPEC,
             "pose_control_available": _pose_control_available(),
             "pyav_available": media_available(),
             "audio_trim_available": media_available(),
@@ -2983,6 +3005,24 @@ def create_app(
             lora_items = body.get("lora_specs") or []
             if len(lora_items) != 1:
                 raise HTTPException(400, "lipdub requires exactly one LoRA preset")
+        if ui_mode == "face_swap":
+            if not body.get("image_path"):
+                raise HTTPException(400, "face_swap requires a face identity image")
+            lora_items = body.get("lora_specs") or []
+            if len(lora_items) != 1:
+                raise HTTPException(400, "face_swap requires exactly one LoRA preset (head swap)")
+            _validate_source_video_request(state, body, ui_mode)
+            for lora_item in lora_items:
+                if not isinstance(lora_item, (list, tuple)) or not lora_item:
+                    continue
+                spec = str(lora_item[0])
+                try:
+                    await asyncio.to_thread(_ensure_lora_downloaded, spec)
+                except Exception as exc:
+                    raise HTTPException(
+                        400,
+                        f"Could not download face-swap LoRA weights ({spec}): {exc}",
+                    ) from exc
 
         _validate_request_media_paths(body)
         try:

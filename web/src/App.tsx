@@ -395,6 +395,8 @@ export default function App() {
     }
   }, [icLoraSubMode]);
 
+  const faceSwapPresetId = config?.face_swap_preset_id ?? "face_swap_head";
+
   const chainParts = useMemo(() => {
     if (!chainId || !selectedClipId) return [];
     return clips
@@ -420,7 +422,7 @@ export default function App() {
     setChainId(null);
     setSourceClipId(null);
     setMode((current) => {
-      if (["retake", "extend", "lipdub"].includes(current)) return "generate";
+      if (["retake", "extend", "lipdub", "face_swap"].includes(current)) return "generate";
       if (current === "i2v" && !imagePath) return "generate";
       if (current === "a2v" && !audioPath && !audioFile) return "generate";
       if (current === "keyframe" && (!imagePath || !endImagePath)) return "generate";
@@ -469,7 +471,7 @@ export default function App() {
         releaseClipContext();
       } else if (deleted && sourceClipId === deleted.id) {
         setMode((current) =>
-          ["retake", "extend", "lipdub"].includes(current) ? "generate" : current,
+          ["retake", "extend", "lipdub", "face_swap"].includes(current) ? "generate" : current,
         );
       }
     },
@@ -651,6 +653,12 @@ export default function App() {
     ensureLoraPresets,
   ]);
 
+  useEffect(() => {
+    if (mode !== "face_swap" || !faceSwapPresetId) return;
+    setLoraPresetIds([faceSwapPresetId]);
+    void ensureLoraPresets([faceSwapPresetId], config?.lora_presets, { interactive: true });
+  }, [mode, faceSwapPresetId, config?.lora_presets, ensureLoraPresets]);
+
   const persistLoraSelection = useCallback(async (ids: string[]) => {
     try {
       localStorage.setItem(LORA_SEL_KEY, JSON.stringify(ids));
@@ -683,6 +691,9 @@ export default function App() {
           } else if (presetId === motionId && checked) {
             next = next.filter((id) => id !== hdrId);
           }
+        }
+        if (mode === "face_swap" && checked) {
+          next = [presetId];
         }
         void persistLoraSelection(next);
         void ensureLoraPresets(next, undefined, { interactive: true });
@@ -1006,7 +1017,7 @@ export default function App() {
   }
 
   function clearMediaForMode(nextMode: string) {
-    if (!["i2v", "generate", "a2v", "keyframe", "ic_lora"].includes(nextMode)) {
+    if (!["i2v", "generate", "a2v", "keyframe", "ic_lora", "face_swap"].includes(nextMode)) {
       setImagePath(null);
       setImageName(null);
       if (imageRef.current) imageRef.current.value = "";
@@ -1020,7 +1031,7 @@ export default function App() {
       resetAudioSelection();
       setAudiocontinue(false);
     }
-    if (!["retake", "extend", "lipdub"].includes(nextMode)) {
+    if (!["retake", "extend", "lipdub", "face_swap"].includes(nextMode)) {
       setVideoPath(null);
       setSourceClipId(null);
       if (videoRef.current) videoRef.current.value = "";
@@ -1035,7 +1046,7 @@ export default function App() {
     if (nextMode === "a2v") {
       setChainMethod("autocontinue");
     }
-    if (nextMode === "ic_lora") {
+    if (nextMode === "ic_lora" || nextMode === "face_swap") {
       setClipMultiplier(1);
       setAutocontinue(false);
       setAutoconcat(false);
@@ -1073,11 +1084,13 @@ export default function App() {
   const needsImageUpload = mode === "i2v" || mode === "keyframe";
   const isA2v = mode === "a2v";
   const isIcLora = mode === "ic_lora";
+  const isFaceSwap = mode === "face_swap";
   const pyavAvailable =
     config?.pyav_available ?? config?.audio_trim_available ?? false;
   const audioTrimAvailable = pyavAvailable;
   const needsEndImageUpload = mode === "keyframe";
-  const needsVideoUpload = mode === "retake" || mode === "extend" || mode === "lipdub";
+  const needsVideoUpload =
+    mode === "retake" || mode === "extend" || mode === "lipdub" || mode === "face_swap";
   const showStartImageOptional = mode === "generate";
   const isT2vLike = mode === "generate" || mode === "i2v";
   const showChainMethodChoice =
@@ -1452,7 +1465,7 @@ export default function App() {
       body.extend_direction = extendDirection;
     }
     if (
-      (mode === "i2v" || mode === "generate" || mode === "a2v" || mode === "keyframe" || mode === "ic_lora") &&
+      (mode === "i2v" || mode === "generate" || mode === "a2v" || mode === "keyframe" || mode === "ic_lora" || mode === "face_swap") &&
       imagePath
     ) {
       body.image_path = imagePath;
@@ -1483,9 +1496,9 @@ export default function App() {
         body.conditioning_video_scale = conditioningVideoScale;
       }
     }
-    if ((mode === "retake" || mode === "extend" || mode === "lipdub") && sourceClipId) {
+    if ((mode === "retake" || mode === "extend" || mode === "lipdub" || mode === "face_swap") && sourceClipId) {
       body.source_clip_id = sourceClipId;
-    } else if ((mode === "retake" || mode === "extend" || mode === "lipdub") && videoPath) {
+    } else if ((mode === "retake" || mode === "extend" || mode === "lipdub" || mode === "face_swap") && videoPath) {
       body.video_path = videoPath;
     }
     if (seed.trim()) {
@@ -1499,6 +1512,12 @@ export default function App() {
     );
     if (mode === "lipdub" && selectedLoras.length !== 1) {
       setError("LipDub requires exactly one LoRA — select a single preset.");
+      setBusy(false);
+      setProgress(null);
+      return;
+    }
+    if (mode === "face_swap" && selectedLoras.length !== 1) {
+      setError("Face swap requires exactly one LoRA — use the head-swap preset.");
       setBusy(false);
       setProgress(null);
       return;
@@ -1553,12 +1572,14 @@ export default function App() {
   const canSubmit = useMemo(() => {
     if (!prompt.trim() || busy || !serverOk) return false;
     if (mode === "ic_lora" && loraBusy) return false;
+    if (mode === "face_swap" && loraBusy) return false;
     const continuing = willContinueChain;
     if (mode === "i2v" && !imagePath && !continuing) return false;
+    if (mode === "face_swap" && !imagePath) return false;
     if (mode === "a2v" && !audioPath && !audioFile) return false;
     if (mode === "a2v" && audioStartSeconds > 0 && !audioTrimAvailable) return false;
     if (audiocontinue && !pyavAvailable) return false;
-    if ((mode === "retake" || mode === "extend" || mode === "lipdub") && !hasVideoSource) {
+    if ((mode === "retake" || mode === "extend" || mode === "lipdub" || mode === "face_swap") && !hasVideoSource) {
       return false;
     }
     return true;
@@ -1874,7 +1895,7 @@ export default function App() {
                   Clips
                   <select
                     value={clipMultiplier}
-                    disabled={isIcLora}
+                    disabled={isIcLora || isFaceSwap}
                     onChange={(e) => setClipMultiplier(Number(e.target.value))}
                   >
                     {Array.from(
@@ -2031,7 +2052,7 @@ export default function App() {
                   />
                   Enhance prompt
                 </label>
-                {!isMultiClip && !audiocontinue && !isIcLora && (
+                {!isMultiClip && !audiocontinue && !isIcLora && !isFaceSwap && (
                   <label className="check">
                     <input
                       type="checkbox"
@@ -2046,7 +2067,7 @@ export default function App() {
                     type="checkbox"
                     checked={autoconcat}
                     onChange={(e) => setAutoconcat(e.target.checked)}
-                    disabled={isMultiClip || audiocontinue || isIcLora}
+                    disabled={isMultiClip || audiocontinue || isIcLora || isFaceSwap}
                   />
                   Autoconcat
                 </label>
@@ -2092,8 +2113,44 @@ export default function App() {
                 </div>
               )}
 
-              {(isA2v || isIcLora || needsImageUpload || showStartImageOptional || needsVideoUpload || needsEndImageUpload) && (
+              {(isA2v || isIcLora || isFaceSwap || needsImageUpload || showStartImageOptional || needsVideoUpload || needsEndImageUpload) && (
                 <div className="media-panel">
+                  {isFaceSwap && (
+                    <>
+                      <span className="media-panel-title">Face swap inputs</span>
+                      <p className="hint hint-inline">
+                        Replace the face in your reference video with the identity image.
+                        Audio from the reference clip is preserved when present.
+                        LoRA:{" "}
+                        <a
+                          href="https://www.runcomfy.com/comfyui-workflows/ltx-2-3-video-face-swap-in-comfyui-realistic-face-replacement-workflow"
+                          target="_blank"
+                          rel="noreferrer"
+                        >
+                          LTX 2.3 face swap workflow
+                        </a>
+                        .
+                      </p>
+                      <label className="media-upload">
+                        <span className="media-upload-label">Face identity image (required)</span>
+                        <input
+                          ref={imageRef}
+                          type="file"
+                          accept="image/*"
+                          onChange={async (e) => {
+                            const f = e.target.files?.[0];
+                            if (f) {
+                              setImagePath(await uploadFile(f, "image"));
+                              setImageName(f.name);
+                            }
+                          }}
+                        />
+                        <span className="media-upload-hint">
+                          {imageName ?? "Choose face photo…"}
+                        </span>
+                      </label>
+                    </>
+                  )}
                   {isIcLora && (
                     <>
                       <span className="media-panel-title">IC-LoRA inputs</span>
@@ -2307,7 +2364,9 @@ export default function App() {
                   {needsVideoUpload && (
                     <>
                       {!isA2v && (
-                        <span className="media-panel-title">Source video</span>
+                        <span className="media-panel-title">
+                          {isFaceSwap ? "Reference video (required)" : "Source video"}
+                        </span>
                       )}
                       <label className="media-upload">
                         <span className="media-upload-label">Upload from disk</span>
