@@ -1,4 +1,4 @@
-"""IC-LoRA control-signal preprocessing (OpenPose maps for Union Control)."""
+"""IC-LoRA control-signal preprocessing (ComfyUI OpenPose maps for Union Control)."""
 
 from __future__ import annotations
 
@@ -13,17 +13,12 @@ POSE_LANDMARKER_FULL_URL = (
     "pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task"
 )
 
-# OpenPose COCO-18 body pairs (Union Control / DWPreprocessor topology).
-OPENPOSE_COCO18_PAIRS: tuple[tuple[int, int], ...] = (
-    (1, 0),
-    (0, 14),
-    (14, 16),
-    (0, 15),
-    (15, 17),
+# ComfyUI controlnet_aux ``draw_bodypose`` limb sequence (1-based → 0-based indices).
+OPENPOSE_BODY18_LIMBS: tuple[tuple[int, int], ...] = (
     (1, 2),
+    (1, 5),
     (2, 3),
     (3, 4),
-    (1, 5),
     (5, 6),
     (6, 7),
     (1, 8),
@@ -32,15 +27,42 @@ OPENPOSE_COCO18_PAIRS: tuple[tuple[int, int], ...] = (
     (1, 11),
     (11, 12),
     (12, 13),
+    (0, 1),
+    (0, 14),
+    (14, 16),
+    (0, 15),
+    (15, 17),
 )
 
-# MediaPipe Pose → OpenPose COCO-18 index (neck computed from shoulders).
+# Same 18-color ramp as ComfyUI ``draw_bodypose`` (RGB).
+OPENPOSE_LIMB_COLORS: tuple[tuple[int, int, int], ...] = (
+    (255, 0, 0),
+    (255, 85, 0),
+    (255, 170, 0),
+    (255, 255, 0),
+    (170, 255, 0),
+    (85, 255, 0),
+    (0, 255, 0),
+    (0, 255, 85),
+    (0, 255, 170),
+    (0, 255, 255),
+    (0, 170, 255),
+    (0, 85, 255),
+    (0, 0, 255),
+    (85, 0, 255),
+    (170, 0, 255),
+    (255, 0, 255),
+    (255, 0, 170),
+    (255, 0, 85),
+)
+
+# MediaPipe Pose → OpenPose BODY-18 (ComfyUI / DWPreprocessor topology).
 _MP_TO_OPENPOSE: dict[int, int] = {
     0: 0,  # nose
-    2: 14,  # left eye
-    5: 15,  # right eye
-    7: 16,  # left ear
-    8: 17,  # right ear
+    2: 15,  # left eye
+    5: 14,  # right eye
+    7: 17,  # left ear
+    8: 16,  # right ear
     12: 2,  # right shoulder
     14: 3,  # right elbow
     16: 4,  # right wrist
@@ -134,7 +156,7 @@ def mediapipe_landmarks_to_openpose18(
     width: int,
     height: int,
 ) -> list[tuple[int, int] | None]:
-    """Map MediaPipe Pose landmarks to OpenPose COCO-18 pixel keypoints."""
+    """Map MediaPipe Pose landmarks to OpenPose BODY-18 pixel keypoints."""
     pts: list[tuple[int, int] | None] = [None] * 18
     if not landmarks:
         return pts
@@ -152,36 +174,11 @@ def mediapipe_landmarks_to_openpose18(
     return pts
 
 
-def _draw_openpose_skeleton(
-    canvas: "object",
-    openpose_pts: list[tuple[int, int] | None],
-    *,
-    line_thickness: int = 6,
-    joint_radius: int = 4,
-) -> None:
-    import numpy as np
-
-    h, w = canvas.shape[:2]
-    for i, j in OPENPOSE_COCO18_PAIRS:
-        a = openpose_pts[i] if i < len(openpose_pts) else None
-        b = openpose_pts[j] if j < len(openpose_pts) else None
-        if a is None or b is None:
-            continue
-        _draw_thick_line(canvas, a, b, thickness=line_thickness)
-
-    for p in openpose_pts:
-        if p is None:
-            continue
-        x, y = p
-        y0, y1 = max(0, y - joint_radius), min(h, y + joint_radius + 1)
-        x0, x1 = max(0, x - joint_radius), min(w, x + joint_radius + 1)
-        canvas[y0:y1, x0:x1] = 255
-
-
-def _draw_thick_line(
+def _draw_thick_colored_line(
     canvas: "object",
     a: tuple[int, int],
     b: tuple[int, int],
+    color: tuple[int, int, int],
     *,
     thickness: int,
 ) -> None:
@@ -190,19 +187,51 @@ def _draw_thick_line(
     x0, y0 = a
     x1, y1 = b
     steps = max(abs(x1 - x0), abs(y1 - y0), 1)
+    rgb = np.array(color, dtype=np.uint8)
     for t in np.linspace(0.0, 1.0, num=steps + 1):
         x = int(round(x0 + (x1 - x0) * t))
         y = int(round(y0 + (y1 - y0) * t))
         y0b, y1b = max(0, y - thickness), min(canvas.shape[0], y + thickness + 1)
         x0b, x1b = max(0, x - thickness), min(canvas.shape[1], x + thickness + 1)
-        canvas[y0b:y1b, x0b:x1b] = 255
+        canvas[y0b:y1b, x0b:x1b] = rgb
+
+
+def _draw_openpose_skeleton(
+    canvas: "object",
+    openpose_pts: list[tuple[int, int] | None],
+    *,
+    line_thickness: int = 4,
+    joint_radius: int = 4,
+) -> None:
+    """Render ComfyUI-style colored OpenPose BODY-18 on black (Union Control training format)."""
+    import numpy as np
+
+    h, w = canvas.shape[:2]
+    for (i, j), color in zip(OPENPOSE_BODY18_LIMBS, OPENPOSE_LIMB_COLORS, strict=False):
+        a = openpose_pts[i] if i < len(openpose_pts) else None
+        b = openpose_pts[j] if j < len(openpose_pts) else None
+        if a is None or b is None:
+            continue
+        limb_color = tuple(int(float(c) * 0.6) for c in color)
+        _draw_thick_colored_line(canvas, a, b, limb_color, thickness=line_thickness)
+
+    for idx, p in enumerate(openpose_pts):
+        if p is None:
+            continue
+        color = OPENPOSE_LIMB_COLORS[idx % len(OPENPOSE_LIMB_COLORS)]
+        x, y = p
+        y0, y1 = max(0, y - joint_radius), min(h, y + joint_radius + 1)
+        x0, x1 = max(0, x - joint_radius), min(w, x + joint_radius + 1)
+        canvas[y0:y1, x0:x1] = np.array(color, dtype=np.uint8)
 
 
 def _pose_frame_energy(frame: "object") -> int:
     import numpy as np
 
-    gray = np.asarray(frame).max(axis=2)
-    return int((gray > 16).sum())
+    arr = np.asarray(frame)
+    if arr.ndim == 3:
+        return int((arr.max(axis=2) > 16).sum())
+    return int((arr > 16).sum())
 
 
 def _draw_pose_from_landmarks(
@@ -232,6 +261,7 @@ def _decode_motion_frames(
     width: int,
     height: int,
     num_frames: int,
+    fps: float,
 ) -> list["object"]:
     import numpy as np
 
@@ -241,15 +271,34 @@ def _decode_motion_frames(
     import av
 
     frames_rgb: list[np.ndarray] = []
+    next_pick = 0.0
+    decoded_index = 0
+    target_fps = max(float(fps), 1.0)
+
     with av.open(str(source_video)) as container:
         if not container.streams.video:
             raise RuntimeError(f"No video stream in {source_video}")
         stream = container.streams.video[0]
+        source_fps = float(stream.average_rate or stream.base_rate or target_fps)
+
         for frame in container.decode(stream):
             if len(frames_rgb) >= num_frames:
                 break
+
+            take = True
+            if source_fps > 0 and abs(source_fps - target_fps) > 0.01:
+                take = decoded_index >= next_pick
+                if take:
+                    next_pick += source_fps / target_fps
+
+            if not take:
+                decoded_index += 1
+                continue
+
             rgb = frame.reformat(width=width, height=height, format="rgb24")
             frames_rgb.append(np.ascontiguousarray(rgb.to_ndarray(), dtype=np.uint8))
+            decoded_index += 1
+
     if not frames_rgb:
         raise RuntimeError(f"No frames decoded from {source_video}")
     while len(frames_rgb) < num_frames:
@@ -347,7 +396,7 @@ def render_pose_control_video(
     num_frames: int,
     fps: float = 24.0,
 ) -> Path:
-    """Render OpenPose COCO-18 stick figures for Union Control IC-LoRA."""
+    """Render ComfyUI-style colored OpenPose maps for Union Control IC-LoRA."""
     from ltx_media import _pyav_frame_rate, require_media
 
     require_pose_control()
@@ -365,7 +414,11 @@ def render_pose_control_video(
     pad_h = height + (height & 1)
 
     frames_rgb = _decode_motion_frames(
-        source_video, width=width, height=height, num_frames=num_frames
+        source_video,
+        width=width,
+        height=height,
+        num_frames=num_frames,
+        fps=float(fps),
     )
     if _mediapipe_has_tasks_pose():
         pose_frames, detected = _pose_frames_tasks(
@@ -406,7 +459,7 @@ def render_pose_control_video(
     if not output_path.is_file() or output_path.stat().st_size == 0:
         raise RuntimeError(f"Pose control encode produced empty output: {output_path}")
     log.info(
-        "IC-LoRA OpenPose control: %s → %s (%d frames, %dx%d, detected=%d/%d)",
+        "IC-LoRA OpenPose control: %s → %s (%d frames, %dx%d, detected=%d/%d, colored=ComfyUI)",
         source_video,
         output_path,
         num_frames,

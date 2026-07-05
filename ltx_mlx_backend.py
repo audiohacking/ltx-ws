@@ -2293,6 +2293,7 @@ class LocalVideoGenerator:
                             tmpdir=tmpdir,
                         )
                         tmp_video_conditioning_cleanup.extend(ic_vcond_cleanup)
+                        uses_pose = _needs_pose_control_preprocessing(resolved_loras, vc_items)
                         ic_kwargs: dict[str, Any] = {
                             "prompt": req.prompt,
                             "output_path": out_path,
@@ -2303,6 +2304,7 @@ class LocalVideoGenerator:
                             "frame_rate": float(self.fps),
                             "seed": seed,
                             "stage1_steps": int(steps),
+                            "conditioning_attention_strength": 1.0,
                         }
                         if tmp_image:
                             ic_kwargs["images"] = _build_ic_lora_image_conditionings(
@@ -2314,7 +2316,32 @@ class LocalVideoGenerator:
                             )
                         if req.stage2_steps is not None:
                             ic_kwargs["stage2_steps"] = int(req.stage2_steps)
+                        elif uses_pose and tmp_image:
+                            # Stage 2 drops video reference; lighter refine preserves motion.
+                            ic_kwargs["stage2_steps"] = 1
+                            log.info(
+                                "IC-LoRA Union motion transfer: stage2_steps=1 "
+                                "(override with stage2_steps in API)"
+                            )
+                        if ic_vcond_cleanup:
+                            log.info(
+                                "IC-LoRA pose control video: %s — verify colored "
+                                "OpenPose skeletons before cleanup",
+                                ic_vcond_cleanup[0],
+                            )
                         _invoke_generate_and_save(pipe, **ic_kwargs)
+                        if uses_pose and ic_vcond_cleanup and self.spill_dir and req.job_id:
+                            try:
+                                self.spill_dir.mkdir(parents=True, exist_ok=True)
+                                slug = _spill_slug(req.prompt)
+                                dest = (
+                                    self.spill_dir
+                                    / f"{req.job_id}_{slug}_pose_control.mp4"
+                                )
+                                shutil.copy2(ic_vcond_cleanup[0], dest)
+                                log.info("IC-LoRA pose control saved → %s", dest)
+                            except OSError as exc:
+                                log.warning("Could not save pose control debug copy: %s", exc)
                     elif tmp_image:
                         try:
                             from PIL import Image as PILImage
