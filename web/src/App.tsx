@@ -631,9 +631,25 @@ export default function App() {
 
   useEffect(() => {
     if (mode !== "ic_lora" || !icLoraPresetId) return;
-    setLoraPresetIds([icLoraPresetId]);
+    const hdrId = config?.ic_lora_preset_id ?? "ic_lora_hdr";
+    const motionId = config?.ic_lora_motion_preset_id ?? "ic_lora_union_motion";
+    setLoraPresetIds((prev) => {
+      const extras = prev.filter((id) => id !== hdrId && id !== motionId);
+      const next = [icLoraPresetId, ...extras];
+      if (next.length === prev.length && next.every((id, i) => prev[i] === id)) {
+        return prev;
+      }
+      return next;
+    });
     void ensureLoraPresets([icLoraPresetId], config?.lora_presets, { interactive: true });
-  }, [mode, icLoraPresetId, config?.lora_presets, ensureLoraPresets]);
+  }, [
+    mode,
+    icLoraPresetId,
+    config?.ic_lora_preset_id,
+    config?.ic_lora_motion_preset_id,
+    config?.lora_presets,
+    ensureLoraPresets,
+  ]);
 
   const persistLoraSelection = useCallback(async (ids: string[]) => {
     try {
@@ -1478,9 +1494,7 @@ export default function App() {
       setProgress(null);
       return;
     }
-    if (mode === "ic_lora") {
-      // Server picks HDR vs Union Control from motion/character inputs.
-    } else if (selectedLoras.length) {
+    if (selectedLoras.length) {
       body.lora_specs = selectedLoras.map((p) => [p.spec, p.scale]);
     }
 
@@ -1913,15 +1927,6 @@ export default function App() {
               )}
 
               <div className="lora-row">
-                {isIcLora ? (
-                  <p className="hint hint-inline lora-ic-auto">
-                    <strong>Auto:</strong> {icLoraModeLabel}
-                    {loraActivity.phase === "working" && loraActivity.label
-                      ? ` — downloading ${loraActivity.label}…`
-                      : ""}
-                  </p>
-                ) : (
-                  <>
                 <label className="lora-row-select">
                   LoRA
                   <LoraMultiSelect
@@ -1973,8 +1978,6 @@ export default function App() {
                     {addingCustomLora ? "…" : "Add"}
                   </button>
                 </div>
-                  </>
-                )}
               </div>
 
               {isMultiClip && !audiocontinue && (
@@ -2086,16 +2089,11 @@ export default function App() {
                     <>
                       <span className="media-panel-title">IC-LoRA inputs</span>
                       <p className="hint hint-inline ic-lora-active-mode">
-                        Active: <strong>{icLoraModeLabel}</strong>
-                      </p>
-                      <p className="hint hint-inline">
-                        Add or remove the character image to switch between HDR reference-video
-                        mode and Union Control motion transfer. Weights download automatically.
+                        Mode: <strong>{icLoraModeLabel}</strong>
                         {!config?.pose_control_available && icLoraSubMode === "motion_transfer" && (
                           <>
                             {" "}
-                            Motion transfer needs mediapipe:{" "}
-                            <code>pip install mediapipe</code>
+                            (requires <code>pip install mediapipe</code>)
                           </>
                         )}
                       </p>

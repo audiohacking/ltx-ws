@@ -1446,11 +1446,17 @@ def _ic_lora_has_motion_reference(body: dict[str, Any]) -> bool:
     return False
 
 
+def _ic_lora_primary_spec(*, has_motion: bool, has_character: bool) -> str:
+    if has_motion and has_character:
+        return IC_LORA_UNION_MOTION_SPEC
+    return IC_LORA_DEFAULT_SPEC
+
+
 def _apply_ic_lora_defaults(body: dict[str, Any]) -> dict[str, Any]:
-    """Pick HDR vs Union Control IC-LoRA weights for the requested inputs.
+    """Ensure the correct primary IC-LoRA is first; keep extra user-selected LoRAs.
 
   - Motion video + character image → Union Control (pose motion transfer).
-  - Motion video only → HDR IC-LoRA (V2V / T2V + reference video, testing mode).
+  - Motion video only → HDR IC-LoRA (V2V / T2V + reference video).
   - No motion video → HDR IC-LoRA (pure T2V).
     """
     if (body.get("mode") or "generate").strip().lower() != "ic_lora":
@@ -1458,10 +1464,22 @@ def _apply_ic_lora_defaults(body: dict[str, Any]) -> dict[str, Any]:
     new_body = dict(body)
     has_motion = _ic_lora_has_motion_reference(new_body)
     has_character = bool(new_body.get("image_path"))
-    if has_motion and has_character:
-        new_body["lora_specs"] = [[IC_LORA_UNION_MOTION_SPEC, IC_LORA_DEFAULT_SCALE]]
-    else:
-        new_body["lora_specs"] = [[IC_LORA_DEFAULT_SPEC, IC_LORA_DEFAULT_SCALE]]
+    primary = _ic_lora_primary_spec(has_motion=has_motion, has_character=has_character)
+    merged: list[list[Any]] = [[primary, IC_LORA_DEFAULT_SCALE]]
+    seen = {primary}
+    for item in new_body.get("lora_specs") or []:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        spec = str(item[0]).strip()
+        if not spec or spec in seen:
+            continue
+        try:
+            scale = float(item[1])
+        except (TypeError, ValueError):
+            scale = IC_LORA_DEFAULT_SCALE
+        merged.append([spec, scale])
+        seen.add(spec)
+    new_body["lora_specs"] = merged
     return new_body
 
 

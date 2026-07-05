@@ -128,6 +128,29 @@ def test_apply_ic_lora_defaults_hdr_for_motion_only(tmp_path: Path):
     assert out["lora_specs"] == [[IC_LORA_DEFAULT_SPEC, IC_LORA_DEFAULT_SCALE]]
 
 
+def test_apply_ic_lora_defaults_keeps_extra_loras():
+    from web_ui import (
+        IC_LORA_DEFAULT_SCALE,
+        IC_LORA_DEFAULT_SPEC,
+        IC_LORA_UNION_MOTION_SPEC,
+        _apply_ic_lora_defaults,
+    )
+
+    extra = "https://example.com/custom-lora.safetensors"
+    out = _apply_ic_lora_defaults(
+        {
+            "mode": "ic_lora",
+            "prompt": "test",
+            "image_path": "/tmp/char.jpg",
+            "video_conditioning": [["/tmp/motion.mp4", 1.0]],
+            "lora_specs": [[extra, 0.5], [IC_LORA_UNION_MOTION_SPEC, 1.0]],
+        }
+    )
+    assert out["lora_specs"][0] == [IC_LORA_UNION_MOTION_SPEC, IC_LORA_DEFAULT_SCALE]
+    assert [extra, 0.5] in out["lora_specs"]
+    assert len(out["lora_specs"]) == 2
+
+
 def test_ic_lora_t2v_allows_missing_video_conditioning():
     from web_ui import IC_LORA_DEFAULT_SPEC, _build_params_from_request
 
