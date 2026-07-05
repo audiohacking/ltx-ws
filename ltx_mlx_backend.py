@@ -32,6 +32,8 @@ from urllib.request import url2pathname, urlopen
 log = logging.getLogger("fvserver")
 
 LTX2_SPATIAL_ALIGN = 32
+IC_LORA_IMAGE_CRF = 33  # ltx_pipelines_mlx.utils.media_io.DEFAULT_IMAGE_CRF
+IC_LORA_IDENTITY_HOLD_STRENGTH = 1.0
 LTX2_MLX_GIT_TAG = "v0.14.15"
 
 CHAIN_METHOD_AUTOCONTINUE = "autocontinue"
@@ -1235,6 +1237,70 @@ class GenerationCancelledError(RuntimeError):
     """Raised when generation is cancelled via ``request_cancel()``."""
 
 
+def _ic_lora_uses_hdr_pipeline(resolved_loras: list[tuple[str, float]]) -> bool:
+    """True when any resolved LoRA declares HDR metadata (use HDRICLoraPipeline)."""
+    try:
+        from ltx_core_mlx.loader.hdr_metadata import read_hdr_lora_config
+    except ImportError:
+        return False
+    for path, _ in resolved_loras:
+        if read_hdr_lora_config(path):
+            return True
+    return False
+
+
+def _build_ic_lora_image_conditionings(
+    image_path: str,
+    num_frames: int,
+) -> list[tuple[str, int, float, int]]:
+    """I2V anchors per ltx-2-mlx: frame 0 latent replace + optional last-frame keyframe."""
+    images: list[tuple[str, int, float, int]] = [
+        (image_path, 0, 1.0, IC_LORA_IMAGE_CRF),
+    ]
+    if num_frames > 1:
+        images.append((image_path, num_frames - 1, 1.0, IC_LORA_IMAGE_CRF))
+    return images
+
+
+def _compose_ic_lora_video_conditioning(
+    vc_items: list[tuple[str, float]],
+    *,
+    identity_image_path: str | None,
+    width: int,
+    height: int,
+    num_frames: int,
+    fps: float,
+    tmpdir: str,
+    identity_strength: float = IC_LORA_IDENTITY_HOLD_STRENGTH,
+) -> tuple[list[tuple[str, float]], list[str]]:
+    """Merge motion refs with a per-frame identity hold clip when both are present."""
+    from ltx_media import encode_image_hold_video
+
+    cleanup: list[str] = []
+    combined = [(str(p), float(s)) for p, s in vc_items]
+    if identity_image_path and vc_items:
+        hold_path = os.path.join(tmpdir, "ic_lora_identity_hold.mp4")
+        encode_image_hold_video(
+            identity_image_path,
+            hold_path,
+            width=width,
+            height=height,
+            num_frames=num_frames,
+            fps=fps,
+        )
+        cleanup.append(hold_path)
+        combined.append((hold_path, float(identity_strength)))
+        log.info(
+            "IC-LoRA V2V+I2V: %d motion ref(s) + identity hold (%dx%d, %d frames, strength=%.2f)",
+            len(vc_items),
+            width,
+            height,
+            num_frames,
+            identity_strength,
+        )
+    return combined, cleanup
+
+
 def _stage_from_tqdm_desc(desc: str) -> str:
     d = (desc or "").strip().lower()
     if "denois" in d:
@@ -1462,6 +1528,9 @@ class LocalVideoGenerator:
         ic_cls = getattr(lpm, "ICLoraPipeline", None)
         if ic_cls is not None:
             self._pipe_classes["ic_lora"] = ic_cls
+        hdr_ic_cls = getattr(lpm, "HDRICLoraPipeline", None)
+        if hdr_ic_cls is not None:
+            self._pipe_classes["hdr_ic_lora"] = hdr_ic_cls
 
         for key, cls_name in (
             ("two_stage", "TI2VidTwoStagesPipeline"),
@@ -2144,17 +2213,32 @@ class LocalVideoGenerator:
                     elif mode == "ic_lora":
                         if not resolved_loras:
                             raise RuntimeError("ic_lora mode requires at least one LoRA spec")
+                        ic_pipe_key = (
+                            "hdr_ic_lora"
+                            if _ic_lora_uses_hdr_pipeline(resolved_loras)
+                            else "ic_lora"
+                        )
                         pipe = self._get_pipe(
-                            "ic_lora",
+                            ic_pipe_key,
                             pipe_kwargs={
                                 "lora_paths": [(str(p), float(s)) for p, s in resolved_loras],
                             },
                         )
                         last_pipe = pipe
+                        ic_vcond, ic_vcond_cleanup = _compose_ic_lora_video_conditioning(
+                            vc_items,
+                            identity_image_path=tmp_image,
+                            width=width,
+                            height=height,
+                            num_frames=nf,
+                            fps=float(self.fps),
+                            tmpdir=tmpdir,
+                        )
+                        tmp_video_conditioning_cleanup.extend(ic_vcond_cleanup)
                         ic_kwargs: dict[str, Any] = {
                             "prompt": req.prompt,
                             "output_path": out_path,
-                            "video_conditioning": [(str(p), float(s)) for p, s in vc_items],
+                            "video_conditioning": ic_vcond,
                             "height": height,
                             "width": width,
                             "num_frames": nf,
@@ -2163,7 +2247,9 @@ class LocalVideoGenerator:
                             "stage1_steps": int(steps),
                         }
                         if tmp_image:
-                            ic_kwargs["images"] = [(tmp_image, 0, 1.0)]
+                            ic_kwargs["images"] = _build_ic_lora_image_conditionings(
+                                tmp_image, nf
+                            )
                         if req.reference_strength is not None:
                             ic_kwargs["conditioning_attention_strength"] = float(
                                 req.reference_strength

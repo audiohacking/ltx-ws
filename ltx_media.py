@@ -668,6 +668,68 @@ def stream_decoder_latent_to_mp4(
     return output_path
 
 
+def encode_image_hold_video(
+    image_path: str | Path,
+    output_path: str | Path,
+    *,
+    width: int,
+    height: int,
+    num_frames: int,
+    fps: float = 24.0,
+) -> Path:
+    """Encode a still image as an H.264 clip with ``num_frames`` identical frames.
+
+    IC-LoRA ``images`` at frame 0 only replace the first latent frame; per-frame
+    identity across a clip requires ``video_conditioning`` with a hold clip built
+    from the character still (see ltx-2-mlx IC-LoRA static-scene recipes).
+    """
+    import numpy as np
+    from PIL import Image
+
+    require_media()
+    image_path = Path(image_path)
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    width = int(width)
+    height = int(height)
+    num_frames = max(1, int(num_frames))
+    fps_frac = _pyav_frame_rate(fps)
+
+    with Image.open(image_path) as im:
+        rgb = im.convert("RGB").resize((width, height), Image.Resampling.LANCZOS)
+        arr = np.asarray(rgb, dtype=np.uint8)
+
+    if arr.dtype != np.uint8:
+        arr = arr.astype(np.uint8)
+
+    pad_w = width + (width & 1)
+    pad_h = height + (height & 1)
+    if (pad_w, pad_h) != (width, height):
+        padded = np.zeros((pad_h, pad_w, 3), dtype=np.uint8)
+        padded[:height, :width, :] = arr
+        arr = padded
+
+    with av.open(str(output_path), "w") as container:
+        stream = container.add_stream(
+            "libx264", rate=fps_frac, width=pad_w, height=pad_h
+        )
+        stream.pix_fmt = "yuv420p"
+        stream.options = {"crf": "18", "preset": "veryfast"}
+        stream.time_base = Fraction(fps_frac.denominator, fps_frac.numerator)
+        for i in range(num_frames):
+            frame = av.VideoFrame.from_ndarray(arr, format="rgb24")
+            frame = frame.reformat(format="yuv420p")
+            frame.pts = i
+            for packet in stream.encode(frame):
+                container.mux(packet)
+        for packet in stream.encode(None):
+            container.mux(packet)
+
+    if not output_path.is_file() or output_path.stat().st_size == 0:
+        raise RuntimeError(f"Image hold video encode produced empty output: {output_path}")
+    return output_path
+
+
 def encode_single_frame(
     output_file: Any,
     image_array: Any,

@@ -787,7 +787,6 @@ export default function App() {
 
   function beginFreshGeneration() {
     releaseClipContext();
-    setPrompt("");
     setError(null);
   }
 
@@ -1485,7 +1484,6 @@ export default function App() {
       const data = await r.json();
       setChainId(data.chain_id);
       setSelectedClipId(null);
-      setPrompt("");
       setProgress(
         data.started_immediately
           ? { phase: "starting", message: "Starting…" }
@@ -1711,25 +1709,36 @@ export default function App() {
 
         <section className="composer">
           <div className="prompt-row">
-            <textarea
-              ref={promptRef}
-              className="prompt-input"
-              rows={1}
-              placeholder={
-                willContinueChain
-                  ? "What do you want to edit?"
-                  : "What video do you want to create?"
-              }
-              value={prompt}
-              onChange={(e) => setPrompt(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
-                  void handleGenerate();
+            <div className="prompt-field-wrap">
+              <textarea
+                ref={promptRef}
+                className="prompt-input"
+                rows={1}
+                placeholder={
+                  willContinueChain
+                    ? "What do you want to edit?"
+                    : "What video do you want to create?"
                 }
-              }}
-              disabled={busy}
-            />
+                value={prompt}
+                onChange={(e) => setPrompt(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    void handleGenerate();
+                  }
+                }}
+                disabled={busy}
+              />
+              <button
+                type="button"
+                className="btn-prompt-clear"
+                onClick={() => setPrompt("")}
+                disabled={busy || !prompt}
+                aria-label="Clear prompt"
+              >
+                CLEAR
+              </button>
+            </div>
             <button
               type="button"
               className="btn-generate"
@@ -2059,7 +2068,10 @@ export default function App() {
                       <span className="media-panel-title">IC-LoRA inputs</span>
                       <p className="hint hint-inline">
                         IC-LoRA HDR weights load automatically. Motion reference video drives
-                        v2v transfer; character image is optional. Omit motion video for pure T2V.
+                        v2v transfer; character image is optional. With both inputs, the
+                        character still is expanded into per-frame conditioning so identity
+                        persists across the clip (not only frame 1). Omit motion video for
+                        pure T2V.
                       </p>
                       <div className="media-upload-row">
                         <label className="media-upload">
