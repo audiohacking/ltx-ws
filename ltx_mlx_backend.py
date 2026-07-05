@@ -1253,13 +1253,15 @@ def _build_ic_lora_image_conditionings(
     image_path: str,
     num_frames: int,
 ) -> list[tuple[str, int, float, int]]:
-    """I2V anchors per ltx-2-mlx: frame 0 latent replace + optional last-frame keyframe."""
-    images: list[tuple[str, int, float, int]] = [
-        (image_path, 0, 1.0, IC_LORA_IMAGE_CRF),
-    ]
-    if num_frames > 1:
-        images.append((image_path, num_frames - 1, 1.0, IC_LORA_IMAGE_CRF))
-    return images
+    """I2V frame-0 anchor only.
+
+    IC-LoRA stage 2 accepts ``VideoConditionByLatentIndex`` (frame_idx==0) but
+    not ``VideoConditionByKeyframeIndex`` — a last-frame keyframe appends extra
+    tokens and breaks stage-2 ``unpatchify``. Per-frame identity when motion
+    video is also present comes from the identity-hold ``video_conditioning``.
+    """
+    del num_frames  # frame-0 only; see docstring
+    return [(image_path, 0, 1.0, IC_LORA_IMAGE_CRF)]
 
 
 def _compose_ic_lora_video_conditioning(

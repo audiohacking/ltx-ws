@@ -14,10 +14,9 @@ from ltx_mlx_backend import (
 )
 
 
-def test_build_ic_lora_image_conditionings_multi_anchor():
+def test_build_ic_lora_image_conditionings_frame_zero_only():
     images = _build_ic_lora_image_conditionings("/tmp/char.jpg", 97)
-    assert images[0] == ("/tmp/char.jpg", 0, 1.0, IC_LORA_IMAGE_CRF)
-    assert images[1] == ("/tmp/char.jpg", 96, 1.0, IC_LORA_IMAGE_CRF)
+    assert images == [("/tmp/char.jpg", 0, 1.0, IC_LORA_IMAGE_CRF)]
 
 
 def test_build_ic_lora_image_conditionings_single_frame():
