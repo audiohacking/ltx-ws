@@ -110,6 +110,12 @@ _LOAD_AUDIO_STALE_IMPORTERS = (
     "ltx_pipelines_mlx.lipdub",
 )
 
+# Pipelines that bind video probe/load at import time.
+_VIDEO_IO_STALE_IMPORTERS = (
+    "ltx_pipelines_mlx.iclora_utils",
+    "ltx_pipelines_mlx.ic_lora",
+)
+
 
 def _module_dict_attr(mod: Any, attr: str) -> Any:
     """Return a module-level attribute without triggering lazy ``__getattr__`` loaders."""
@@ -267,10 +273,62 @@ def _patch_media_io_pyav_only() -> None:
         log.debug("PyAV media_io patch applied (I2V image preprocess)")
 
 
+def _patch_video_io_pyav_only() -> None:
+    """Replace upstream ffprobe/ffmpeg video probe and decode with PyAV."""
+    try:
+        import ltx_core_mlx.utils.ffmpeg as ffmpeg_mod
+        import ltx_core_mlx.utils.video as video_mod
+    except ImportError:
+        return
+
+    from ltx_media import load_video_frames_normalized as pyav_load_video_frames
+    from ltx_media import probe_video_info as pyav_probe_video_info
+
+    first = not getattr(ffmpeg_mod, "_ltx_ws_pyav_video_io_patched", False)
+
+    stale_probe = getattr(ffmpeg_mod, "_ltx_ws_original_probe_video_info", None)
+    if stale_probe is None:
+        current_probe = ffmpeg_mod.probe_video_info
+        if current_probe is not pyav_probe_video_info:
+            ffmpeg_mod._ltx_ws_original_probe_video_info = current_probe
+            stale_probe = current_probe
+    ffmpeg_mod.probe_video_info = pyav_probe_video_info
+
+    stale_load = getattr(video_mod, "_ltx_ws_original_load_video_frames", None)
+    if stale_load is None:
+        current_load = video_mod.load_video_frames_normalized
+        if current_load is not pyav_load_video_frames:
+            video_mod._ltx_ws_original_load_video_frames = current_load
+            stale_load = current_load
+    video_mod.load_video_frames_normalized = pyav_load_video_frames
+
+    if stale_probe is not None:
+        for module_name in _VIDEO_IO_STALE_IMPORTERS:
+            _rebind_module_attr(
+                module_name,
+                "probe_video_info",
+                pyav_probe_video_info,
+                stale=stale_probe,
+            )
+    if stale_load is not None:
+        for module_name in _VIDEO_IO_STALE_IMPORTERS:
+            _rebind_module_attr(
+                module_name,
+                "load_video_frames_normalized",
+                pyav_load_video_frames,
+                stale=stale_load,
+            )
+
+    ffmpeg_mod._ltx_ws_pyav_video_io_patched = True
+    if first:
+        log.debug("PyAV video_io patch applied (IC-LoRA reference video probe/decode)")
+
+
 def _apply_ltx_mlx_patches(*, default_fps: float = 24.0) -> None:
     """Apply all ltx-ws runtime patches (PyAV-only media, pipeline compat)."""
     _patch_media_io_pyav_only()
     _patch_load_audio_pyav_only()
+    _patch_video_io_pyav_only()
     _patch_ltx_pipelines_compat(default_fps=default_fps)
     _patch_video_decode_pyav_only()
 

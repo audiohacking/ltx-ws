@@ -387,8 +387,6 @@ async def ltx_generate_sequence(
     if normalized_mode == "ic_lora":
         if not lora_specs:
             raise ValueError("mode=ic_lora requires lora_specs")
-        if not video_conditioning:
-            raise ValueError("mode=ic_lora requires video_conditioning")
 
     method = (chain_method or CHAIN_METHOD_AUTOCONTINUE).strip().lower()
     if method not in VALID_CHAIN_METHODS:

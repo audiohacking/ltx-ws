@@ -87,6 +87,109 @@ def require_media() -> None:
         raise RuntimeError("PyAV is required — install with: pip install av")
 
 
+def probe_video_info(video_path: str) -> Any:
+    """PyAV replacement for ``ltx_core_mlx.utils.ffmpeg.probe_video_info``."""
+    try:
+        from ltx_core_mlx.utils.ffmpeg import VideoInfo
+    except ImportError as exc:  # pragma: no cover - only when ltx-core-mlx missing
+        raise RuntimeError("ltx-core-mlx is required for video probing") from exc
+
+    require_media()
+    with av.open(str(video_path)) as container:
+        video_stream = None
+        has_audio = False
+        for stream in container.streams:
+            if stream.type == "video" and video_stream is None:
+                video_stream = stream
+            elif stream.type == "audio":
+                has_audio = True
+        if video_stream is None:
+            raise RuntimeError(f"No video stream found in {video_path}")
+
+        width = int(video_stream.width or 0)
+        height = int(video_stream.height or 0)
+        if width <= 0 or height <= 0:
+            raise RuntimeError(f"Invalid video dimensions in {video_path}")
+
+        rate = video_stream.average_rate or video_stream.base_rate
+        fps = float(rate) if rate else 24.0
+
+        duration = 0.0
+        if container.duration:
+            duration = float(container.duration) / float(av.time_base)
+        elif video_stream.duration is not None and video_stream.time_base is not None:
+            duration = float(video_stream.duration * video_stream.time_base)
+
+        num_frames = int(video_stream.frames) if video_stream.frames else 0
+        if num_frames == 0 and duration > 0 and fps > 0:
+            num_frames = int(duration * fps)
+
+        if num_frames == 0:
+            counted = 0
+            for _ in container.decode(video_stream):
+                counted += 1
+            num_frames = counted
+
+        return VideoInfo(
+            width=width,
+            height=height,
+            num_frames=num_frames,
+            fps=fps,
+            duration=duration,
+            has_audio=has_audio,
+        )
+
+
+def load_video_frames_normalized(
+    path: str,
+    height: int,
+    width: int,
+    max_frames: int,
+    fps: float | None = None,
+) -> Any:
+    """PyAV replacement for ``ltx_core_mlx.utils.video.load_video_frames_normalized``."""
+    import mlx.core as mx
+    import numpy as np
+
+    require_media()
+    frames_list: list[Any] = []
+    next_pick = 0.0
+    decoded_index = 0
+
+    with av.open(str(path)) as container:
+        if not container.streams.video:
+            raise RuntimeError(f"No video stream found in {path}")
+        stream = container.streams.video[0]
+        source_fps = float(stream.average_rate or stream.base_rate or 24.0)
+
+        for frame in container.decode(stream):
+            if len(frames_list) >= max_frames:
+                break
+
+            take = True
+            if fps is not None and source_fps > 0 and abs(source_fps - fps) > 0.01:
+                take = decoded_index >= next_pick
+                if take:
+                    next_pick += source_fps / fps
+
+            if not take:
+                decoded_index += 1
+                continue
+
+            rgb = frame.reformat(width=width, height=height, format="rgb24")
+            arr = np.asarray(rgb.to_ndarray(), dtype=np.float32) / 255.0
+            frames_list.append(arr)
+            decoded_index += 1
+
+    if not frames_list:
+        raise RuntimeError(f"No frames decoded from {path}")
+
+    stacked = np.stack(frames_list, axis=0)
+    tensor = mx.array(stacked).transpose(0, 3, 1, 2)
+    tensor = tensor.transpose(1, 0, 2, 3)[None, ...]
+    return tensor.astype(mx.bfloat16)
+
+
 def probe_audio_duration(path: Path | str) -> float | None:
     """Return audio duration in seconds, or None when probing fails."""
     require_media()
