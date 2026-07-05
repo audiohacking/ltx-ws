@@ -79,6 +79,9 @@ PIPELINE_PROFILES = [
 ]
 
 CLIP_MULTIPLIER_MAX = 10
+IC_LORA_PRESET_ID = "ic_lora_hdr"
+IC_LORA_DEFAULT_SPEC = "Lightricks/LTX-2.3-22b-IC-LoRA-HDR"
+IC_LORA_DEFAULT_SCALE = 1.0
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "web_outputs"
 DEFAULT_UPLOAD_DIR = REPO_ROOT / "web_uploads"
 INDEX_FILE = "index.json"
@@ -1410,6 +1413,15 @@ def _resolve_ic_lora_video_conditioning(
     return body
 
 
+def _apply_ic_lora_defaults(body: dict[str, Any]) -> dict[str, Any]:
+    """IC-LoRA mode always uses the dedicated HDR IC-LoRA weights."""
+    if (body.get("mode") or "generate").strip().lower() != "ic_lora":
+        return body
+    new_body = dict(body)
+    new_body["lora_specs"] = [[IC_LORA_DEFAULT_SPEC, IC_LORA_DEFAULT_SCALE]]
+    return new_body
+
+
 def _api_mode(mode: str) -> str:
     """Map Web UI mode to generation_mode (i2v → generate + initial_image; a2v stays a2v)."""
     m = (mode or "generate").strip().lower()
@@ -2653,6 +2665,8 @@ def create_app(
             "lora_presets": lora_presets,
             "default_lora_preset_id": default_lora_preset_id,
             "preferred_lora_preset_ids": preferred_lora_ids,
+            "ic_lora_preset_id": IC_LORA_PRESET_ID,
+            "ic_lora_default_spec": IC_LORA_DEFAULT_SPEC,
             "pyav_available": media_available(),
             "audio_trim_available": media_available(),
         }
@@ -2884,8 +2898,14 @@ def create_app(
         _validate_source_video_request(state, body, ui_mode)
         body = _resolve_ic_lora_video_conditioning(state, body)
         if ui_mode == "ic_lora":
-            if not body.get("lora_specs"):
-                raise HTTPException(400, "ic_lora requires at least one IC-LoRA in lora_specs")
+            body = _apply_ic_lora_defaults(body)
+            try:
+                await asyncio.to_thread(_ensure_lora_downloaded, IC_LORA_DEFAULT_SPEC)
+            except Exception as exc:
+                raise HTTPException(
+                    400,
+                    f"Could not download IC-LoRA weights ({IC_LORA_DEFAULT_SPEC}): {exc}",
+                ) from exc
         if ui_mode == "keyframe" and (not body.get("image_path") or not body.get("end_image_path")):
             raise HTTPException(400, "keyframe mode requires start and end image uploads")
         if ui_mode == "lipdub":

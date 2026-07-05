@@ -354,6 +354,8 @@ export default function App() {
   const loraPresetsRef = useRef<LoraPreset[]>([]);
   const ensurePromisesRef = useRef<Map<string, Promise<void>>>(new Map());
   const runEventSourceRef = useRef<EventSource | null>(null);
+  const preIcLoraPresetIdsRef = useRef<string[] | null>(null);
+  const prevModeRef = useRef(mode);
 
   const libraryClips = useMemo(() => {
     return clips
@@ -589,6 +591,23 @@ export default function App() {
       setError(String(e));
     }
   }, [ensureLoraPresets]);
+
+  useEffect(() => {
+    const icId = config?.ic_lora_preset_id ?? "ic_lora_hdr";
+    const entered = mode === "ic_lora" && prevModeRef.current !== "ic_lora";
+    const left = mode !== "ic_lora" && prevModeRef.current === "ic_lora";
+    prevModeRef.current = mode;
+
+    if (entered) {
+      preIcLoraPresetIdsRef.current = loraPresetIds;
+      setLoraPresetIds([icId]);
+      void ensureLoraPresets([icId], config?.lora_presets, { interactive: true });
+    } else if (left && preIcLoraPresetIdsRef.current !== null) {
+      setLoraPresetIds(preIcLoraPresetIdsRef.current);
+      preIcLoraPresetIdsRef.current = null;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only on mode transitions
+  }, [mode, config?.ic_lora_preset_id, config?.lora_presets, ensureLoraPresets]);
 
   const persistLoraSelection = useCallback(async (ids: string[]) => {
     try {
@@ -1434,13 +1453,14 @@ export default function App() {
       setProgress(null);
       return;
     }
-    if (mode === "ic_lora" && selectedLoras.length === 0) {
-      setError("IC-LoRA requires at least one IC-LoRA preset — select one above.");
-      setBusy(false);
-      setProgress(null);
-      return;
-    }
-    if (selectedLoras.length) {
+    if (mode === "ic_lora") {
+      body.lora_specs = [
+        [
+          config?.ic_lora_default_spec ?? "Lightricks/LTX-2.3-22b-IC-LoRA-HDR",
+          1.0,
+        ],
+      ];
+    } else if (selectedLoras.length) {
       body.lora_specs = selectedLoras.map((p) => [p.spec, p.scale]);
     }
 
@@ -1490,6 +1510,7 @@ export default function App() {
 
   const canSubmit = useMemo(() => {
     if (!prompt.trim() || busy || !serverOk) return false;
+    if (mode === "ic_lora" && loraBusy) return false;
     const continuing = willContinueChain;
     if (mode === "i2v" && !imagePath && !continuing) return false;
     if (mode === "a2v" && !audioPath && !audioFile) return false;
@@ -1497,12 +1518,6 @@ export default function App() {
     if (audiocontinue && !pyavAvailable) return false;
     if ((mode === "retake" || mode === "extend" || mode === "lipdub") && !hasVideoSource) {
       return false;
-    }
-    if (mode === "ic_lora") {
-      const icLoras = (config?.lora_presets ?? []).filter(
-        (p) => loraPresetIds.includes(p.id) && p.spec,
-      );
-      if (icLoras.length === 0) return false;
     }
     return true;
   }, [
@@ -1523,8 +1538,7 @@ export default function App() {
     autocontinue,
     activeClip,
     chainId,
-    loraPresetIds,
-    config?.lora_presets,
+    loraBusy,
   ]);
 
   const fitPromptHeight = useCallback(() => {
@@ -1869,6 +1883,16 @@ export default function App() {
               )}
 
               <div className="lora-row">
+                {isIcLora ? (
+                  <p className="hint hint-inline lora-ic-auto">
+                    <strong>IC-LoRA HDR</strong> weights are selected and downloaded
+                    automatically for this mode.
+                    {loraActivity.phase === "working" && loraActivity.label
+                      ? ` (${loraActivity.label}…)`
+                      : ""}
+                  </p>
+                ) : (
+                  <>
                 <label className="lora-row-select">
                   LoRA
                   <LoraMultiSelect
@@ -1920,6 +1944,8 @@ export default function App() {
                     {addingCustomLora ? "…" : "Add"}
                   </button>
                 </div>
+                  </>
+                )}
               </div>
 
               {isMultiClip && !audiocontinue && (
@@ -2031,7 +2057,7 @@ export default function App() {
                     <>
                       <span className="media-panel-title">IC-LoRA inputs</span>
                       <p className="hint hint-inline">
-                        Select an IC-LoRA preset above (e.g. HDR). Motion reference video drives
+                        IC-LoRA HDR weights load automatically. Motion reference video drives
                         v2v transfer; character image is optional. Omit motion video for pure T2V.
                       </p>
                       <div className="media-upload-row">

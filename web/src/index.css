@@ -1279,6 +1279,14 @@ body {
   color: var(--text);
 }
 
+.lora-ic-auto {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+}
+
 .clip-source-picker {
   display: flex;
   flex-direction: column;
