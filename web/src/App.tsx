@@ -396,6 +396,7 @@ export default function App() {
   }, [icLoraSubMode]);
 
   const faceSwapPresetId = config?.face_swap_preset_id ?? "face_swap_head";
+  const lipDubPresetId = config?.lipdub_preset_id ?? "lipdub_ic_lora";
 
   const chainParts = useMemo(() => {
     if (!chainId || !selectedClipId) return [];
@@ -659,6 +660,12 @@ export default function App() {
     void ensureLoraPresets([faceSwapPresetId], config?.lora_presets, { interactive: true });
   }, [mode, faceSwapPresetId, config?.lora_presets, ensureLoraPresets]);
 
+  useEffect(() => {
+    if (mode !== "lipdub" || !lipDubPresetId) return;
+    setLoraPresetIds([lipDubPresetId]);
+    void ensureLoraPresets([lipDubPresetId], config?.lora_presets, { interactive: true });
+  }, [mode, lipDubPresetId, config?.lora_presets, ensureLoraPresets]);
+
   const persistLoraSelection = useCallback(async (ids: string[]) => {
     try {
       localStorage.setItem(LORA_SEL_KEY, JSON.stringify(ids));
@@ -693,6 +700,9 @@ export default function App() {
           }
         }
         if (mode === "face_swap" && checked) {
+          next = [presetId];
+        }
+        if (mode === "lipdub" && checked) {
           next = [presetId];
         }
         void persistLoraSelection(next);
@@ -1017,7 +1027,7 @@ export default function App() {
   }
 
   function clearMediaForMode(nextMode: string) {
-    if (!["i2v", "generate", "a2v", "keyframe", "ic_lora", "face_swap"].includes(nextMode)) {
+    if (!["i2v", "generate", "a2v", "keyframe", "ic_lora", "lipdub", "face_swap"].includes(nextMode)) {
       setImagePath(null);
       setImageName(null);
       if (imageRef.current) imageRef.current.value = "";
@@ -1046,7 +1056,7 @@ export default function App() {
     if (nextMode === "a2v") {
       setChainMethod("autocontinue");
     }
-    if (nextMode === "ic_lora" || nextMode === "face_swap") {
+    if (nextMode === "ic_lora" || nextMode === "face_swap" || nextMode === "lipdub") {
       setClipMultiplier(1);
       setAutocontinue(false);
       setAutoconcat(false);
@@ -1085,6 +1095,7 @@ export default function App() {
   const isA2v = mode === "a2v";
   const isIcLora = mode === "ic_lora";
   const isFaceSwap = mode === "face_swap";
+  const isLipDub = mode === "lipdub";
   const pyavAvailable =
     config?.pyav_available ?? config?.audio_trim_available ?? false;
   const audioTrimAvailable = pyavAvailable;
@@ -1465,7 +1476,7 @@ export default function App() {
       body.extend_direction = extendDirection;
     }
     if (
-      (mode === "i2v" || mode === "generate" || mode === "a2v" || mode === "keyframe" || mode === "ic_lora" || mode === "face_swap") &&
+      (mode === "i2v" || mode === "generate" || mode === "a2v" || mode === "keyframe" || mode === "ic_lora" || mode === "lipdub" || mode === "face_swap") &&
       imagePath
     ) {
       body.image_path = imagePath;
@@ -1478,7 +1489,7 @@ export default function App() {
       resolvedAudioPath = await uploadFile(audioFile, "audio");
       setAudioPath(resolvedAudioPath);
     }
-    if ((mode === "a2v" || mode === "lipdub") && resolvedAudioPath) {
+    if (mode === "a2v" && resolvedAudioPath) {
       body.audio_path = resolvedAudioPath;
       if (mode === "a2v" && audioStartSeconds > 0) {
         body.audio_start_seconds = audioStartSeconds;
@@ -1486,6 +1497,9 @@ export default function App() {
           body.audio_source_duration_seconds = audioDurationSeconds;
         }
       }
+    }
+    if (mode === "lipdub" && resolvedAudioPath) {
+      body.audio_path = resolvedAudioPath;
     }
     if (mode === "ic_lora") {
       if (conditioningVideoPath) {
@@ -1511,7 +1525,7 @@ export default function App() {
       (p) => loraPresetIds.includes(p.id) && p.spec,
     );
     if (mode === "lipdub" && selectedLoras.length !== 1) {
-      setError("LipDub requires exactly one LoRA — select a single preset.");
+      setError("LipDub requires exactly one LoRA — use the LipDub IC-LoRA preset.");
       setBusy(false);
       setProgress(null);
       return;
@@ -1572,6 +1586,7 @@ export default function App() {
   const canSubmit = useMemo(() => {
     if (!prompt.trim() || busy || !serverOk) return false;
     if (mode === "ic_lora" && loraBusy) return false;
+    if (mode === "lipdub" && loraBusy) return false;
     if (mode === "face_swap" && loraBusy) return false;
     const continuing = willContinueChain;
     if (mode === "i2v" && !imagePath && !continuing) return false;
@@ -1895,7 +1910,7 @@ export default function App() {
                   Clips
                   <select
                     value={clipMultiplier}
-                    disabled={isIcLora || isFaceSwap}
+                    disabled={isIcLora || isFaceSwap || isLipDub}
                     onChange={(e) => setClipMultiplier(Number(e.target.value))}
                   >
                     {Array.from(
@@ -2052,7 +2067,7 @@ export default function App() {
                   />
                   Enhance prompt
                 </label>
-                {!isMultiClip && !audiocontinue && !isIcLora && !isFaceSwap && (
+                {!isMultiClip && !audiocontinue && !isIcLora && !isFaceSwap && !isLipDub && (
                   <label className="check">
                     <input
                       type="checkbox"
@@ -2067,7 +2082,7 @@ export default function App() {
                     type="checkbox"
                     checked={autoconcat}
                     onChange={(e) => setAutoconcat(e.target.checked)}
-                    disabled={isMultiClip || audiocontinue || isIcLora || isFaceSwap}
+                    disabled={isMultiClip || audiocontinue || isIcLora || isFaceSwap || isLipDub}
                   />
                   Autoconcat
                 </label>
@@ -2113,8 +2128,56 @@ export default function App() {
                 </div>
               )}
 
-              {(isA2v || isIcLora || isFaceSwap || needsImageUpload || showStartImageOptional || needsVideoUpload || needsEndImageUpload) && (
+              {(isA2v || isIcLora || isFaceSwap || isLipDub || needsImageUpload || showStartImageOptional || needsVideoUpload || needsEndImageUpload) && (
                 <div className="media-panel">
+                  {isLipDub && (
+                    <>
+                      <span className="media-panel-title">LipDub inputs</span>
+                      <p className="hint hint-inline">
+                        Lip-sync / dub a reference clip: visual motion from the video,
+                        voice tone from uploaded audio (or the video&apos;s audio track),
+                        and new dialogue in your prompt. Frame count follows the reference
+                        video. Requires the LipDub IC-LoRA.
+                      </p>
+                      <label className="media-upload">
+                        <span className="media-upload-label">
+                          Voice tone audio (optional if video has audio)
+                        </span>
+                        <input
+                          ref={audioRef}
+                          type="file"
+                          accept="audio/*"
+                          onChange={(e) => {
+                            const f = e.target.files?.[0];
+                            if (f) handleAudioFileSelected(f);
+                          }}
+                        />
+                        <span className="media-upload-hint">
+                          {audioName ?? "Choose voice-tone audio…"}
+                        </span>
+                      </label>
+                      <label className="media-upload">
+                        <span className="media-upload-label">
+                          I2V anchor image (optional)
+                        </span>
+                        <input
+                          ref={imageRef}
+                          type="file"
+                          accept="image/*"
+                          onChange={async (e) => {
+                            const f = e.target.files?.[0];
+                            if (f) {
+                              setImagePath(await uploadFile(f, "image"));
+                              setImageName(f.name);
+                            }
+                          }}
+                        />
+                        <span className="media-upload-hint">
+                          {imageName ?? "Choose anchor image…"}
+                        </span>
+                      </label>
+                    </>
+                  )}
                   {isFaceSwap && (
                     <>
                       <span className="media-panel-title">Face swap inputs</span>
@@ -2315,7 +2378,7 @@ export default function App() {
                       )}
                     </>
                   )}
-                  {!isA2v && (needsImageUpload || showStartImageOptional) && (
+                  {!isA2v && !isLipDub && (needsImageUpload || showStartImageOptional) && (
                     <>
                       <span className="media-panel-title">Source media</span>
                       <label className="media-upload">
@@ -2366,7 +2429,11 @@ export default function App() {
                     <>
                       {!isA2v && (
                         <span className="media-panel-title">
-                          {isFaceSwap ? "Reference video (required)" : "Source video"}
+                          {isFaceSwap
+                            ? "Reference video (required)"
+                            : isLipDub
+                              ? "Reference video (required, visual motion)"
+                              : "Source video"}
                         </span>
                       )}
                       <label className="media-upload">
@@ -2421,7 +2488,11 @@ export default function App() {
                       )}
                       {hasVideoSource && (
                         <p className="media-source-note">
-                          {sourceClipId ? "Using library clip as source video." : "Using uploaded file as source video."}
+                          {sourceClipId
+                            ? "Using library clip as reference video."
+                            : isLipDub
+                              ? "Using uploaded reference video. Add voice-tone audio above if the clip has no audio track."
+                              : "Using uploaded file as source video."}
                         </p>
                       )}
                     </>

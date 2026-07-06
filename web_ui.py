@@ -98,6 +98,12 @@ FACE_SWAP_DEFAULT_SPEC = (
     "resolve/main/ltx-2.3/head_swap_v3_rank_adaptive_fro_098.safetensors"
 )
 FACE_SWAP_DEFAULT_SCALE = 0.98
+LIPDUB_PRESET_ID = "lipdub_ic_lora"
+LIPDUB_DEFAULT_SPEC = (
+    "https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-LipDub/"
+    "resolve/main/ltx-2.3-22b-ic-lora-lipdub-0.9.safetensors"
+)
+LIPDUB_DEFAULT_SCALE = 1.0
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "web_outputs"
 
 
@@ -355,6 +361,12 @@ def _lora_catalog(output_dir: Path | None = None) -> tuple[list[dict[str, Any]],
         "Face swap — head swap LoRA (LTX 2.3)",
         FACE_SWAP_DEFAULT_SPEC,
         FACE_SWAP_DEFAULT_SCALE,
+    )
+    _add(
+        LIPDUB_PRESET_ID,
+        "LipDub — IC-LoRA (LTX 2.3)",
+        LIPDUB_DEFAULT_SPEC,
+        LIPDUB_DEFAULT_SCALE,
     )
 
     if output_dir is not None:
@@ -730,7 +742,7 @@ def _clip_audio_duration_seconds(body: dict[str, Any]) -> float:
 
 
 def _apply_audio_start_offset(body: dict[str, Any]) -> tuple[dict[str, Any], list[Path]]:
-    """Crop a2v/lipdub audio from ``audio_start_seconds`` before generation."""
+    """Crop a2v audio from ``audio_start_seconds`` before generation."""
     temps: list[Path] = []
     try:
         start = float(body.get("audio_start_seconds") or 0)
@@ -742,7 +754,7 @@ def _apply_audio_start_offset(body: dict[str, Any]) -> tuple[dict[str, Any], lis
     if not audio_path:
         return body, temps
     ui_mode = (body.get("mode") or "generate").strip().lower()
-    if ui_mode not in ("a2v", "lipdub"):
+    if ui_mode != "a2v":
         return body, temps
     if not media_available():
         raise ValueError("Audio start offset requires PyAV — install with: pip install av")
@@ -1537,6 +1549,7 @@ def _build_params_from_request(body: dict[str, Any], *, state: AppState | None =
         "generate",
         "keyframe",
         "ic_lora",
+        "lipdub",
         "face_swap",
     ) else None
     end_image_path = body.get("end_image_path") if ui_mode == "keyframe" else None
@@ -2755,6 +2768,8 @@ def create_app(
             "ic_lora_union_motion_spec": IC_LORA_UNION_MOTION_SPEC,
             "face_swap_preset_id": FACE_SWAP_PRESET_ID,
             "face_swap_default_spec": FACE_SWAP_DEFAULT_SPEC,
+            "lipdub_preset_id": LIPDUB_PRESET_ID,
+            "lipdub_default_spec": LIPDUB_DEFAULT_SPEC,
             "pose_control_available": _pose_control_available(),
             "pyav_available": media_available(),
             "audio_trim_available": media_available(),
@@ -3004,7 +3019,34 @@ def create_app(
         if ui_mode == "lipdub":
             lora_items = body.get("lora_specs") or []
             if len(lora_items) != 1:
-                raise HTTPException(400, "lipdub requires exactly one LoRA preset")
+                raise HTTPException(400, "lipdub requires exactly one LoRA preset (LipDub IC-LoRA)")
+            _validate_source_video_request(state, body, ui_mode)
+            if not body.get("audio_path") and media_available():
+                try:
+                    ref_path = resolve_source_video_path(state, body)
+                except ValueError as exc:
+                    raise HTTPException(400, str(exc)) from exc
+                if ref_path:
+                    from ltx_media import probe_video_info
+
+                    info = probe_video_info(ref_path)
+                    if not info.has_audio:
+                        raise HTTPException(
+                            400,
+                            "lipdub requires voice-tone audio: upload an audio file or "
+                            "use a reference video with an audio track",
+                        )
+            for lora_item in lora_items:
+                if not isinstance(lora_item, (list, tuple)) or not lora_item:
+                    continue
+                spec = str(lora_item[0])
+                try:
+                    await asyncio.to_thread(_ensure_lora_downloaded, spec)
+                except Exception as exc:
+                    raise HTTPException(
+                        400,
+                        f"Could not download LipDub LoRA weights ({spec}): {exc}",
+                    ) from exc
         if ui_mode == "face_swap":
             if not body.get("image_path"):
                 raise HTTPException(400, "face_swap requires a face identity image")

@@ -1381,6 +1381,47 @@ def _maybe_preserve_reference_audio(
             log.warning("Could not preserve reference audio from %s: %s", ref, exc)
 
 
+def _prepare_lipdub_reference_video(
+    reference_video: str,
+    voice_audio: str | None,
+    *,
+    tmpdir: str,
+) -> tuple[str, list[str]]:
+    """Build the LipDub reference clip with voice-tone audio for VAE reference tokens.
+
+    LipDubPipeline reads audio from ``reference_video_path`` only. When the user
+    supplies a separate voice-tone track, mux it onto a temp copy of the reference
+    video (Comfy-style Load Audio). Otherwise use embedded video audio.
+    """
+    from ltx_media import media_available, mux_audio_into_video, probe_video_info
+
+    cleanup: list[str] = []
+    if not media_available():
+        if voice_audio:
+            raise RuntimeError("lipdub voice-tone audio mux requires PyAV (pip install av)")
+        return reference_video, cleanup
+
+    info = probe_video_info(reference_video)
+    duration_s = float(info.duration or 0.0)
+    if duration_s <= 0 and info.num_frames > 0 and info.fps > 0:
+        duration_s = float(info.num_frames) / float(info.fps)
+    duration_s = max(0.1, duration_s)
+
+    if voice_audio:
+        out = os.path.join(tmpdir, "lipdub_ref_with_voice_audio.mp4")
+        mux_audio_into_video(reference_video, voice_audio, out, duration_s=duration_s)
+        cleanup.append(out)
+        log.info("LipDub: muxed voice-tone audio onto reference video (%s)", out)
+        return out, cleanup
+
+    if not info.has_audio:
+        raise RuntimeError(
+            "lipdub requires voice-tone audio: upload an audio file or use a reference "
+            "video with an audio track"
+        )
+    return reference_video, cleanup
+
+
 def _invoke_lipdub_style(
     pipe: Any,
     *,
@@ -1390,7 +1431,7 @@ def _invoke_lipdub_style(
     num_frames: int,
     req: GenerationRequest,
 ) -> None:
-    """LipDub: reference video + optional face image + source audio conditioning."""
+    """LipDub: reference video (visual IC-LoRA + voice-tone audio) + optional I2V anchor."""
     _apply_ltx_mlx_patches(default_fps=float(common_gen_kwargs.get("frame_rate") or 24.0))
     lip_kwargs = dict(common_gen_kwargs)
     lip_kwargs["reference_video_path"] = reference_video
@@ -2581,10 +2622,16 @@ class LocalVideoGenerator:
                             },
                         )
                         last_pipe = pipe
+                        lipdub_ref, lipdub_tmp = _prepare_lipdub_reference_video(
+                            tmp_video,
+                            tmp_audio,
+                            tmpdir=tmpdir,
+                        )
+                        tmp_video_conditioning_cleanup.extend(lipdub_tmp)
                         _invoke_lipdub_style(
                             pipe,
                             common_gen_kwargs=common_gen_kwargs,
-                            reference_video=tmp_video,
+                            reference_video=lipdub_ref,
                             tmp_image=tmp_image,
                             num_frames=nf,
                             req=req,
