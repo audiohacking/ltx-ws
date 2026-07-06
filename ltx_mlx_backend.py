@@ -1390,7 +1390,7 @@ def _invoke_lipdub_style(
     num_frames: int,
     req: GenerationRequest,
 ) -> None:
-    """LipDub / face-swap: reference video + optional face image + source audio conditioning."""
+    """LipDub: reference video + optional face image + source audio conditioning."""
     _apply_ltx_mlx_patches(default_fps=float(common_gen_kwargs.get("frame_rate") or 24.0))
     lip_kwargs = dict(common_gen_kwargs)
     lip_kwargs["reference_video_path"] = reference_video
@@ -1400,6 +1400,144 @@ def _invoke_lipdub_style(
         lip_kwargs["reference_strength"] = float(req.reference_strength)
     _apply_optional_generate_kwargs(lip_kwargs, req)
     _invoke_generate_and_save(pipe, **lip_kwargs)
+
+
+def _prepare_face_swap_reference_video(
+    reference_path: str,
+    *,
+    tmpdir: str,
+    num_frames: int,
+    width: int,
+    height: int,
+    fps: float,
+) -> str:
+    """Trim/resize reference footage to the requested clip length for IC-LoRA face swap."""
+    from ltx_media import media_available, probe_video_info, trim_video_to_spec
+
+    if not media_available():
+        raise RuntimeError("face_swap requires PyAV to prepare reference video (pip install av)")
+
+    info = probe_video_info(reference_path)
+    trimmed_path = os.path.join(tmpdir, "face_swap_ref_trimmed.mp4")
+    if info.num_frames > num_frames or abs(info.fps - fps) > 0.05:
+        log.info(
+            "Face swap: trimming reference video %d frames at %.1f fps -> %d frames at %.1f fps",
+            info.num_frames,
+            info.fps,
+            num_frames,
+            fps,
+        )
+    trim_video_to_spec(
+        reference_path,
+        trimmed_path,
+        num_frames=num_frames,
+        width=width,
+        height=height,
+        fps=fps,
+    )
+    return trimmed_path
+
+
+def _run_ic_lora_generation(
+    gen: "LocalVideoGenerator",
+    *,
+    req: GenerationRequest,
+    prompt: str,
+    resolved_loras: list[tuple[str, float]],
+    vc_items: list[tuple[str, float]],
+    tmp_image: str | None,
+    tmpdir: str,
+    out_path: str,
+    width: int,
+    height: int,
+    nf: int,
+    seed: int,
+    steps: int,
+    tmp_video_conditioning_cleanup: list[str],
+    audio_reference_paths: list[str] | None = None,
+) -> Any:
+    """Shared IC-LoRA invoke path for ``ic_lora`` and ``face_swap`` modes."""
+    if not resolved_loras:
+        raise RuntimeError("IC-LoRA generation requires at least one LoRA spec")
+    if not vc_items:
+        raise RuntimeError("IC-LoRA generation requires video conditioning")
+
+    ic_pipe_key = (
+        "hdr_ic_lora" if _ic_lora_uses_hdr_pipeline(resolved_loras) else "ic_lora"
+    )
+    primary_lora = _ic_lora_primary_lora(resolved_loras)
+    uses_pose = _needs_pose_control_preprocessing(resolved_loras, vc_items)
+    log.info(
+        "IC-LoRA invoke: pipe=%s primary=%s vcond_in=%d image=%s pose_preprocess=%s",
+        ic_pipe_key,
+        primary_lora[0] if primary_lora else "?",
+        len(vc_items),
+        "yes" if tmp_image else "no",
+        "yes" if uses_pose else "no",
+    )
+    pipe = gen._get_pipe(
+        ic_pipe_key,
+        pipe_kwargs={
+            "lora_paths": [(str(p), float(s)) for p, s in resolved_loras],
+        },
+    )
+    ic_vcond, ic_vcond_cleanup = _prepare_ic_lora_video_conditioning(
+        vc_items,
+        resolved_loras=resolved_loras,
+        width=width,
+        height=height,
+        num_frames=nf,
+        fps=float(gen.fps),
+        tmpdir=tmpdir,
+    )
+    tmp_video_conditioning_cleanup.extend(ic_vcond_cleanup)
+    ic_kwargs: dict[str, Any] = {
+        "prompt": prompt,
+        "output_path": out_path,
+        "video_conditioning": ic_vcond,
+        "height": height,
+        "width": width,
+        "num_frames": nf,
+        "frame_rate": float(gen.fps),
+        "seed": seed,
+        "stage1_steps": int(steps),
+        "conditioning_attention_strength": 1.0,
+    }
+    if tmp_image:
+        ic_kwargs["images"] = _build_ic_lora_image_conditionings(tmp_image, nf)
+    if req.reference_strength is not None:
+        ic_kwargs["conditioning_attention_strength"] = float(req.reference_strength)
+    if req.stage2_steps is not None:
+        ic_kwargs["stage2_steps"] = int(req.stage2_steps)
+    elif uses_pose and tmp_image:
+        ic_kwargs["stage2_steps"] = 1
+        log.info(
+            "IC-LoRA Union motion transfer: stage2_steps=1 "
+            "(override with stage2_steps in API)"
+        )
+    if ic_vcond_cleanup:
+        log.info(
+            "IC-LoRA pose control video: %s — verify colored "
+            "OpenPose skeletons before cleanup",
+            ic_vcond_cleanup[0],
+        )
+    _invoke_generate_and_save(pipe, **ic_kwargs)
+    if uses_pose and ic_vcond_cleanup and gen.spill_dir and req.job_id:
+        try:
+            gen.spill_dir.mkdir(parents=True, exist_ok=True)
+            slug = _spill_slug(req.prompt)
+            dest = gen.spill_dir / f"{req.job_id}_{slug}_pose_control.mp4"
+            shutil.copy2(ic_vcond_cleanup[0], dest)
+            log.info("IC-LoRA pose control saved → %s", dest)
+        except OSError as exc:
+            log.warning("Could not save pose control debug copy: %s", exc)
+    if audio_reference_paths:
+        _maybe_preserve_reference_audio(
+            out_path,
+            audio_reference_paths,
+            job_id=req.job_id,
+        )
+    return pipe
 
 
 def _stage_from_tqdm_desc(desc: str) -> str:
@@ -2320,121 +2458,64 @@ class LocalVideoGenerator:
                             raise RuntimeError("face_swap mode requires face identity image")
                         if len(resolved_loras) != 1:
                             raise RuntimeError("face_swap mode requires exactly one LoRA spec")
-                        log.info(
-                            "Face swap: reference video + identity image "
-                            "(LipDub-style audio conditioning from reference)"
-                        )
-                        pipe = self._get_pipe(
-                            "lipdub",
-                            pipe_kwargs={
-                                "lora_paths": [(str(p), float(s)) for p, s in resolved_loras],
-                            },
-                        )
-                        last_pipe = pipe
-                        _invoke_lipdub_style(
-                            pipe,
-                            common_gen_kwargs=common_gen_kwargs,
-                            reference_video=tmp_video,
-                            tmp_image=tmp_image,
+                        ref_scale = 1.0
+                        if vc_items:
+                            ref_path, ref_scale = vc_items[0]
+                        else:
+                            ref_path = tmp_video
+                        trimmed_ref = _prepare_face_swap_reference_video(
+                            str(ref_path),
+                            tmpdir=tmpdir,
                             num_frames=nf,
-                            req=req,
+                            width=width,
+                            height=height,
+                            fps=float(self.fps),
                         )
-                        _maybe_preserve_reference_audio(
-                            out_path,
-                            [tmp_video],
-                            job_id=req.job_id,
+                        tmp_video_conditioning_cleanup.append(trimmed_ref)
+                        log.info(
+                            "Face swap: IC-LoRA + head-swap LoRA "
+                            "(identity image + %d-frame motion reference)",
+                            nf,
+                        )
+                        last_pipe = _run_ic_lora_generation(
+                            self,
+                            req=req,
+                            prompt=effective_prompt,
+                            resolved_loras=resolved_loras,
+                            vc_items=[(trimmed_ref, float(ref_scale))],
+                            tmp_image=tmp_image,
+                            tmpdir=tmpdir,
+                            out_path=out_path,
+                            width=width,
+                            height=height,
+                            nf=nf,
+                            seed=seed,
+                            steps=steps,
+                            tmp_video_conditioning_cleanup=tmp_video_conditioning_cleanup,
+                            audio_reference_paths=[tmp_video],
                         )
                     elif mode == "ic_lora":
                         if not resolved_loras:
                             raise RuntimeError("ic_lora mode requires at least one LoRA spec")
-                        ic_pipe_key = (
-                            "hdr_ic_lora"
-                            if _ic_lora_uses_hdr_pipeline(resolved_loras)
-                            else "ic_lora"
-                        )
-                        primary_lora = _ic_lora_primary_lora(resolved_loras)
-                        log.info(
-                            "IC-LoRA invoke: pipe=%s primary=%s vcond_in=%d image=%s pose_preprocess=%s",
-                            ic_pipe_key,
-                            primary_lora[0] if primary_lora else "?",
-                            len(vc_items),
-                            "yes" if tmp_image else "no",
-                            "yes"
-                            if _needs_pose_control_preprocessing(resolved_loras, vc_items)
-                            else "no",
-                        )
-                        pipe = self._get_pipe(
-                            ic_pipe_key,
-                            pipe_kwargs={
-                                "lora_paths": [(str(p), float(s)) for p, s in resolved_loras],
-                            },
-                        )
-                        last_pipe = pipe
-                        ic_vcond, ic_vcond_cleanup = _prepare_ic_lora_video_conditioning(
-                            vc_items,
+                        if not vc_items:
+                            raise RuntimeError("ic_lora mode requires video conditioning")
+                        last_pipe = _run_ic_lora_generation(
+                            self,
+                            req=req,
+                            prompt=req.prompt,
                             resolved_loras=resolved_loras,
+                            vc_items=vc_items,
+                            tmp_image=tmp_image,
+                            tmpdir=tmpdir,
+                            out_path=out_path,
                             width=width,
                             height=height,
-                            num_frames=nf,
-                            fps=float(self.fps),
-                            tmpdir=tmpdir,
+                            nf=nf,
+                            seed=seed,
+                            steps=steps,
+                            tmp_video_conditioning_cleanup=tmp_video_conditioning_cleanup,
+                            audio_reference_paths=[str(p) for p, _ in vc_items],
                         )
-                        tmp_video_conditioning_cleanup.extend(ic_vcond_cleanup)
-                        uses_pose = _needs_pose_control_preprocessing(resolved_loras, vc_items)
-                        ic_kwargs: dict[str, Any] = {
-                            "prompt": req.prompt,
-                            "output_path": out_path,
-                            "video_conditioning": ic_vcond,
-                            "height": height,
-                            "width": width,
-                            "num_frames": nf,
-                            "frame_rate": float(self.fps),
-                            "seed": seed,
-                            "stage1_steps": int(steps),
-                            "conditioning_attention_strength": 1.0,
-                        }
-                        if tmp_image:
-                            ic_kwargs["images"] = _build_ic_lora_image_conditionings(
-                                tmp_image, nf
-                            )
-                        if req.reference_strength is not None:
-                            ic_kwargs["conditioning_attention_strength"] = float(
-                                req.reference_strength
-                            )
-                        if req.stage2_steps is not None:
-                            ic_kwargs["stage2_steps"] = int(req.stage2_steps)
-                        elif uses_pose and tmp_image:
-                            # Stage 2 drops video reference; lighter refine preserves motion.
-                            ic_kwargs["stage2_steps"] = 1
-                            log.info(
-                                "IC-LoRA Union motion transfer: stage2_steps=1 "
-                                "(override with stage2_steps in API)"
-                            )
-                        if ic_vcond_cleanup:
-                            log.info(
-                                "IC-LoRA pose control video: %s — verify colored "
-                                "OpenPose skeletons before cleanup",
-                                ic_vcond_cleanup[0],
-                            )
-                        _invoke_generate_and_save(pipe, **ic_kwargs)
-                        if uses_pose and ic_vcond_cleanup and self.spill_dir and req.job_id:
-                            try:
-                                self.spill_dir.mkdir(parents=True, exist_ok=True)
-                                slug = _spill_slug(req.prompt)
-                                dest = (
-                                    self.spill_dir
-                                    / f"{req.job_id}_{slug}_pose_control.mp4"
-                                )
-                                shutil.copy2(ic_vcond_cleanup[0], dest)
-                                log.info("IC-LoRA pose control saved → %s", dest)
-                            except OSError as exc:
-                                log.warning("Could not save pose control debug copy: %s", exc)
-                        if vc_items:
-                            _maybe_preserve_reference_audio(
-                                out_path,
-                                [str(p) for p, _ in vc_items],
-                                job_id=req.job_id,
-                            )
                     elif tmp_image:
                         try:
                             from PIL import Image as PILImage

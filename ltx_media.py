@@ -805,6 +805,91 @@ def encode_image_hold_video(
     return output_path
 
 
+def trim_video_to_spec(
+    src: str | Path,
+    dst: str | Path,
+    *,
+    num_frames: int,
+    width: int,
+    height: int,
+    fps: float,
+    start_seconds: float = 0.0,
+) -> Path:
+    """Re-encode up to ``num_frames`` from ``src`` at the target resolution and fps."""
+    import numpy as np
+
+    require_media()
+    src = Path(src)
+    dst = Path(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    num_frames = max(1, int(num_frames))
+    width = int(width)
+    height = int(height)
+    pad_w = width + (width & 1)
+    pad_h = height + (height & 1)
+    fps_frac = _pyav_frame_rate(fps)
+    start_seconds = max(0.0, float(start_seconds))
+
+    frames_written = 0
+    next_pick = 0.0
+    decoded_index = 0
+    started = start_seconds <= 0.0
+
+    with av.open(str(src)) as vin, av.open(str(dst), "w") as out:
+        if not vin.streams.video:
+            raise RuntimeError(f"No video stream in {src}")
+        in_stream = vin.streams.video[0]
+        source_fps = float(in_stream.average_rate or in_stream.base_rate or fps)
+
+        out_stream = out.add_stream(
+            "libx264", rate=fps_frac, width=pad_w, height=pad_h
+        )
+        out_stream.pix_fmt = "yuv420p"
+        out_stream.options = {"crf": "18", "preset": "veryfast"}
+        out_stream.time_base = Fraction(fps_frac.denominator, fps_frac.numerator)
+
+        for frame in vin.decode(in_stream):
+            if frames_written >= num_frames:
+                break
+
+            frame_time = _media_time_seconds(frame, in_stream)
+            if not started:
+                if frame_time is not None and frame_time < start_seconds:
+                    decoded_index += 1
+                    continue
+                started = True
+
+            take = True
+            if source_fps > 0 and abs(source_fps - fps) > 0.01:
+                take = decoded_index >= next_pick
+                if take:
+                    next_pick += source_fps / fps
+
+            if not take:
+                decoded_index += 1
+                continue
+
+            rgb = frame.reformat(width=pad_w, height=pad_h, format="rgb24")
+            arr = np.asarray(rgb.to_ndarray(), dtype=np.uint8)
+            out_frame = av.VideoFrame.from_ndarray(arr, format="rgb24")
+            out_frame = out_frame.reformat(format="yuv420p")
+            out_frame.pts = frames_written
+            for packet in out_stream.encode(out_frame):
+                out.mux(packet)
+            frames_written += 1
+            decoded_index += 1
+
+        if frames_written == 0:
+            raise RuntimeError(f"No frames written trimming {src}")
+
+        for packet in out_stream.encode(None):
+            out.mux(packet)
+
+    if not dst.is_file() or dst.stat().st_size == 0:
+        raise RuntimeError(f"Video trim produced empty output: {dst}")
+    return dst
+
+
 def encode_single_frame(
     output_file: Any,
     image_array: Any,

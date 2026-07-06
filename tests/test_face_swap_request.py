@@ -41,3 +41,16 @@ def test_build_params_face_swap(tmp_path: Path):
     assert params.initial_image == str(face.resolve())
     assert params.source_video == str(video.resolve())
     assert len(params.lora_specs) == 1
+
+
+def test_face_swap_mode_is_not_lipdub():
+    """Face swap must not route through LipDub (lip-sync) pipeline."""
+    from pathlib import Path
+
+    src = Path("ltx_mlx_backend.py").read_text(encoding="utf-8")
+    face_block_start = src.index('elif mode in ("face_swap", "face-swap"):')
+    face_block_end = src.index("elif mode == \"ic_lora\":", face_block_start)
+    face_block = src[face_block_start:face_block_end]
+    assert '"lipdub"' not in face_block
+    assert "_invoke_lipdub_style" not in face_block
+    assert "_run_ic_lora_generation" in face_block
