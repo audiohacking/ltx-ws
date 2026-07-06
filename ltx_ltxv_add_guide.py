@@ -21,7 +21,10 @@ from ltx_core_mlx.components.patchifiers import compute_video_latent_shape
 from ltx_core_mlx.conditioning.mask_utils import update_attention_mask
 from ltx_core_mlx.conditioning.types.latent_cond import LatentState
 from ltx_core_mlx.utils.ffmpeg import probe_video_info
-from ltx_core_mlx.utils.positions import VIDEO_SPATIAL_SCALE, VIDEO_TEMPORAL_SCALE, compute_video_positions
+from ltx_core_mlx.utils.positions import (
+    VIDEO_SPATIAL_SCALE,
+    VIDEO_TEMPORAL_SCALE,
+)
 from ltx_core_mlx.utils.video import load_video_frames_normalized
 
 logger = logging.getLogger(__name__)
@@ -33,9 +36,11 @@ DEFAULT_GUIDE_BLUR_RADIUS = 0
 VIDEO_TIME_SCALE = 8
 
 
-def vae_compatible_frame_count(num_frames: int, source_num_frames: int) -> int:
+def vae_compatible_frame_count(num_frames: int, source_num_frames: int | None = None) -> int:
     """Round down to ``8k+1`` pixel frames (LTX video VAE temporal layout)."""
-    max_frames = min(int(num_frames), int(source_num_frames))
+    max_frames = int(num_frames)
+    if source_num_frames is not None:
+        max_frames = min(max_frames, int(source_num_frames))
     k = max(1, (max_frames - 1) // VIDEO_TIME_SCALE)
     return 1 + k * VIDEO_TIME_SCALE
 
@@ -69,6 +74,12 @@ def ltxv_preprocess_rgb_frame(frame: np.ndarray, *, crf: int = DEFAULT_GUIDE_CRF
     return out.astype(np.float32) / 255.0
 
 
+def _mlx_to_numpy_f32(video: mx.array) -> np.ndarray:
+    """Materialize MLX video tensor as float32 numpy (bfloat16 is not PEP-3118 safe)."""
+    _mx_eval(video)
+    return np.asarray(video.astype(mx.float32))
+
+
 def preprocess_guide_video_tensor(
     video: mx.array,
     *,
@@ -77,7 +88,9 @@ def preprocess_guide_video_tensor(
 ) -> mx.array:
     """Apply ``LTXVPreprocess`` (+ optional blur) to ``(1, 3, F, H, W)`` in ``[0,1]``."""
     del blur_radius  # Comfy blur optional; BFS workflows use 0
-    arr = np.array(video)
+    if crf <= 0:
+        return video.astype(mx.float32)
+    arr = _mlx_to_numpy_f32(video)
     if arr.ndim != 5:
         raise ValueError(f"Expected video (1, 3, F, H, W), got {arr.shape}")
     _, _, f, _, _ = arr.shape
@@ -87,7 +100,58 @@ def preprocess_guide_video_tensor(
         out_frames.append(ltxv_preprocess_rgb_frame(hwc, crf=crf))
     stacked = np.stack(out_frames, axis=0)  # F,H,W,C
     stacked = np.transpose(stacked, (3, 0, 1, 2))[None, ...]  # 1,C,F,H,W
-    return mx.array(stacked, dtype=video.dtype)
+    return mx.array(stacked, dtype=mx.float32)
+
+
+def _video_patch_grid_bounds_np(
+    num_latent_frames: int,
+    latent_height: int,
+    latent_width: int,
+    *,
+    patch_size: tuple[int, int, int] = (1, 1, 1),
+) -> np.ndarray:
+    """Comfy / ltx-core ``get_patch_grid_bounds`` for video latents (batch=1)."""
+    pt, ph, pw = patch_size
+    f_grid = np.arange(0, num_latent_frames, pt, dtype=np.float32)
+    h_grid = np.arange(0, latent_height, ph, dtype=np.float32)
+    w_grid = np.arange(0, latent_width, pw, dtype=np.float32)
+    f_starts, h_starts, w_starts = np.meshgrid(f_grid, h_grid, w_grid, indexing="ij")
+    f_ends = f_starts + pt
+    h_ends = h_starts + ph
+    w_ends = w_starts + pw
+    starts = np.stack([f_starts, h_starts, w_starts], axis=0)
+    ends = np.stack([f_ends, h_ends, w_ends], axis=0)
+    bounds = np.stack([starts, ends], axis=-1)  # (3, F, H, W, 2)
+    flat = bounds.reshape(3, -1, 2)
+    return flat[np.newaxis, ...]  # (1, 3, N, 2)
+
+
+def _pixel_coords_from_bounds_np(
+    latent_bounds: np.ndarray,
+    *,
+    causal_fix: bool,
+) -> np.ndarray:
+    """Comfy ``latent_to_pixel_coords`` / ltx-core ``get_pixel_coords``."""
+    scale = np.array(
+        [VIDEO_TEMPORAL_SCALE, VIDEO_SPATIAL_SCALE, VIDEO_SPATIAL_SCALE],
+        dtype=np.float32,
+    ).reshape(1, 3, 1, 1)
+    pixel = latent_bounds.astype(np.float32) * scale
+    if causal_fix:
+        pixel[:, 0, ...] = np.maximum(pixel[:, 0, ...] + 1.0 - VIDEO_TEMPORAL_SCALE, 0.0)
+    return pixel
+
+
+def _rope_positions_from_pixel_bounds(
+    pixel_bounds: np.ndarray,
+    *,
+    frame_rate: float,
+) -> np.ndarray:
+    """Token RoPE positions: temporal mid / fps, spatial mids in pixels."""
+    t_mid = (pixel_bounds[:, 0, :, 0] + pixel_bounds[:, 0, :, 1]) * 0.5 / float(frame_rate)
+    h_mid = (pixel_bounds[:, 1, :, 0] + pixel_bounds[:, 1, :, 1]) * 0.5
+    w_mid = (pixel_bounds[:, 2, :, 0] + pixel_bounds[:, 2, :, 1]) * 0.5
+    return np.stack([t_mid, h_mid, w_mid], axis=-1).astype(np.float32)
 
 
 def compute_guide_video_positions(
@@ -99,30 +163,16 @@ def compute_guide_video_positions(
     frame_idx: int = 0,
     num_pixel_frames: int | None = None,
 ) -> mx.array:
-    """RoPE positions for appended guide tokens (upstream ``VideoConditionByKeyframeIndex``)."""
-    if frame_idx == 0:
-        positions = compute_video_positions(num_latent_frames, height, width, frame_rate=frame_rate)
-    else:
-        idx = mx.arange(num_latent_frames).astype(mx.float32)
-        f_starts = idx * VIDEO_TEMPORAL_SCALE
-        f_ends = (idx + 1) * VIDEO_TEMPORAL_SCALE
-        f_mids = (f_starts + f_ends) / 2.0 / frame_rate
-        h_mids = mx.arange(height).astype(mx.float32) * VIDEO_SPATIAL_SCALE + VIDEO_SPATIAL_SCALE / 2.0
-        w_mids = mx.arange(width).astype(mx.float32) * VIDEO_SPATIAL_SCALE + VIDEO_SPATIAL_SCALE / 2.0
-        f_grid = mx.repeat(mx.repeat(f_mids[:, None, None], height, axis=1), width, axis=2)
-        h_grid = mx.repeat(mx.repeat(h_mids[None, :, None], num_latent_frames, axis=0), width, axis=2)
-        w_grid = mx.repeat(mx.repeat(w_mids[None, None, :], num_latent_frames, axis=0), height, axis=1)
-        positions = mx.stack([f_grid, h_grid, w_grid], axis=-1).reshape(-1, 3)[None, :, :].astype(mx.float32)
-
+    """RoPE positions for appended guide tokens (Comfy ``add_keyframe_index``)."""
+    del num_pixel_frames
+    causal_fix = frame_idx == 0 or num_latent_frames == 1
+    bounds = _video_patch_grid_bounds_np(num_latent_frames, height, width)
+    pixel = _pixel_coords_from_bounds_np(bounds, causal_fix=causal_fix)
     if frame_idx != 0:
-        offset = float(frame_idx) / float(frame_rate)
-        positions = positions.at[:, :, 0].add(offset)
-
-    if num_pixel_frames == 1:
-        t0 = positions[:, :, 0:1]
-        positions = positions.at[:, :, 0].set(t0[:, :, 0] + 1.0 / float(frame_rate))
-
-    return positions.astype(mx.float32)
+        pixel = pixel.copy()
+        pixel[:, 0, :, :] += float(frame_idx)
+    rope = _rope_positions_from_pixel_bounds(pixel, frame_rate=frame_rate)
+    return mx.array(rope, dtype=mx.float32)
 
 
 @dataclass(frozen=True)

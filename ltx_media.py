@@ -187,7 +187,7 @@ def load_video_frames_normalized(
     stacked = np.stack(frames_list, axis=0)
     tensor = mx.array(stacked).transpose(0, 3, 1, 2)
     tensor = tensor.transpose(1, 0, 2, 3)[None, ...]
-    return tensor.astype(mx.bfloat16)
+    return tensor.astype(mx.float32)
 
 
 def probe_audio_duration(path: Path | str) -> float | None:

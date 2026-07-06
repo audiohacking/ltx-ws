@@ -79,6 +79,33 @@ def test_crop_guides_from_video_tokens():
     assert cropped.shape == (1, 12, 128)
 
 
+def test_ltxv_preprocess_accepts_bfloat16_video_tensor():
+    pytest.importorskip("av")
+    import mlx.core as mx
+
+    from ltx_ltxv_add_guide import preprocess_guide_video_tensor
+
+    video = mx.ones((1, 3, 2, 64, 64), dtype=mx.bfloat16) * 0.5
+    out = preprocess_guide_video_tensor(video, crf=0)
+    assert out.dtype == mx.float32
+    out2 = preprocess_guide_video_tensor(video, crf=33)
+    assert out2.dtype == mx.float32
+    assert out2.shape == video.shape
+
+
+def test_compute_guide_positions_match_generation_at_frame_zero():
+    import numpy as np
+
+    from ltx_core_mlx.utils.positions import compute_video_positions
+    from ltx_ltxv_add_guide import compute_guide_video_positions
+
+    for f, h, w in ((4, 8, 10), (13, 6, 9)):
+        ref = np.array(compute_video_positions(f, h, w, frame_rate=24.0))
+        guide = np.array(compute_guide_video_positions(f, h, w, frame_rate=24.0, frame_idx=0))
+        assert guide.shape == ref.shape
+        np.testing.assert_allclose(guide, ref, rtol=1e-5, atol=1e-5)
+
+
 def test_face_swap_pipeline_uses_add_guide_in_source():
     from pathlib import Path
 
@@ -88,6 +115,10 @@ def test_face_swap_pipeline_uses_add_guide_in_source():
     assert "encode_guide_video" in pipe
     assert "ltxv_preprocess_rgb_frame" in guide
     assert "crop_guides_from_video_tokens" in pipe
+    assert "denoise_loop" in pipe
+    assert "DISTILLED_SIGMAS" in pipe
+    assert "guided_denoise_loop" not in pipe
+    assert "self.upsampler" not in pipe
     assert "extract_bfs_guide_keyframe_images" not in pipe
     assert "append_ic_lora_reference_video_conditionings" not in pipe
 
@@ -95,12 +126,12 @@ def test_face_swap_pipeline_uses_add_guide_in_source():
 def test_face_swap_pipeline_class_exports():
     from ltx_face_swap_pipeline import (
         DEFAULT_FACE_SWAP_CFG,
-        DEFAULT_FACE_SWAP_STAGE1_STEPS,
+        DEFAULT_FACE_SWAP_NUM_STEPS,
         FaceSwapPipeline,
     )
-    from ltx_pipelines_mlx.keyframe_interpolation import KeyframeInterpolationPipeline
+    from ltx_pipelines_mlx._base import BasePipeline
 
-    assert issubclass(FaceSwapPipeline, KeyframeInterpolationPipeline)
+    assert issubclass(FaceSwapPipeline, BasePipeline)
     assert hasattr(FaceSwapPipeline, "generate_face_swap")
-    assert DEFAULT_FACE_SWAP_CFG == 3.0
-    assert DEFAULT_FACE_SWAP_STAGE1_STEPS == 20
+    assert DEFAULT_FACE_SWAP_CFG == 1.0
+    assert DEFAULT_FACE_SWAP_NUM_STEPS == 8

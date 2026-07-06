@@ -1127,7 +1127,7 @@ def _invoke_generate_and_save(pipe: Any, **kwargs: Any) -> None:
 
     if "num_steps" in call_kwargs:
         steps = call_kwargs["num_steps"]
-        if "stage1_steps" in accepted and "stage1_steps" not in call_kwargs:
+        if "stage1_steps" in accepted and "stage1_steps" not in call_kwargs and "num_steps" not in accepted:
             call_kwargs["stage1_steps"] = steps
         if "num_steps" not in accepted and "steps" in accepted:
             call_kwargs["steps"] = call_kwargs.pop("num_steps")
@@ -1424,10 +1424,9 @@ def _prepare_face_swap_guide_video(
         compute_bfs_guide_layout,
         resolve_face_swap_canvas_size,
     )
+    from ltx_ltxv_add_guide import vae_compatible_frame_count
     from ltx_media import (
-        ic_lora_vae_compatible_frame_count,
         media_available,
-        normalize_video_for_ic_lora_reference,
         probe_video_info,
         trim_video_fit_aspect,
     )
@@ -1452,13 +1451,10 @@ def _prepare_face_swap_guide_video(
             width,
             height,
         )
-    vae_frames = ic_lora_vae_compatible_frame_count(
-        num_frames,
-        source_num_frames=info.num_frames,
-    )
+    vae_frames = vae_compatible_frame_count(num_frames, info.num_frames)
     if vae_frames != num_frames:
         log.info(
-            "Face swap: adjusting target frames %d -> %d for IC-LoRA VAE (1+8k)",
+            "Face swap: adjusting target frames %d -> %d for LTX VAE (8k+1)",
             num_frames,
             vae_frames,
         )
@@ -1501,16 +1497,7 @@ def _prepare_face_swap_guide_video(
         region_size_px=256,
         layout=guide_layout,
     )
-    normalized_path = os.path.join(tmpdir, "face_swap_bfs_v3_guide_norm.mp4")
-    effective_nf = normalize_video_for_ic_lora_reference(
-        guide_path,
-        normalized_path,
-        num_frames=vae_frames,
-        width=canvas_w,
-        height=canvas_h,
-        fps=fps,
-    )
-    return normalized_path, layout, effective_nf, canvas_w, canvas_h
+    return guide_path, layout, vae_frames, canvas_w, canvas_h
 
 
 def _run_ic_lora_generation(
@@ -1634,13 +1621,13 @@ def _run_face_swap_generation(
     seed: int,
     steps: int,
 ) -> Any:
-    """BFS V3 face swap via Comfy LTXVAddGuide + dev CFG + head-swap LoRA."""
+    """BFS V3 face swap via Comfy LTXVAddGuide + distilled sampler + head-swap LoRA."""
     if len(resolved_loras) != 1:
         raise RuntimeError("Face swap requires exactly one head-swap LoRA")
 
     log.info(
         "Face swap invoke: FaceSwapPipeline lora=%s guide=%s (%dx%d, %d frames) "
-        "add_guide=full_composite crop_guides=yes dev_cfg=yes",
+        "add_guide=full_composite crop_guides=yes distilled_8step=yes",
         resolved_loras[0][0],
         guide_path,
         width,
@@ -1651,19 +1638,19 @@ def _run_face_swap_generation(
         "face_swap",
         pipe_kwargs={"lora_paths": [(str(p), float(s)) for p, s in resolved_loras]},
     )
-    from ltx_face_swap_pipeline import (
-        DEFAULT_FACE_SWAP_STAGE1_STEPS,
-        DEFAULT_FACE_SWAP_STAGE2_STEPS,
-    )
+    from ltx_face_swap_pipeline import DEFAULT_FACE_SWAP_NUM_STEPS, FaceSwapPipeline
+
+    if not isinstance(pipe, FaceSwapPipeline):
+        raise RuntimeError(
+            f"face_swap expected FaceSwapPipeline (distilled single-stage), got {type(pipe).__name__}; "
+            "update ltx-ws faceswap branch"
+        )
     from ltx_ltxv_add_guide import DEFAULT_GUIDE_CRF
 
-    stage1 = int(steps) if steps and steps >= 15 else DEFAULT_FACE_SWAP_STAGE1_STEPS
-    if stage1 != int(steps):
-        log.info(
-            "Face swap: using stage1_steps=%d (UI requested %s; dev+CFG needs >=15)",
-            stage1,
-            steps,
-        )
+    num_steps = int(steps) if steps and steps > 0 else DEFAULT_FACE_SWAP_NUM_STEPS
+    if num_steps > 8:
+        log.info("Face swap: capping num_steps %d -> 8 (V3 distilled schedule)", num_steps)
+        num_steps = 8
     swap_kwargs: dict[str, Any] = {
         "prompt": prompt,
         "output_path": out_path,
@@ -1673,14 +1660,13 @@ def _run_face_swap_generation(
         "num_frames": nf,
         "frame_rate": float(gen.fps),
         "seed": seed,
-        "stage1_steps": stage1,
-        "stage2_steps": DEFAULT_FACE_SWAP_STAGE2_STEPS,
+        "num_steps": num_steps,
         "guide_crf": DEFAULT_GUIDE_CRF,
     }
     if req.reference_strength is not None:
         swap_kwargs["guide_strength"] = float(req.reference_strength)
     if req.stage2_steps is not None:
-        swap_kwargs["stage2_steps"] = int(req.stage2_steps)
+        log.info("Face swap: stage2_steps ignored (single-stage V3 workflow)")
     if req.cfg_scale is not None:
         swap_kwargs["cfg_scale"] = float(req.cfg_scale)
     _apply_optional_generate_kwargs(swap_kwargs, req)

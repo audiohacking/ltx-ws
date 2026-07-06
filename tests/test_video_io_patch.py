@@ -61,6 +61,17 @@ def test_load_video_frames_normalized_pyav(tmp_path: Path):
     assert tuple(tensor.shape) == (1, 3, 9, 48, 64)
 
 
+def test_load_video_frames_normalized_is_float32(tmp_path: Path):
+    pytest.importorskip("ltx_core_mlx")
+    import mlx.core as mx
+    import ltx_media
+
+    video = tmp_path / "ref.mp4"
+    _write_h264_mp4(video, frames=5, fps=24.0)
+    tensor = ltx_media.load_video_frames_normalized(str(video), 48, 64, max_frames=5)
+    assert tensor.dtype == mx.float32
+
+
 def test_video_io_patch_replaces_ffmpeg_helpers():
     pytest.importorskip("ltx_pipelines_mlx")
     from ltx_core_mlx.utils import ffmpeg as ffmpeg_mod

@@ -1,4 +1,4 @@
-"""Face swap uses BFS V3 composite guide video for IC-LoRA conditioning."""
+"""Face swap uses BFS V3 composite guide video (LTXVAddGuide path, no IC-LoRA normalize)."""
 
 from __future__ import annotations
 
@@ -59,10 +59,7 @@ def test_prepare_face_swap_guide_trims_and_composes(tmp_path: Path):
         return_value=(tmp_path / "trimmed.mp4", 512, 288),
     ) as trim, patch("ltx_face_swap_compose.compose_bfs_v3_guide_video") as compose, patch(
         "ltx_face_swap_compose.compute_bfs_guide_layout",
-    ) as layout_fn, patch(
-        "ltx_media.normalize_video_for_ic_lora_reference",
-        return_value=121,
-    ) as normalize:
+    ) as layout_fn:
         probe.return_value = type(
             "Info", (), {"num_frames": 889, "fps": 30.0, "width": 1920, "height": 1080}
         )()
@@ -83,10 +80,9 @@ def test_prepare_face_swap_guide_trims_and_composes(tmp_path: Path):
     trim.assert_called_once()
     layout_fn.assert_called_once()
     compose.assert_called_once()
-    normalize.assert_called_once()
     assert compose.call_args.kwargs["width"] == canvas_w
     assert compose.call_args.kwargs["height"] == canvas_h
-    assert guide_path.endswith("face_swap_bfs_v3_guide_norm.mp4")
+    assert guide_path.endswith("face_swap_bfs_v3_guide.mp4")
     assert layout is layout_obj
     assert effective_nf == 121
     assert canvas_w == 768 and canvas_h == 512

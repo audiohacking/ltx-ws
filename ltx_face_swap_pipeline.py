@@ -1,7 +1,8 @@
-"""BFS V3 face swap — Comfy ``LTXVAddGuide`` + dev CFG + head-swap LoRA.
+"""BFS V3 face swap — Comfy ``LTXVAddGuide`` + distilled single-stage sampler.
 
-Uses local :mod:`ltx_ltxv_add_guide` (append-keyframe + crop-guides) with the full
-composite BFS guide video at ``frame_idx=0``. See docs/FACESWAP_MLX_PORT.md.
+Matches ``workflow_ltx2_head_swap_drag_and_drop_v3.0.json``: full-resolution
+distilled DiT, 8-step ``DISTILLED_SIGMAS``, appended composite guide, crop guides.
+See ``docs/FACESWAP_COMFY_GRAPH.md``.
 """
 
 from __future__ import annotations
@@ -11,11 +12,17 @@ from pathlib import Path
 
 import mlx.core as mx
 
-from ltx_core_mlx.components.guiders import MultiModalGuiderParams, create_multimodal_guider_factory
-from ltx_core_mlx.components.patchifiers import compute_video_latent_shape
+from ltx_core_mlx.loader import (
+    LTXV_LORA_COMFY_RENAMING_MAP,
+    LoraStateDictWithStrength,
+    SafetensorsStateDictLoader,
+    StateDict,
+    apply_loras,
+)
 from ltx_core_mlx.model.transformer.model import X0Model
 from ltx_core_mlx.utils.memory import aggressive_cleanup
 from ltx_core_mlx.utils.positions import compute_audio_positions, compute_audio_token_count, compute_video_positions
+from ltx_core_mlx.utils.weights import apply_quantization
 from ltx_ltxv_add_guide import (
     DEFAULT_GUIDE_CRF,
     build_appended_guide_conditioning,
@@ -23,45 +30,46 @@ from ltx_ltxv_add_guide import (
     encode_guide_video,
     generation_token_count,
 )
-from ltx_pipelines_mlx.ic_lora import ICLoraPipeline
-from ltx_pipelines_mlx.keyframe_interpolation import KeyframeInterpolationPipeline
-from ltx_pipelines_mlx.scheduler import STAGE_2_SIGMAS, ltx2_schedule
+from ltx_pipelines_mlx._base import BasePipeline
+from ltx_pipelines_mlx.scheduler import DISTILLED_SIGMAS
 from ltx_pipelines_mlx.utils.helpers import create_noised_state
-from ltx_pipelines_mlx.utils.samplers import denoise_loop, guided_denoise_loop
+from ltx_pipelines_mlx.utils.progress import phase
+from ltx_pipelines_mlx.utils.samplers import denoise_loop
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_FACE_SWAP_CFG = 3.0
-DEFAULT_FACE_SWAP_STAGE1_STEPS = 20
-DEFAULT_FACE_SWAP_STAGE2_STEPS = 3
+_mx_eval = getattr(mx, "eval")  # noqa: B009
+
+DEFAULT_FACE_SWAP_NUM_STEPS = 8
+DEFAULT_FACE_SWAP_CFG = 1.0
 DEFAULT_GUIDE_STRENGTH = 1.0
 
+# Backward-compatible aliases (API / tests)
+DEFAULT_FACE_SWAP_STAGE1_STEPS = DEFAULT_FACE_SWAP_NUM_STEPS
+DEFAULT_FACE_SWAP_STAGE2_STEPS = 0
 
-def _pick_model_file(model_dir: Path, *candidates: str) -> str:
+
+def _pick_model_file(model_dir: Path, *candidates: str) -> str | None:
     for name in candidates:
         if (model_dir / name).exists():
             return name
-    return candidates[0]
+    return None
 
 
-def _resolve_dev_transformer(model_dir: Path) -> str:
-    return _pick_model_file(
+def _resolve_distilled_dynamic_lora(model_dir: Path) -> tuple[str, float] | None:
+    name = _pick_model_file(
         model_dir,
-        "transformer.safetensors",
-        "transformer-dev.safetensors",
-    )
-
-
-def _resolve_distilled_lora(model_dir: Path) -> str:
-    return _pick_model_file(
-        model_dir,
+        "ltx-2.3-22b-distilled-lora-dynamic_fro09_avg_rank_105_bf16.safetensors",
         "ltx-2.3-22b-distilled-lora-384.safetensors",
         "ltx-2.3-22b-distilled-lora.safetensors",
     )
+    if name is None:
+        return None
+    return str(model_dir / name), 1.0
 
 
-class FaceSwapPipeline(KeyframeInterpolationPipeline):
-    """BFS head-swap: full composite guide via LTXVAddGuide + dev CFG + LoRA."""
+class FaceSwapPipeline(BasePipeline):
+    """BFS head-swap: full composite guide via LTXVAddGuide + distilled 8-step."""
 
     def __init__(
         self,
@@ -73,25 +81,77 @@ class FaceSwapPipeline(KeyframeInterpolationPipeline):
     ):
         if not lora_paths or len(lora_paths) != 1:
             raise ValueError("Face swap requires exactly one head-swap LoRA.")
-        model_path = Path(model_dir)
         super().__init__(
             model_dir,
             gemma_model_id=gemma_model_id,
             low_memory=low_memory,
             low_ram_streaming=low_ram_streaming,
-            dev_transformer=_resolve_dev_transformer(model_path),
-            distilled_lora=_resolve_distilled_lora(model_path),
         )
-        self._lora_paths = [(str(p), float(s)) for p, s in lora_paths]
-        self._head_swap_fused = False
+        self._head_swap_lora = [(str(p), float(s)) for p, s in lora_paths]
+        self._loras_fused = False
 
-    def _fuse_head_swap_loras(self) -> None:
-        if self._head_swap_fused or not self._lora_paths:
+    def _lora_fusion_list(self) -> list[tuple[str, float]]:
+        fused: list[tuple[str, float]] = []
+        dynamic = _resolve_distilled_dynamic_lora(self.model_dir)
+        if dynamic is not None:
+            fused.append(dynamic)
+        fused.extend(self._head_swap_lora)
+        return fused
+
+    def _fuse_loras(self) -> None:
+        if self._loras_fused:
+            return
+        lora_paths = self._lora_fusion_list()
+        if not lora_paths:
             return
         assert self.dit is not None
-        ICLoraPipeline._fuse_loras(self)
-        self._head_swap_fused = True
-        logger.info("Face swap: fused head-swap LoRA into dev transformer")
+
+        if self.low_ram_streaming:
+            from ltx_core_mlx.loader.block_streaming import BlockLoraSource
+
+            sources: list = list(object.__getattribute__(self.dit, "_lora_sources"))
+            for lora_path, strength in lora_paths:
+                sources.append(
+                    BlockLoraSource(
+                        lora_path,
+                        block_prefix="transformer.transformer_blocks.",
+                        strength=strength,
+                        sd_ops=LTXV_LORA_COMFY_RENAMING_MAP,
+                    )
+                )
+                logger.info("Face swap: attached LoRA stream %s (strength=%s)", lora_path, strength)
+            object.__setattr__(self.dit, "_lora_sources", sources)
+            self._loras_fused = True
+            return
+
+        import mlx.utils
+
+        model_weights = dict(mlx.utils.tree_flatten(self.dit.parameters()))
+        model_sd = StateDict(sd=model_weights, size=0, dtype=set())
+        loader = SafetensorsStateDictLoader()
+        lora_sds = []
+        for lora_path, strength in lora_paths:
+            lora_sd = loader.load(lora_path, sd_ops=LTXV_LORA_COMFY_RENAMING_MAP)
+            lora_sds.append(LoraStateDictWithStrength(state_dict=lora_sd, strength=strength))
+            logger.info("Face swap: loaded LoRA %s (strength=%s)", lora_path, strength)
+        fused_sd = apply_loras(model_sd=model_sd, lora_sd_and_strengths=lora_sds)
+        apply_quantization(self.dit, fused_sd.sd)
+        self.dit.load_weights(list(fused_sd.sd.items()))
+        aggressive_cleanup()
+        self._loras_fused = True
+        logger.info("Face swap: fused %d LoRA(s) into distilled transformer", len(lora_paths))
+
+    def load(self) -> None:
+        """Load distilled DiT + VAE encoder (no upsampler — single-stage full res)."""
+        if self._loaded:
+            return
+        if self.dit is None:
+            transformer_path = self.model_dir / "transformer.safetensors"
+            if not transformer_path.exists():
+                transformer_path = self._resolve_safetensors(self.model_dir, "transformer-distilled")
+            self.dit = self._load_transformer_with_optional_streaming(transformer_path)
+        self._load_vae_encoder()
+        self._loaded = True
 
     def generate_face_swap(
         self,
@@ -103,6 +163,7 @@ class FaceSwapPipeline(KeyframeInterpolationPipeline):
         *,
         frame_rate: float,
         seed: int = 42,
+        num_steps: int | None = None,
         stage1_steps: int | None = None,
         stage2_steps: int | None = None,
         cfg_scale: float = DEFAULT_FACE_SWAP_CFG,
@@ -110,24 +171,35 @@ class FaceSwapPipeline(KeyframeInterpolationPipeline):
         guide_frame_idx: int = 0,
         guide_crf: int = DEFAULT_GUIDE_CRF,
     ) -> tuple[mx.array, mx.array]:
-        half_h, half_w = height // 2, width // 2
-        f_half, h_half, w_half = compute_video_latent_shape(num_frames, half_h, half_w)
-        enc_h_half = h_half * 32
-        enc_w_half = w_half * 32
-        _, _, _, gen_tokens_half = generation_token_count(num_frames, half_h, half_w)
+        del cfg_scale  # V3 workflow CFG=1; distilled path uses denoise_loop (no CFG)
+        if stage2_steps:
+            logger.info("Face swap: stage2_steps ignored (V3 workflow is single-stage)")
 
-        h_full, w_full = height, width
-        f_full, h_lat_full, w_lat_full, gen_tokens_full = generation_token_count(num_frames, h_full, w_full)
-        enc_h_full = h_lat_full * 32
-        enc_w_full = w_lat_full * 32
+        steps = num_steps or stage1_steps or DEFAULT_FACE_SWAP_NUM_STEPS
+        steps = max(1, min(int(steps), len(DISTILLED_SIGMAS) - 1))
+        sigmas = DISTILLED_SIGMAS[: steps + 1]
 
-        self._load_vae_encoder()
+        f_lat, h_lat, w_lat, gen_tokens = generation_token_count(num_frames, height, width)
+        enc_h = h_lat * 32
+        enc_w = w_lat * 32
+
+        self._load_text_encoder()
+        with phase("Encoding prompt", verbose=self.verbose):
+            video_embeds, audio_embeds = self._encode_text(prompt)
+            _mx_eval(video_embeds, audio_embeds)
+        if self.low_memory:
+            self.prompt_encoder.free()
+            aggressive_cleanup()
+
+        self.load()
+        assert self.dit is not None
         assert self.vae_encoder is not None
+        self._fuse_loras()
 
-        encoded_half = encode_guide_video(
+        encoded = encode_guide_video(
             guide_video_path,
-            encode_height=enc_h_half,
-            encode_width=enc_w_half,
+            encode_height=enc_h,
+            encode_width=enc_w,
             num_frames=num_frames,
             frame_rate=frame_rate,
             video_encoder=self.vae_encoder,
@@ -135,165 +207,64 @@ class FaceSwapPipeline(KeyframeInterpolationPipeline):
             frame_idx=guide_frame_idx,
             crf=guide_crf,
         )
-        guide_cond_half = build_appended_guide_conditioning(encoded_half, strength=guide_strength)
-
-        video_embeds, audio_embeds, neg_video_embeds, neg_audio_embeds = self._encode_text_with_negative(prompt)
-
-        if self.dit is None:
-            self.dit = self._load_dev_transformer()
-        self._fuse_head_swap_loras()
-        if self.upsampler is None:
-            self._load_upsampler()
-        assert self.dit is not None
-        assert self.upsampler is not None
+        guide_cond = build_appended_guide_conditioning(encoded, strength=guide_strength)
 
         audio_t = compute_audio_token_count(num_frames, frame_rate=frame_rate)
         audio_shape = (1, audio_t, 128)
-        video_positions_half = compute_video_positions(f_half, h_half, w_half, frame_rate=frame_rate)
+        video_positions = compute_video_positions(f_lat, h_lat, w_lat, frame_rate=frame_rate)
         audio_positions = compute_audio_positions(audio_t)
 
-        video_state_1 = create_noised_state(
-            base_shape=(1, gen_tokens_half, 128),
-            conditionings=[guide_cond_half],
-            spatial_dims=(f_half, h_half, w_half),
-            positions=video_positions_half,
+        video_state = create_noised_state(
+            base_shape=(1, gen_tokens, 128),
+            conditionings=[guide_cond],
+            spatial_dims=(f_lat, h_lat, w_lat),
+            positions=video_positions,
             seed=seed,
             sigma=1.0,
         )
-        audio_state_1 = create_noised_state(
+        audio_state = create_noised_state(
             base_shape=audio_shape,
             conditionings=[],
-            spatial_dims=(f_half, h_half, w_half),
+            spatial_dims=(f_lat, h_lat, w_lat),
             positions=audio_positions,
             seed=seed + 1,
             sigma=1.0,
         )
 
-        s1_steps = stage1_steps or DEFAULT_FACE_SWAP_STAGE1_STEPS
-        sigmas_1 = ltx2_schedule(s1_steps, num_tokens=gen_tokens_half)
-        x0_model = X0Model(self.dit)
-
-        vgp = MultiModalGuiderParams(
-            cfg_scale=cfg_scale,
-            stg_scale=0.0,
-            rescale_scale=0.7,
-            modality_scale=3.0,
-            stg_blocks=[28],
-        )
-        agp = MultiModalGuiderParams(
-            cfg_scale=7.0,
-            stg_scale=0.0,
-            rescale_scale=0.7,
-            modality_scale=3.0,
-            stg_blocks=[28],
-        )
-        video_factory = create_multimodal_guider_factory(vgp, negative_context=neg_video_embeds)
-        audio_factory = create_multimodal_guider_factory(agp, negative_context=neg_audio_embeds)
-
         logger.info(
-            "Face swap stage1: dev+CFG steps=%d cfg=%.1f add_guide=full_composite crf=%d "
-            "tokens_gen=%d tokens_guide=%d",
-            s1_steps,
-            cfg_scale,
+            "Face swap: distilled full-res steps=%d add_guide=composite crf=%d "
+            "tokens_gen=%d tokens_guide=%d canvas=%dx%d frames=%d",
+            steps,
             guide_crf,
-            gen_tokens_half,
-            int(encoded_half.tokens.shape[1]),
+            gen_tokens,
+            int(encoded.tokens.shape[1]),
+            width,
+            height,
+            num_frames,
         )
 
-        self._pre_denoise_flush(video_state_1, audio_state_1)
-        output_1 = guided_denoise_loop(
+        x0_model = X0Model(self.dit)
+        self._pre_denoise_flush(video_state, audio_state)
+        output = denoise_loop(
             model=x0_model,
-            video_state=video_state_1,
-            audio_state=audio_state_1,
+            video_state=video_state,
+            audio_state=audio_state,
             video_text_embeds=video_embeds,
             audio_text_embeds=audio_embeds,
-            video_guider_factory=video_factory,
-            audio_guider_factory=audio_factory,
-            sigmas=sigmas_1,
+            sigmas=sigmas,
         )
         if self.low_memory:
             aggressive_cleanup()
 
-        gen_tokens_1 = crop_guides_from_video_tokens(output_1.video_latent, num_generation_tokens=gen_tokens_half)
-
-        if self._distilled_lora:
-            self._fuse_distilled_lora(self.dit)
-
-        video_half = self.video_patchifier.unpatchify(gen_tokens_1, (f_half, h_half, w_half))
-
-        def _denorm_upscale_renorm(encoder) -> mx.array:
-            v_mlx = video_half.transpose(0, 2, 3, 4, 1)
-            v_denorm = encoder.denormalize_latent(v_mlx).transpose(0, 4, 1, 2, 3)
-            v_up = self.upsampler(v_denorm)
-            v_up_mlx = encoder.normalize_latent(v_up.transpose(0, 2, 3, 4, 1))
-            return v_up_mlx.transpose(0, 4, 1, 2, 3)
-
-        video_upscaled = self.image_conditioner(_denorm_upscale_renorm, free_after=True)
-        mx.async_eval(video_upscaled)
-        if self.low_memory:
-            self.upsampler = None
-            aggressive_cleanup()
-
-        encoded_full = encode_guide_video(
-            guide_video_path,
-            encode_height=enc_h_full,
-            encode_width=enc_w_full,
-            num_frames=num_frames,
-            frame_rate=frame_rate,
-            video_encoder=self.vae_encoder,
-            video_patchifier=self.video_patchifier,
-            frame_idx=guide_frame_idx,
-            crf=guide_crf,
+        gen_tokens_out = crop_guides_from_video_tokens(
+            output.video_latent,
+            num_generation_tokens=gen_tokens,
         )
-        guide_cond_full = build_appended_guide_conditioning(encoded_full, strength=guide_strength)
-
-        video_tokens_up, _ = self.video_patchifier.patchify(video_upscaled)
-        sigmas_2 = STAGE_2_SIGMAS[: (stage2_steps or DEFAULT_FACE_SWAP_STAGE2_STEPS) + 1]
-        start_sigma = sigmas_2[0]
-        video_positions_full = compute_video_positions(f_full, h_lat_full, w_lat_full, frame_rate=frame_rate)
-
-        video_state_2 = create_noised_state(
-            base_shape=video_tokens_up.shape,
-            conditionings=[guide_cond_full],
-            spatial_dims=(f_full, h_lat_full, w_lat_full),
-            positions=video_positions_full,
-            seed=seed + 2,
-            sigma=start_sigma,
-            initial_latent=video_tokens_up,
-        )
-        audio_state_2 = create_noised_state(
-            base_shape=output_1.audio_latent.shape,
-            conditionings=[],
-            spatial_dims=(f_full, h_lat_full, w_lat_full),
-            positions=audio_positions,
-            seed=seed + 2,
-            sigma=start_sigma,
-            initial_latent=output_1.audio_latent,
-        )
-
-        logger.info(
-            "Face swap stage2: distilled refine steps=%d crop_guides_after=yes",
-            len(sigmas_2) - 1,
-        )
-
-        self._pre_denoise_flush(video_state_2, audio_state_2)
-        output_2 = denoise_loop(
-            model=x0_model,
-            video_state=video_state_2,
-            audio_state=audio_state_2,
-            video_text_embeds=video_embeds,
-            audio_text_embeds=audio_embeds,
-            sigmas=sigmas_2,
-        )
-        if self.low_memory:
-            aggressive_cleanup()
-
-        gen_tokens_2 = crop_guides_from_video_tokens(output_2.video_latent, num_generation_tokens=gen_tokens_full)
-        video_latent = self.video_patchifier.unpatchify(gen_tokens_2, (f_full, h_lat_full, w_lat_full))
-        audio_latent = self.audio_patchifier.unpatchify(output_2.audio_latent)
+        video_latent = self.video_patchifier.unpatchify(gen_tokens_out, (f_lat, h_lat, w_lat))
+        audio_latent = self.audio_patchifier.unpatchify(output.audio_latent)
         return video_latent, audio_latent
 
-    def generate_and_save(  # type: ignore[override]
+    def generate_and_save(
         self,
         prompt: str,
         output_path: str,
@@ -304,6 +275,7 @@ class FaceSwapPipeline(KeyframeInterpolationPipeline):
         *,
         frame_rate: float,
         seed: int = 42,
+        num_steps: int | None = None,
         stage1_steps: int | None = None,
         stage2_steps: int | None = None,
         cfg_scale: float = DEFAULT_FACE_SWAP_CFG,
@@ -319,6 +291,7 @@ class FaceSwapPipeline(KeyframeInterpolationPipeline):
             num_frames=num_frames,
             frame_rate=frame_rate,
             seed=seed,
+            num_steps=num_steps,
             stage1_steps=stage1_steps,
             stage2_steps=stage2_steps,
             cfg_scale=cfg_scale,
@@ -329,9 +302,8 @@ class FaceSwapPipeline(KeyframeInterpolationPipeline):
         if self.low_memory:
             self.dit = None
             self.prompt_encoder.free()
-            self.upsampler = None
             self._loaded = False
-            self._head_swap_fused = False
+            self._loras_fused = False
             aggressive_cleanup()
 
         self._load_decoders()
@@ -350,6 +322,7 @@ class FaceSwapPipeline(KeyframeInterpolationPipeline):
 
 __all__ = [
     "DEFAULT_FACE_SWAP_CFG",
+    "DEFAULT_FACE_SWAP_NUM_STEPS",
     "DEFAULT_FACE_SWAP_STAGE1_STEPS",
     "DEFAULT_FACE_SWAP_STAGE2_STEPS",
     "DEFAULT_GUIDE_STRENGTH",
