@@ -748,6 +748,27 @@ def _lora_cached_path(spec: str) -> Path | None:
     return None
 
 
+def format_lora_download_error(exc: BaseException, spec: str = "") -> str:
+    """User-facing LoRA download failure (gated Hugging Face repos, etc.)."""
+    msg = str(exc)
+    lower = msg.lower()
+    gated = (
+        "403" in msg
+        or "gated" in lower
+        or "authorized list" in lower
+        or "cannot access gated repo" in lower
+    )
+    if gated or "LTX-2.3-22b-IC-LoRA-LipDub" in (spec or msg):
+        return (
+            "LipDub LoRA is gated on Hugging Face. Accept access at "
+            "https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-LipDub, "
+            "set HF_TOKEN (or run huggingface-cli login), then add a custom LoRA "
+            "with the official resolve URL or set LTX_WS_LIPDUB_LORA to a local "
+            ".safetensors path."
+        )
+    return f"LoRA download failed: {exc}"
+
+
 def _resolve_lora_path(spec: str) -> tuple[str, str | None]:
     """
     Resolve LoRA spec to a local safetensors path.

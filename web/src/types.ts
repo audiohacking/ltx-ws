@@ -55,6 +55,9 @@ export interface Config {
   face_swap_default_spec?: string;
   lipdub_preset_id?: string;
   lipdub_default_spec?: string;
+  lipdub_official_gated_spec?: string;
+  lipdub_official_hf_url?: string;
+  lipdub_env_var?: string;
   pose_control_available?: boolean;
   pyav_available?: boolean;
   audio_trim_available?: boolean;

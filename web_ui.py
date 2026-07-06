@@ -99,12 +99,44 @@ FACE_SWAP_DEFAULT_SPEC = (
 )
 FACE_SWAP_DEFAULT_SCALE = 0.98
 LIPDUB_PRESET_ID = "lipdub_ic_lora"
-LIPDUB_DEFAULT_SPEC = (
-    "https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-LipDub/"
-    "resolve/main/ltx-2.3-22b-ic-lora-lipdub-0.9.safetensors"
+LIPDUB_OFFICIAL_REPO = "Lightricks/LTX-2.3-22b-IC-LoRA-LipDub"
+LIPDUB_OFFICIAL_FILENAME = "ltx-2.3-22b-ic-lora-lipdub-0.9.safetensors"
+LIPDUB_OFFICIAL_GATED_SPEC = (
+    f"https://huggingface.co/{LIPDUB_OFFICIAL_REPO}/resolve/main/{LIPDUB_OFFICIAL_FILENAME}"
 )
+LIPDUB_PUBLIC_BUCKET_SPEC = (
+    "https://huggingface.co/buckets/audiohacking/LTX-2.3-22b-IC-LoRA-LipDub-bucket/"
+    f"resolve/{LIPDUB_OFFICIAL_FILENAME}"
+)
+ENV_LIPDUB_LORA = "LTX_WS_LIPDUB_LORA"
 LIPDUB_DEFAULT_SCALE = 1.0
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "web_outputs"
+
+
+def _hf_lora_resolve_url_accessible(url: str) -> bool:
+    """True when a Hugging Face resolve URL returns downloadable bytes (public bucket)."""
+    from urllib.request import Request, urlopen
+
+    try:
+        req = Request(url, headers={"Range": "bytes=0-0"})
+        with urlopen(req, timeout=15) as resp:
+            return resp.status in (200, 206)
+    except Exception:
+        return False
+
+
+def _builtin_lipdub_spec() -> str:
+    """Built-in LipDub LoRA URL/path, if any.
+
+  Order: ``LTX_WS_LIPDUB_LORA`` env → public audiohacking bucket mirror → none.
+  The official Lightricks weights are gated; do not use them as a silent default.
+    """
+    env = os.environ.get(ENV_LIPDUB_LORA, "").strip()
+    if env:
+        return env
+    if _hf_lora_resolve_url_accessible(LIPDUB_PUBLIC_BUCKET_SPEC):
+        return LIPDUB_PUBLIC_BUCKET_SPEC
+    return ""
 
 
 def _pose_control_available() -> bool:
@@ -362,12 +394,14 @@ def _lora_catalog(output_dir: Path | None = None) -> tuple[list[dict[str, Any]],
         FACE_SWAP_DEFAULT_SPEC,
         FACE_SWAP_DEFAULT_SCALE,
     )
-    _add(
-        LIPDUB_PRESET_ID,
-        "LipDub — IC-LoRA (LTX 2.3)",
-        LIPDUB_DEFAULT_SPEC,
-        LIPDUB_DEFAULT_SCALE,
-    )
+    lipdub_spec = _builtin_lipdub_spec()
+    if lipdub_spec:
+        _add(
+            LIPDUB_PRESET_ID,
+            "LipDub — IC-LoRA (LTX 2.3)",
+            lipdub_spec,
+            LIPDUB_DEFAULT_SCALE,
+        )
 
     if output_dir is not None:
         hidden = _read_hidden_lora_ids(output_dir)
@@ -2769,7 +2803,10 @@ def create_app(
             "face_swap_preset_id": FACE_SWAP_PRESET_ID,
             "face_swap_default_spec": FACE_SWAP_DEFAULT_SPEC,
             "lipdub_preset_id": LIPDUB_PRESET_ID,
-            "lipdub_default_spec": LIPDUB_DEFAULT_SPEC,
+            "lipdub_default_spec": _builtin_lipdub_spec(),
+            "lipdub_official_gated_spec": LIPDUB_OFFICIAL_GATED_SPEC,
+            "lipdub_official_hf_url": f"https://huggingface.co/{LIPDUB_OFFICIAL_REPO}",
+            "lipdub_env_var": ENV_LIPDUB_LORA,
             "pose_control_available": _pose_control_available(),
             "pyav_available": media_available(),
             "audio_trim_available": media_available(),
@@ -2872,8 +2909,10 @@ def create_app(
             async with lock:
                 result = await asyncio.to_thread(_ensure_lora_downloaded, spec)
         except Exception as exc:
+            from ltx_mlx_backend import format_lora_download_error
+
             log.warning("LoRA ensure failed for %s: %s", spec, exc)
-            raise HTTPException(500, f"LoRA download failed: {exc}") from exc
+            raise HTTPException(500, format_lora_download_error(exc, spec)) from exc
         log.info(
             "LoRA ensure complete: %s (cached=%s)",
             spec[:160],
@@ -3043,9 +3082,11 @@ def create_app(
                 try:
                     await asyncio.to_thread(_ensure_lora_downloaded, spec)
                 except Exception as exc:
+                    from ltx_mlx_backend import format_lora_download_error
+
                     raise HTTPException(
                         400,
-                        f"Could not download LipDub LoRA weights ({spec}): {exc}",
+                        format_lora_download_error(exc, spec),
                     ) from exc
         if ui_mode == "face_swap":
             if not body.get("image_path"):

@@ -662,6 +662,8 @@ export default function App() {
 
   useEffect(() => {
     if (mode !== "lipdub" || !lipDubPresetId) return;
+    const preset = config?.lora_presets?.find((p) => p.id === lipDubPresetId && p.spec);
+    if (!preset) return;
     setLoraPresetIds([lipDubPresetId]);
     void ensureLoraPresets([lipDubPresetId], config?.lora_presets, { interactive: true });
   }, [mode, lipDubPresetId, config?.lora_presets, ensureLoraPresets]);
@@ -2139,6 +2141,25 @@ export default function App() {
                         and new dialogue in your prompt. Frame count follows the reference
                         video. Requires the LipDub IC-LoRA.
                       </p>
+                      {!config?.lipdub_default_spec && (
+                        <p className="hint hint-inline">
+                          LipDub weights are gated on Hugging Face — accept access at{" "}
+                          <a
+                            href={
+                              config?.lipdub_official_hf_url ??
+                              "https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-LipDub"
+                            }
+                            target="_blank"
+                            rel="noreferrer"
+                          >
+                            Lightricks/LTX-2.3-22b-IC-LoRA-LipDub
+                          </a>
+                          , set <code>HF_TOKEN</code> (or <code>huggingface-cli login</code>
+                          ), then add a <strong>custom LoRA</strong> with the official resolve
+                          URL or set <code>{config?.lipdub_env_var ?? "LTX_WS_LIPDUB_LORA"}</code>{" "}
+                          to a local <code>.safetensors</code> path on the server.
+                        </p>
+                      )}
                       <label className="media-upload">
                         <span className="media-upload-label">
                           Voice tone audio (optional if video has audio)
