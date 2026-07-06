@@ -1647,10 +1647,7 @@ def _run_face_swap_generation(
         )
     from ltx_ltxv_add_guide import DEFAULT_GUIDE_CRF
 
-    num_steps = int(steps) if steps and steps > 0 else DEFAULT_FACE_SWAP_NUM_STEPS
-    if num_steps < 15:
-        log.info("Face swap: raising num_steps %d -> %d (dev+CFG)", num_steps, DEFAULT_FACE_SWAP_NUM_STEPS)
-        num_steps = DEFAULT_FACE_SWAP_NUM_STEPS
+    num_steps = int(steps) if steps and int(steps) > 0 else DEFAULT_FACE_SWAP_NUM_STEPS
     swap_kwargs: dict[str, Any] = {
         "prompt": prompt,
         "output_path": out_path,

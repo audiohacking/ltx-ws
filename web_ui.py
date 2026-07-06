@@ -98,6 +98,7 @@ FACE_SWAP_DEFAULT_SPEC = (
     "resolve/main/ltx-2.3/head_swap_v3_rank_adaptive_fro_098.safetensors"
 )
 FACE_SWAP_DEFAULT_SCALE = 0.98
+FACE_SWAP_DEFAULT_NUM_STEPS = 20
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "web_outputs"
 
 
@@ -2755,6 +2756,7 @@ def create_app(
             "ic_lora_union_motion_spec": IC_LORA_UNION_MOTION_SPEC,
             "face_swap_preset_id": FACE_SWAP_PRESET_ID,
             "face_swap_default_spec": FACE_SWAP_DEFAULT_SPEC,
+            "face_swap_num_steps": FACE_SWAP_DEFAULT_NUM_STEPS,
             "pose_control_available": _pose_control_available(),
             "pyav_available": media_available(),
             "audio_trim_available": media_available(),

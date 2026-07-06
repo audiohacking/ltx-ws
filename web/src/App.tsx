@@ -1860,6 +1860,9 @@ export default function App() {
                       const next = e.target.value;
                       setMode(next);
                       clearMediaForMode(next);
+                      if (next === "face_swap") {
+                        setNumSteps(config?.face_swap_num_steps ?? 20);
+                      }
                     }}
                   >
                     {config.generation_modes.map((m) => (

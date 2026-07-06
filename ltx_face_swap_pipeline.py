@@ -155,8 +155,9 @@ class FaceSwapPipeline(TI2VidOneStagePipeline):
         if stage2_steps:
             logger.info("Face swap: stage2_steps ignored (single-stage dev+CFG)")
 
-        steps = num_steps or stage1_steps or DEFAULT_FACE_SWAP_NUM_STEPS
-        steps = max(8, int(steps))
+        steps = int(num_steps or stage1_steps or DEFAULT_FACE_SWAP_NUM_STEPS)
+        if steps < 1:
+            steps = 1
 
         f_lat, h_lat, w_lat, gen_tokens = generation_token_count(num_frames, height, width)
         enc_h = h_lat * 32
