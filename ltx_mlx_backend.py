@@ -1626,7 +1626,6 @@ def _run_face_swap_generation(
     prompt: str,
     resolved_loras: list[tuple[str, float]],
     guide_path: str,
-    guide_scale: float,
     tmpdir: str,
     out_path: str,
     width: int,
@@ -1634,15 +1633,14 @@ def _run_face_swap_generation(
     nf: int,
     seed: int,
     steps: int,
-    guide_images: list[tuple[str, int, float, int]],
 ) -> Any:
-    """BFS V3 face swap via :class:`FaceSwapPipeline` (LoRA + composite ref in stage 2)."""
+    """BFS V3 face swap via dev+CFG composite keyframes + head-swap LoRA."""
     if len(resolved_loras) != 1:
         raise RuntimeError("Face swap requires exactly one head-swap LoRA")
 
     log.info(
         "Face swap invoke: FaceSwapPipeline lora=%s guide=%s (%dx%d, %d frames) "
-        "guide_vae_init=yes ic_ref_append=no frame0_anchor=yes stage2_lora=yes",
+        "dev_cfg=yes composite_keyframes=yes",
         resolved_loras[0][0],
         guide_path,
         width,
@@ -1653,25 +1651,32 @@ def _run_face_swap_generation(
         "face_swap",
         pipe_kwargs={"lora_paths": [(str(p), float(s)) for p, s in resolved_loras]},
     )
+    from ltx_face_swap_pipeline import DEFAULT_FACE_SWAP_STAGE1_STEPS, DEFAULT_FACE_SWAP_STAGE2_STEPS
+
+    stage1 = int(steps) if steps and steps >= 15 else DEFAULT_FACE_SWAP_STAGE1_STEPS
+    if stage1 != int(steps):
+        log.info(
+            "Face swap: using stage1_steps=%d (UI requested %s; dev+CFG needs >=15)",
+            stage1,
+            steps,
+        )
     swap_kwargs: dict[str, Any] = {
         "prompt": prompt,
         "output_path": out_path,
-        "video_conditioning": [(guide_path, float(guide_scale))],
+        "guide_video_path": guide_path,
+        "keyframe_tmpdir": tmpdir,
         "height": height,
         "width": width,
         "num_frames": nf,
         "frame_rate": float(gen.fps),
         "seed": seed,
-        "stage1_steps": int(steps),
-        "images": guide_images,
-        "conditioning_attention_strength": 1.0,
+        "stage1_steps": stage1,
+        "stage2_steps": DEFAULT_FACE_SWAP_STAGE2_STEPS,
     }
-    if req.reference_strength is not None:
-        swap_kwargs["conditioning_attention_strength"] = float(req.reference_strength)
     if req.stage2_steps is not None:
         swap_kwargs["stage2_steps"] = int(req.stage2_steps)
-    else:
-        swap_kwargs["stage2_steps"] = 3
+    if req.cfg_scale is not None:
+        swap_kwargs["cfg_scale"] = float(req.cfg_scale)
     _apply_optional_generate_kwargs(swap_kwargs, req)
     _invoke_generate_and_save(pipe, **swap_kwargs)
     return pipe
@@ -2605,7 +2610,6 @@ class LocalVideoGenerator:
                             raise RuntimeError("face_swap mode requires exactly one LoRA spec")
                         from ltx_face_swap_compose import (
                             crop_face_swap_output_to_main_video,
-                            extract_bfs_guide_keyframe_at_index,
                             format_head_swap_prompt,
                         )
 
@@ -2632,16 +2636,10 @@ class LocalVideoGenerator:
                                 guide_path,
                             ]
                         )
-                        kf_path, _kf_idx = extract_bfs_guide_keyframe_at_index(
-                            guide_path,
-                            os.path.join(tmpdir, "face_swap_ic_lora_frame0"),
-                            frame_idx=0,
-                        )
-                        guide_images = _build_ic_lora_image_conditionings(kf_path, face_swap_nf)
                         face_swap_prompt = format_head_swap_prompt(effective_prompt)
                         log.info(
                             "Face swap: BFS V3 composite %dx%d (%d frames) "
-                            "main panel %dx%d + FaceSwapPipeline",
+                            "main panel %dx%d + dev CFG keyframes",
                             canvas_w,
                             canvas_h,
                             face_swap_nf,
@@ -2663,7 +2661,6 @@ class LocalVideoGenerator:
                             prompt=face_swap_prompt,
                             resolved_loras=resolved_loras,
                             guide_path=guide_path,
-                            guide_scale=float(ref_scale),
                             tmpdir=tmpdir,
                             out_path=out_path,
                             width=canvas_w,
@@ -2671,7 +2668,6 @@ class LocalVideoGenerator:
                             nf=face_swap_nf,
                             seed=seed,
                             steps=steps,
-                            guide_images=guide_images,
                         )
                         try:
                             crop_face_swap_output_to_main_video(out_path, guide_layout)
