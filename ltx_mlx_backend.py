@@ -2648,11 +2648,11 @@ class LocalVideoGenerator:
                             guide_layout.video_w,
                             guide_layout.video_h,
                         )
-                        if gen.spill_dir and req.job_id:
+                        if self.spill_dir and req.job_id:
                             try:
-                                gen.spill_dir.mkdir(parents=True, exist_ok=True)
+                                self.spill_dir.mkdir(parents=True, exist_ok=True)
                                 slug = _spill_slug(req.prompt)
-                                dest = gen.spill_dir / f"{req.job_id}_{slug}_face_swap_guide.mp4"
+                                dest = self.spill_dir / f"{req.job_id}_{slug}_face_swap_guide.mp4"
                                 shutil.copy2(guide_path, dest)
                                 log.info("Face swap guide saved → %s", dest)
                             except OSError as exc:
