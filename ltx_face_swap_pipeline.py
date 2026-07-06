@@ -1,5 +1,9 @@
 """BFS V3 face swap on MLX via dev transformer + CFG + composite keyframes.
 
+⚠️  EXPERIMENTAL / INVALID APPROACH — preserved on `faceswap` branch for reference only.
+    See docs/FACESWAP_MLX_PORT.md for the Comfy-aligned port plan (LTXVAddGuide + CropGuides).
+    Do not merge face_swap mode to main until Phase A primitives exist in ltx-pipelines-mlx.
+
 Comfy BFS V3 uses dev UNet, CFG, composite guide, and ``LTXVAddGuideMulti``.
 Distilled IC-LoRA reference-append copies the guide (original face + motion) or,
 without it, loses motion entirely. Keyframe interpolation on the **dev** model
