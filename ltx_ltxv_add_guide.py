@@ -256,7 +256,7 @@ def encode_guide_video(
 
 
 class VideoConditionByAppendedGuide:
-    """Comfy ``LTXVAddGuide.append_keyframe`` — append clean guide; noisy slots are zeros."""
+    """Comfy ``LTXVAddGuide.append_keyframe`` — append full guide latent (mask=0)."""
 
     def __init__(
         self,
@@ -272,9 +272,10 @@ class VideoConditionByAppendedGuide:
     def apply(self, state: LatentState, spatial_dims: tuple[int, int, int]) -> LatentState:
         num_guide = int(self.guide_tokens.shape[1])
         mask_value = 1.0 - self.strength
-        guide_zeros = mx.zeros_like(self.guide_tokens)
 
-        new_latent = mx.concatenate([state.latent, guide_zeros], axis=1)
+        # Match VideoConditionByKeyframeIndex + Comfy append_keyframe: guide lives in
+        # both latent and clean_latent (not zeros); denoise_mask=0 freezes it.
+        new_latent = mx.concatenate([state.latent, self.guide_tokens], axis=1)
         new_clean = mx.concatenate([state.clean_latent, self.guide_tokens], axis=1)
         guide_mask = mx.full(
             (state.denoise_mask.shape[0], num_guide, 1),

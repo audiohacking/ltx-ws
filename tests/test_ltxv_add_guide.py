@@ -50,7 +50,7 @@ def test_appended_guide_extends_sequence_and_freezes_tokens():
     out = cond.apply(state, spatial_dims=(2, 2, 3))
 
     assert out.latent.shape[1] == gen_n + guide_n
-    assert float(mx.sum(out.latent[:, gen_n:, :]).item()) == 0.0
+    assert float(mx.mean(out.latent[:, gen_n:, :]).item()) == 1.0
     assert float(mx.mean(out.clean_latent[:, gen_n:, :]).item()) == 1.0
     assert float(mx.mean(out.denoise_mask[:, gen_n:, :]).item()) == 0.0
     assert float(mx.mean(out.denoise_mask[:, :gen_n, :]).item()) == 1.0
