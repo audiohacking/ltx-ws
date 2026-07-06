@@ -1634,13 +1634,13 @@ def _run_face_swap_generation(
     seed: int,
     steps: int,
 ) -> Any:
-    """BFS V3 face swap via dev+CFG composite keyframes + head-swap LoRA."""
+    """BFS V3 face swap via Comfy LTXVAddGuide + dev CFG + head-swap LoRA."""
     if len(resolved_loras) != 1:
         raise RuntimeError("Face swap requires exactly one head-swap LoRA")
 
     log.info(
         "Face swap invoke: FaceSwapPipeline lora=%s guide=%s (%dx%d, %d frames) "
-        "dev_cfg=yes composite_keyframes=yes",
+        "add_guide=full_composite crop_guides=yes dev_cfg=yes",
         resolved_loras[0][0],
         guide_path,
         width,
@@ -1664,7 +1664,6 @@ def _run_face_swap_generation(
         "prompt": prompt,
         "output_path": out_path,
         "guide_video_path": guide_path,
-        "keyframe_tmpdir": tmpdir,
         "height": height,
         "width": width,
         "num_frames": nf,
@@ -2639,7 +2638,7 @@ class LocalVideoGenerator:
                         face_swap_prompt = format_head_swap_prompt(effective_prompt)
                         log.info(
                             "Face swap: BFS V3 composite %dx%d (%d frames) "
-                            "main panel %dx%d + dev CFG keyframes",
+                            "main panel %dx%d + LTXVAddGuide full composite",
                             canvas_w,
                             canvas_h,
                             face_swap_nf,

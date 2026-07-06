@@ -136,26 +136,15 @@ KJNodes `LTXVAddGuideMulti` chains multiple `append_keyframe` calls for separate
 
 ## 5. Port plan (phased, no improvisation)
 
-### Phase A — Upstream primitives in `ltx-core-mlx` / `ltx-pipelines-mlx`
+### Phase A — Local primitives (`ltx_ltxv_add_guide.py`)
 
-Implement Comfy-isomorphic APIs (names can differ; behavior must match):
+Implemented in-repo (not yet upstreamed):
 
-1. **`add_guide_to_latent()`**
-   - Inputs: `latent_state`, `guide_pixels|guide_latent`, `frame_idx`, `strength`, `vae`, spatial dims
-   - Outputs: updated latent tokens, `noise_mask`, keyframe index tensor for RoPE
-   - Unit tests: compare token shapes + mask values against Comfy reference for 1-frame and 97-frame guides
+1. **`encode_guide_video()`** + **`VideoConditionByAppendedGuide`** — Comfy ``append_keyframe``
+2. **`crop_guides_from_video_tokens()`** — Comfy ``LTXVCropGuides``
+3. **`FaceSwapPipeline`** — full composite guide @ frame 0, dev+CFG stage 1, crop, upscale, stage 2
 
-2. **`crop_guides_from_latent()`**
-   - Strip appended guide temporal tokens; reset keyframe metadata
-   - Test: round-trip add → crop → shape equals original generation latent
-
-3. **`LTXVPreprocess` equivalent** (if not present)
-   - Port CRF preprocessing from Comfy `nodes_lt.LTXVPreprocess`
-
-4. **Wire into denoise loop**
-   - `guided_denoise_loop` / `LatentState` must respect concatenated `noise_mask` (frozen guide tokens)
-
-**Gate:** Phase A passes shape/mask parity tests against Comfy on CPU/torch reference vectors (golden files).
+**Gate:** unit tests in ``tests/test_ltxv_add_guide.py``; remote generation validation on ``faceswap`` branch.
 
 ### Phase B — `FaceSwapPipeline` in `ltx-ws`
 
@@ -194,7 +183,8 @@ compose_bfs_v3_guide_video()
 | Path | Keep / rewrite |
 |------|----------------|
 | `ltx_face_swap_compose.py` | **Keep** — align tests with Comfy `ReservedRegionFrameComposer` |
-| `ltx_face_swap_pipeline.py` | **Rewrite** after Phase A (current file is wrong approach) |
+| `ltx_ltxv_add_guide.py` | **Keep** — local Comfy AddGuide/CropGuides port |
+| `ltx_face_swap_pipeline.py` | **Keep** — uses `ltx_ltxv_add_guide` + dev two-stage |
 | `ltx_mlx_backend.py` face_swap block | **Rewrite** — wire new pipeline only |
 | `tests/test_face_swap_*.py` | **Rewrite** — test compose + mock Phase A primitives |
 | Web UI / MCP face_swap mode | **Do not merge to main** until Phase C |
