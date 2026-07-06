@@ -1651,7 +1651,11 @@ def _run_face_swap_generation(
         "face_swap",
         pipe_kwargs={"lora_paths": [(str(p), float(s)) for p, s in resolved_loras]},
     )
-    from ltx_face_swap_pipeline import DEFAULT_FACE_SWAP_STAGE1_STEPS, DEFAULT_FACE_SWAP_STAGE2_STEPS
+    from ltx_face_swap_pipeline import (
+        DEFAULT_FACE_SWAP_STAGE1_STEPS,
+        DEFAULT_FACE_SWAP_STAGE2_STEPS,
+    )
+    from ltx_ltxv_add_guide import DEFAULT_GUIDE_CRF
 
     stage1 = int(steps) if steps and steps >= 15 else DEFAULT_FACE_SWAP_STAGE1_STEPS
     if stage1 != int(steps):
@@ -1671,7 +1675,10 @@ def _run_face_swap_generation(
         "seed": seed,
         "stage1_steps": stage1,
         "stage2_steps": DEFAULT_FACE_SWAP_STAGE2_STEPS,
+        "guide_crf": DEFAULT_GUIDE_CRF,
     }
+    if req.reference_strength is not None:
+        swap_kwargs["guide_strength"] = float(req.reference_strength)
     if req.stage2_steps is not None:
         swap_kwargs["stage2_steps"] = int(req.stage2_steps)
     if req.cfg_scale is not None:

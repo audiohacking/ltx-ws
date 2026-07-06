@@ -17,6 +17,7 @@ from ltx_core_mlx.model.transformer.model import X0Model
 from ltx_core_mlx.utils.memory import aggressive_cleanup
 from ltx_core_mlx.utils.positions import compute_audio_positions, compute_audio_token_count, compute_video_positions
 from ltx_ltxv_add_guide import (
+    DEFAULT_GUIDE_CRF,
     build_appended_guide_conditioning,
     crop_guides_from_video_tokens,
     encode_guide_video,
@@ -107,6 +108,7 @@ class FaceSwapPipeline(KeyframeInterpolationPipeline):
         cfg_scale: float = DEFAULT_FACE_SWAP_CFG,
         guide_strength: float = DEFAULT_GUIDE_STRENGTH,
         guide_frame_idx: int = 0,
+        guide_crf: int = DEFAULT_GUIDE_CRF,
     ) -> tuple[mx.array, mx.array]:
         half_h, half_w = height // 2, width // 2
         f_half, h_half, w_half = compute_video_latent_shape(num_frames, half_h, half_w)
@@ -131,6 +133,7 @@ class FaceSwapPipeline(KeyframeInterpolationPipeline):
             video_encoder=self.vae_encoder,
             video_patchifier=self.video_patchifier,
             frame_idx=guide_frame_idx,
+            crf=guide_crf,
         )
         guide_cond_half = build_appended_guide_conditioning(encoded_half, strength=guide_strength)
 
@@ -188,9 +191,11 @@ class FaceSwapPipeline(KeyframeInterpolationPipeline):
         audio_factory = create_multimodal_guider_factory(agp, negative_context=neg_audio_embeds)
 
         logger.info(
-            "Face swap stage1: dev+CFG steps=%d cfg=%.1f add_guide=full_composite tokens_gen=%d tokens_guide=%d",
+            "Face swap stage1: dev+CFG steps=%d cfg=%.1f add_guide=full_composite crf=%d "
+            "tokens_gen=%d tokens_guide=%d",
             s1_steps,
             cfg_scale,
+            guide_crf,
             gen_tokens_half,
             int(encoded_half.tokens.shape[1]),
         )
@@ -238,6 +243,7 @@ class FaceSwapPipeline(KeyframeInterpolationPipeline):
             video_encoder=self.vae_encoder,
             video_patchifier=self.video_patchifier,
             frame_idx=guide_frame_idx,
+            crf=guide_crf,
         )
         guide_cond_full = build_appended_guide_conditioning(encoded_full, strength=guide_strength)
 
@@ -302,6 +308,7 @@ class FaceSwapPipeline(KeyframeInterpolationPipeline):
         stage2_steps: int | None = None,
         cfg_scale: float = DEFAULT_FACE_SWAP_CFG,
         guide_strength: float = DEFAULT_GUIDE_STRENGTH,
+        guide_crf: int = DEFAULT_GUIDE_CRF,
         **_unused,
     ) -> str:
         video_latent, audio_latent = self.generate_face_swap(
@@ -316,6 +323,7 @@ class FaceSwapPipeline(KeyframeInterpolationPipeline):
             stage2_steps=stage2_steps,
             cfg_scale=cfg_scale,
             guide_strength=guide_strength,
+            guide_crf=guide_crf,
         )
 
         if self.low_memory:
