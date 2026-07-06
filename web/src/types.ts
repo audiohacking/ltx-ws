@@ -53,7 +53,6 @@ export interface Config {
   ic_lora_union_motion_spec?: string;
   face_swap_preset_id?: string;
   face_swap_default_spec?: string;
-  face_swap_num_steps?: number;
   pose_control_available?: boolean;
   pyav_available?: boolean;
   audio_trim_available?: boolean;

@@ -1638,7 +1638,7 @@ def _run_face_swap_generation(
         "face_swap",
         pipe_kwargs={"lora_paths": [(str(p), float(s)) for p, s in resolved_loras]},
     )
-    from ltx_face_swap_pipeline import DEFAULT_FACE_SWAP_NUM_STEPS, FaceSwapPipeline
+    from ltx_face_swap_pipeline import FaceSwapPipeline
 
     if not isinstance(pipe, FaceSwapPipeline):
         raise RuntimeError(
@@ -1647,7 +1647,6 @@ def _run_face_swap_generation(
         )
     from ltx_ltxv_add_guide import DEFAULT_GUIDE_CRF
 
-    num_steps = int(steps) if steps and int(steps) > 0 else DEFAULT_FACE_SWAP_NUM_STEPS
     swap_kwargs: dict[str, Any] = {
         "prompt": prompt,
         "output_path": out_path,
@@ -1657,7 +1656,7 @@ def _run_face_swap_generation(
         "num_frames": nf,
         "frame_rate": float(gen.fps),
         "seed": seed,
-        "num_steps": num_steps,
+        "num_steps": int(steps),
         "guide_crf": DEFAULT_GUIDE_CRF,
     }
     if req.reference_strength is not None:

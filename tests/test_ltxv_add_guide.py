@@ -125,7 +125,6 @@ def test_face_swap_pipeline_uses_add_guide_in_source():
 def test_face_swap_pipeline_class_exports():
     from ltx_face_swap_pipeline import (
         DEFAULT_FACE_SWAP_CFG,
-        DEFAULT_FACE_SWAP_NUM_STEPS,
         FaceSwapPipeline,
     )
     from ltx_pipelines_mlx.ti2vid_one_stage import TI2VidOneStagePipeline
@@ -133,4 +132,3 @@ def test_face_swap_pipeline_class_exports():
     assert issubclass(FaceSwapPipeline, TI2VidOneStagePipeline)
     assert hasattr(FaceSwapPipeline, "generate_face_swap")
     assert DEFAULT_FACE_SWAP_CFG == 3.0
-    assert DEFAULT_FACE_SWAP_NUM_STEPS == 20

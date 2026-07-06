@@ -42,14 +42,9 @@ logger = logging.getLogger(__name__)
 
 _mx_eval = getattr(mx, "eval")  # noqa: B009
 
-DEFAULT_FACE_SWAP_NUM_STEPS = 20
 DEFAULT_FACE_SWAP_CFG = DEFAULT_CFG_SCALE
 DEFAULT_FACE_SWAP_STG = 1.0
 DEFAULT_GUIDE_STRENGTH = 1.0
-
-# Backward-compatible aliases
-DEFAULT_FACE_SWAP_STAGE1_STEPS = DEFAULT_FACE_SWAP_NUM_STEPS
-DEFAULT_FACE_SWAP_STAGE2_STEPS = 0
 
 
 def _resolve_dev_transformer(model_dir: Path) -> str:
@@ -155,9 +150,11 @@ class FaceSwapPipeline(TI2VidOneStagePipeline):
         if stage2_steps:
             logger.info("Face swap: stage2_steps ignored (single-stage dev+CFG)")
 
-        steps = int(num_steps or stage1_steps or DEFAULT_FACE_SWAP_NUM_STEPS)
+        if not (num_steps or stage1_steps):
+            raise ValueError("face_swap requires num_steps from the generation request")
+        steps = int(num_steps or stage1_steps)
         if steps < 1:
-            steps = 1
+            raise ValueError(f"face_swap num_steps must be >= 1, got {steps}")
 
         f_lat, h_lat, w_lat, gen_tokens = generation_token_count(num_frames, height, width)
         enc_h = h_lat * 32
@@ -320,9 +317,6 @@ class FaceSwapPipeline(TI2VidOneStagePipeline):
 
 __all__ = [
     "DEFAULT_FACE_SWAP_CFG",
-    "DEFAULT_FACE_SWAP_NUM_STEPS",
-    "DEFAULT_FACE_SWAP_STAGE1_STEPS",
-    "DEFAULT_FACE_SWAP_STAGE2_STEPS",
     "DEFAULT_FACE_SWAP_STG",
     "DEFAULT_GUIDE_STRENGTH",
     "FaceSwapPipeline",
