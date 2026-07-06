@@ -108,35 +108,15 @@ LIPDUB_PUBLIC_BUCKET_SPEC = (
     "https://huggingface.co/buckets/audiohacking/LTX-2.3-22b-IC-LoRA-LipDub-bucket/"
     f"resolve/{LIPDUB_OFFICIAL_FILENAME}"
 )
+LIPDUB_DEFAULT_SPEC = LIPDUB_PUBLIC_BUCKET_SPEC
 ENV_LIPDUB_LORA = "LTX_WS_LIPDUB_LORA"
 LIPDUB_DEFAULT_SCALE = 1.0
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "web_outputs"
 
 
-def _hf_lora_resolve_url_accessible(url: str) -> bool:
-    """True when a Hugging Face resolve URL returns downloadable bytes (public bucket)."""
-    from urllib.request import Request, urlopen
-
-    try:
-        req = Request(url, headers={"Range": "bytes=0-0"})
-        with urlopen(req, timeout=15) as resp:
-            return resp.status in (200, 206)
-    except Exception:
-        return False
-
-
 def _builtin_lipdub_spec() -> str:
-    """Built-in LipDub LoRA URL/path, if any.
-
-  Order: ``LTX_WS_LIPDUB_LORA`` env → public audiohacking bucket mirror → none.
-  The official Lightricks weights are gated; do not use them as a silent default.
-    """
-    env = os.environ.get(ENV_LIPDUB_LORA, "").strip()
-    if env:
-        return env
-    if _hf_lora_resolve_url_accessible(LIPDUB_PUBLIC_BUCKET_SPEC):
-        return LIPDUB_PUBLIC_BUCKET_SPEC
-    return ""
+    """Built-in LipDub LoRA URL/path: ``LTX_WS_LIPDUB_LORA`` env override, else public bucket."""
+    return os.environ.get(ENV_LIPDUB_LORA, "").strip() or LIPDUB_DEFAULT_SPEC
 
 
 def _pose_control_available() -> bool:
@@ -395,13 +375,12 @@ def _lora_catalog(output_dir: Path | None = None) -> tuple[list[dict[str, Any]],
         FACE_SWAP_DEFAULT_SCALE,
     )
     lipdub_spec = _builtin_lipdub_spec()
-    if lipdub_spec:
-        _add(
-            LIPDUB_PRESET_ID,
-            "LipDub — IC-LoRA (LTX 2.3)",
-            lipdub_spec,
-            LIPDUB_DEFAULT_SCALE,
-        )
+    _add(
+        LIPDUB_PRESET_ID,
+        "LipDub — IC-LoRA (LTX 2.3)",
+        lipdub_spec,
+        LIPDUB_DEFAULT_SCALE,
+    )
 
     if output_dir is not None:
         hidden = _read_hidden_lora_ids(output_dir)

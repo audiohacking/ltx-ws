@@ -2141,7 +2141,7 @@ export default function App() {
                         and new dialogue in your prompt. Frame count follows the reference
                         video. Requires the LipDub IC-LoRA.
                       </p>
-                      {!config?.lipdub_default_spec && (
+                      {!config?.lipdub_default_spec?.includes("buckets/audiohacking") && (
                         <p className="hint hint-inline">
                           LipDub weights are gated on Hugging Face — accept access at{" "}
                           <a

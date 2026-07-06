@@ -7,36 +7,35 @@ from pathlib import Path
 import pytest
 
 LIPDUB_TEST_SPEC = (
-    "https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-LipDub/"
-    "resolve/main/ltx-2.3-22b-ic-lora-lipdub-0.9.safetensors"
+    "https://huggingface.co/buckets/audiohacking/LTX-2.3-22b-IC-LoRA-LipDub-bucket/"
+    "resolve/ltx-2.3-22b-ic-lora-lipdub-0.9.safetensors"
 )
 
 
-def test_lora_catalog_skips_lipdub_without_public_spec(monkeypatch):
-    from web_ui import LIPDUB_PRESET_ID, _lora_catalog
+def test_lora_catalog_includes_lipdub_public_bucket():
+    from web_ui import LIPDUB_DEFAULT_SPEC, LIPDUB_PRESET_ID, _lora_catalog
 
-    monkeypatch.delenv("LTX_WS_LIPDUB_LORA", raising=False)
-    monkeypatch.setattr("web_ui._hf_lora_resolve_url_accessible", lambda _u: False)
     presets, _ = _lora_catalog(None)
-    assert not any(p["id"] == LIPDUB_PRESET_ID for p in presets)
+    match = next(p for p in presets if p["id"] == LIPDUB_PRESET_ID)
+    assert "buckets/audiohacking/LTX-2.3-22b-IC-LoRA-LipDub-bucket" in match["spec"]
+    assert match["spec"] == LIPDUB_DEFAULT_SPEC
+    assert match["scale"] == pytest.approx(1.0)
 
 
-def test_lora_catalog_includes_lipdub_from_env(monkeypatch):
+def test_lora_catalog_lipdub_env_override(monkeypatch):
     from web_ui import LIPDUB_PRESET_ID, _lora_catalog
 
     monkeypatch.setenv("LTX_WS_LIPDUB_LORA", "/models/lipdub.safetensors")
-    monkeypatch.setattr("web_ui._hf_lora_resolve_url_accessible", lambda _u: False)
     presets, _ = _lora_catalog(None)
     match = next(p for p in presets if p["id"] == LIPDUB_PRESET_ID)
     assert match["spec"] == "/models/lipdub.safetensors"
 
 
-def test_builtin_lipdub_spec_prefers_public_bucket(monkeypatch):
-    from web_ui import LIPDUB_PUBLIC_BUCKET_SPEC, _builtin_lipdub_spec
+def test_builtin_lipdub_spec_uses_public_bucket(monkeypatch):
+    from web_ui import LIPDUB_DEFAULT_SPEC, _builtin_lipdub_spec
 
     monkeypatch.delenv("LTX_WS_LIPDUB_LORA", raising=False)
-    monkeypatch.setattr("web_ui._hf_lora_resolve_url_accessible", lambda url: url == LIPDUB_PUBLIC_BUCKET_SPEC)
-    assert _builtin_lipdub_spec() == LIPDUB_PUBLIC_BUCKET_SPEC
+    assert _builtin_lipdub_spec() == LIPDUB_DEFAULT_SPEC
 
 
 def test_build_params_lipdub_video_only(tmp_path: Path):
@@ -159,8 +158,7 @@ def test_format_lora_download_error_gated_lipdub():
 
     msg = format_lora_download_error(
         RuntimeError("403 Client Error: Cannot access gated repo"),
-        LIPDUB_TEST_SPEC,
+        "https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-LipDub/resolve/main/x.safetensors",
     )
     assert "gated" in msg.lower()
     assert "HF_TOKEN" in msg
-    assert "LTX_WS_LIPDUB_LORA" in msg
