@@ -1627,7 +1627,7 @@ def _run_face_swap_generation(
 
     log.info(
         "Face swap invoke: FaceSwapPipeline lora=%s guide=%s (%dx%d, %d frames) "
-        "add_guide=full_composite crop_guides=yes distilled_8step=yes",
+        "add_guide=full_composite crop_guides=yes dev_cfg=yes",
         resolved_loras[0][0],
         guide_path,
         width,
@@ -1642,15 +1642,15 @@ def _run_face_swap_generation(
 
     if not isinstance(pipe, FaceSwapPipeline):
         raise RuntimeError(
-            f"face_swap expected FaceSwapPipeline (distilled single-stage), got {type(pipe).__name__}; "
+            f"face_swap expected FaceSwapPipeline (dev+CFG), got {type(pipe).__name__}; "
             "update ltx-ws faceswap branch"
         )
     from ltx_ltxv_add_guide import DEFAULT_GUIDE_CRF
 
     num_steps = int(steps) if steps and steps > 0 else DEFAULT_FACE_SWAP_NUM_STEPS
-    if num_steps > 8:
-        log.info("Face swap: capping num_steps %d -> 8 (V3 distilled schedule)", num_steps)
-        num_steps = 8
+    if num_steps < 15:
+        log.info("Face swap: raising num_steps %d -> %d (dev+CFG)", num_steps, DEFAULT_FACE_SWAP_NUM_STEPS)
+        num_steps = DEFAULT_FACE_SWAP_NUM_STEPS
     swap_kwargs: dict[str, Any] = {
         "prompt": prompt,
         "output_path": out_path,

@@ -174,7 +174,7 @@ def compose_bfs_v3_guide_video(
     region_size_px: int | None = None,
     region_position: str = "left",
     chroma_rgb: tuple[int, int, int] = (0, 255, 0),
-    face_scale_pct: float = 90.0,
+    face_scale_pct: float = 100.0,
     face_padding_px: int = 12,
     layout: FaceSwapGuideLayout | None = None,
     src_width: int | None = None,
