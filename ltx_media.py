@@ -805,6 +805,156 @@ def encode_image_hold_video(
     return output_path
 
 
+def snap_multiple_of_32(value: int, *, minimum: int = 32) -> int:
+    """Round to nearest multiple of 32 (LTX VAE requirement)."""
+    value = max(minimum, int(value))
+    return int(round(value / 32)) * 32
+
+
+def canvas_from_video_aspect(
+    src_width: int,
+    src_height: int,
+    longer_edge: int,
+) -> tuple[int, int]:
+    """Resize target preserving aspect with longer side = ``longer_edge`` (Comfy longer-edge)."""
+    src_width = max(1, int(src_width))
+    src_height = max(1, int(src_height))
+    longer_edge = snap_multiple_of_32(int(longer_edge))
+    if src_width >= src_height:
+        out_w = longer_edge
+        out_h = snap_multiple_of_32(int(round(longer_edge * src_height / src_width)))
+    else:
+        out_h = longer_edge
+        out_w = snap_multiple_of_32(int(round(longer_edge * src_width / src_height)))
+    return out_w, out_h
+
+
+def dimensions_fit_inside(src_w: int, src_h: int, max_w: int, max_h: int) -> tuple[int, int]:
+    """Scale ``src`` dimensions to fit inside ``max`` box, preserving aspect."""
+    if src_w <= 0 or src_h <= 0:
+        return max(1, max_w), max(1, max_h)
+    scale = min(max_w / src_w, max_h / src_h)
+    return max(1, int(round(src_w * scale))), max(1, int(round(src_h * scale)))
+
+
+def trim_video_fit_aspect(
+    src: str | Path,
+    dst: str | Path,
+    *,
+    num_frames: int,
+    max_width: int,
+    max_height: int,
+    fps: float,
+    start_seconds: float = 0.0,
+) -> tuple[Path, int, int]:
+    """Trim/re-encode with aspect preserved (Comfy ``ResizeImagesByLongerEdge`` + fit).
+
+    Output frame size is the largest fit inside ``max_width``×``max_height`` without
+    stretching. Returns ``(path, out_width, out_height)``.
+    """
+    import numpy as np
+    from PIL import Image
+
+    require_media()
+    src = Path(src)
+    dst = Path(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    num_frames = max(1, int(num_frames))
+    max_width = max(1, int(max_width))
+    max_height = max(1, int(max_height))
+    fps_frac = _pyav_frame_rate(fps)
+    start_seconds = max(0.0, float(start_seconds))
+
+    frames_written = 0
+    next_pick = 0.0
+    decoded_index = 0
+    started = start_seconds <= 0.0
+    last_arr: Any | None = None
+    out_w = out_h = 0
+    pad_w = pad_h = 0
+
+    with av.open(str(src)) as vin, av.open(str(dst), "w") as out:
+        if not vin.streams.video:
+            raise RuntimeError(f"No video stream in {src}")
+        in_stream = vin.streams.video[0]
+        source_fps = float(in_stream.average_rate or in_stream.base_rate or fps)
+
+        out_stream = None
+
+        for frame in vin.decode(in_stream):
+            if frames_written >= num_frames:
+                break
+
+            frame_time = _media_time_seconds(frame, in_stream)
+            if not started:
+                if frame_time is not None and frame_time < start_seconds:
+                    decoded_index += 1
+                    continue
+                started = True
+
+            take = True
+            if source_fps > 0 and abs(source_fps - fps) > 0.01:
+                take = decoded_index >= next_pick
+                if take:
+                    next_pick += source_fps / fps
+
+            if not take:
+                decoded_index += 1
+                continue
+
+            rgb = frame.reformat(format="rgb24")
+            src_arr = np.asarray(rgb.to_ndarray(), dtype=np.uint8)
+            src_h, src_w = src_arr.shape[:2]
+            if out_w == 0:
+                out_w, out_h = dimensions_fit_inside(src_w, src_h, max_width, max_height)
+                pad_w = out_w + (out_w & 1)
+                pad_h = out_h + (out_h & 1)
+                out_stream = out.add_stream(
+                    "libx264", rate=fps_frac, width=pad_w, height=pad_h
+                )
+                out_stream.pix_fmt = "yuv420p"
+                out_stream.options = {"crf": "18", "preset": "veryfast"}
+                out_stream.time_base = Fraction(fps_frac.denominator, fps_frac.numerator)
+
+            if src_arr.shape[1] != out_w or src_arr.shape[0] != out_h:
+                src_arr = np.asarray(
+                    Image.fromarray(src_arr, mode="RGB").resize(
+                        (out_w, out_h),
+                        Image.Resampling.LANCZOS,
+                    ),
+                    dtype=np.uint8,
+                )
+            arr = src_arr
+            if pad_w != out_w or pad_h != out_h:
+                padded = np.zeros((pad_h, pad_w, 3), dtype=np.uint8)
+                padded[:out_h, :out_w, :] = arr
+                arr = padded
+            last_arr = arr
+            out_frame = av.VideoFrame.from_ndarray(arr, format="rgb24")
+            out_frame = out_frame.reformat(format="yuv420p")
+            out_frame.pts = frames_written
+            for packet in out_stream.encode(out_frame):
+                out.mux(packet)
+            frames_written += 1
+            decoded_index += 1
+
+        if frames_written == 0 or out_stream is None:
+            raise RuntimeError(f"No frames written trimming {src}")
+
+        while frames_written < num_frames and last_arr is not None:
+            out_frame = av.VideoFrame.from_ndarray(last_arr, format="rgb24")
+            out_frame = out_frame.reformat(format="yuv420p")
+            out_frame.pts = frames_written
+            for packet in out_stream.encode(out_frame):
+                out.mux(packet)
+            frames_written += 1
+
+        for packet in out_stream.encode(None):
+            out.mux(packet)
+
+    return dst, out_w, out_h
+
+
 def trim_video_to_spec(
     src: str | Path,
     dst: str | Path,

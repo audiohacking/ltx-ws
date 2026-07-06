@@ -1411,21 +1411,47 @@ def _prepare_face_swap_guide_video(
     width: int,
     height: int,
     fps: float,
-) -> tuple[str, Any, int]:
-    """Trim reference footage and build the BFS V3 composite IC-LoRA guide clip."""
-    from ltx_face_swap_compose import FaceSwapGuideLayout, compose_bfs_v3_guide_video
+) -> tuple[str, Any, int, int, int]:
+    """Trim reference footage and build the BFS V3 composite guide clip.
+
+    Returns ``(guide_path, layout, num_frames, canvas_width, canvas_height)``.
+    Canvas size preserves source aspect (longer-edge resize); it is **not** stretched
+    to the UI preset box.
+    """
+    from ltx_face_swap_compose import (
+        FaceSwapGuideLayout,
+        compose_bfs_v3_guide_video,
+        compute_bfs_guide_layout,
+        resolve_face_swap_canvas_size,
+    )
     from ltx_media import (
         ic_lora_vae_compatible_frame_count,
         media_available,
         normalize_video_for_ic_lora_reference,
         probe_video_info,
-        trim_video_to_spec,
+        trim_video_fit_aspect,
     )
 
     if not media_available():
         raise RuntimeError("face_swap requires PyAV to prepare guide video (pip install av)")
 
     info = probe_video_info(reference_path)
+    canvas_w, canvas_h = resolve_face_swap_canvas_size(
+        info.width,
+        info.height,
+        request_width=width,
+        request_height=height,
+    )
+    if (canvas_w, canvas_h) != (width, height):
+        log.info(
+            "Face swap: canvas %dx%d from source %dx%d (aspect preserved; UI preset was %dx%d)",
+            canvas_w,
+            canvas_h,
+            info.width,
+            info.height,
+            width,
+            height,
+        )
     vae_frames = ic_lora_vae_compatible_frame_count(
         num_frames,
         source_num_frames=info.num_frames,
@@ -1437,20 +1463,30 @@ def _prepare_face_swap_guide_video(
             vae_frames,
         )
     trimmed_path = os.path.join(tmpdir, "face_swap_ref_trimmed.mp4")
+    guide_layout = compute_bfs_guide_layout(
+        canvas_w,
+        canvas_h,
+        src_width=info.width,
+        src_height=info.height,
+        region_size_px=256,
+    )
     if info.num_frames > vae_frames or abs(info.fps - fps) > 0.05:
         log.info(
-            "Face swap: trimming reference video %d frames at %.1f fps -> %d frames at %.1f fps",
+            "Face swap: trimming reference video %d frames at %.1f fps -> %d frames at %.1f fps "
+            "(main panel %dx%d, aspect preserved)",
             info.num_frames,
             info.fps,
             vae_frames,
             fps,
+            guide_layout.video_w,
+            guide_layout.video_h,
         )
-    trim_video_to_spec(
+    trim_video_fit_aspect(
         reference_path,
         trimmed_path,
         num_frames=vae_frames,
-        width=width,
-        height=height,
+        max_width=guide_layout.video_w,
+        max_height=guide_layout.video_h,
         fps=fps,
     )
     guide_path = os.path.join(tmpdir, "face_swap_bfs_v3_guide.mp4")
@@ -1458,21 +1494,23 @@ def _prepare_face_swap_guide_video(
         trimmed_path,
         identity_image,
         guide_path,
-        width=width,
-        height=height,
+        width=canvas_w,
+        height=canvas_h,
         num_frames=vae_frames,
         fps=fps,
+        region_size_px=256,
+        layout=guide_layout,
     )
     normalized_path = os.path.join(tmpdir, "face_swap_bfs_v3_guide_norm.mp4")
     effective_nf = normalize_video_for_ic_lora_reference(
         guide_path,
         normalized_path,
         num_frames=vae_frames,
-        width=width,
-        height=height,
+        width=canvas_w,
+        height=canvas_h,
         fps=fps,
     )
-    return normalized_path, layout, effective_nf
+    return normalized_path, layout, effective_nf, canvas_w, canvas_h
 
 
 def _run_ic_lora_generation(
@@ -1492,6 +1530,7 @@ def _run_ic_lora_generation(
     steps: int,
     tmp_video_conditioning_cleanup: list[str],
     audio_reference_paths: list[str] | None = None,
+    guide_images: list[tuple[str, int, float, int]] | None = None,
 ) -> Any:
     """Shared IC-LoRA invoke path for ``ic_lora`` and ``face_swap`` modes."""
     if not resolved_loras:
@@ -1505,11 +1544,12 @@ def _run_ic_lora_generation(
     primary_lora = _ic_lora_primary_lora(resolved_loras)
     uses_pose = _needs_pose_control_preprocessing(resolved_loras, vc_items)
     log.info(
-        "IC-LoRA invoke: pipe=%s primary=%s vcond_in=%d image=%s pose_preprocess=%s",
+        "IC-LoRA invoke: pipe=%s primary=%s vcond_in=%d image=%s (%d) pose_preprocess=%s",
         ic_pipe_key,
         primary_lora[0] if primary_lora else "?",
         len(vc_items),
-        "yes" if tmp_image else "no",
+        "guide" if guide_images else ("i2v" if tmp_image else "no"),
+        len(guide_images) if guide_images else (1 if tmp_image else 0),
         "yes" if uses_pose else "no",
     )
     pipe = gen._get_pipe(
@@ -1540,7 +1580,9 @@ def _run_ic_lora_generation(
         "stage1_steps": int(steps),
         "conditioning_attention_strength": 1.0,
     }
-    if tmp_image:
+    if guide_images:
+        ic_kwargs["images"] = guide_images
+    elif tmp_image:
         ic_kwargs["images"] = _build_ic_lora_image_conditionings(tmp_image, nf)
     if req.reference_strength is not None:
         ic_kwargs["conditioning_attention_strength"] = float(req.reference_strength)
@@ -1574,6 +1616,64 @@ def _run_ic_lora_generation(
             audio_reference_paths,
             job_id=req.job_id,
         )
+    return pipe
+
+
+def _run_face_swap_generation(
+    gen: "LocalVideoGenerator",
+    *,
+    req: GenerationRequest,
+    prompt: str,
+    resolved_loras: list[tuple[str, float]],
+    guide_path: str,
+    guide_scale: float,
+    tmpdir: str,
+    out_path: str,
+    width: int,
+    height: int,
+    nf: int,
+    seed: int,
+    steps: int,
+    guide_images: list[tuple[str, int, float, int]],
+) -> Any:
+    """BFS V3 face swap via :class:`FaceSwapPipeline` (LoRA + composite ref in stage 2)."""
+    if len(resolved_loras) != 1:
+        raise RuntimeError("Face swap requires exactly one head-swap LoRA")
+
+    log.info(
+        "Face swap invoke: FaceSwapPipeline lora=%s guide=%s (%dx%d, %d frames) "
+        "frame0_anchor=yes stage2_lora=yes",
+        resolved_loras[0][0],
+        guide_path,
+        width,
+        height,
+        nf,
+    )
+    pipe = gen._get_pipe(
+        "face_swap",
+        pipe_kwargs={"lora_paths": [(str(p), float(s)) for p, s in resolved_loras]},
+    )
+    swap_kwargs: dict[str, Any] = {
+        "prompt": prompt,
+        "output_path": out_path,
+        "video_conditioning": [(guide_path, float(guide_scale))],
+        "height": height,
+        "width": width,
+        "num_frames": nf,
+        "frame_rate": float(gen.fps),
+        "seed": seed,
+        "stage1_steps": int(steps),
+        "images": guide_images,
+        "conditioning_attention_strength": 1.0,
+    }
+    if req.reference_strength is not None:
+        swap_kwargs["conditioning_attention_strength"] = float(req.reference_strength)
+    if req.stage2_steps is not None:
+        swap_kwargs["stage2_steps"] = int(req.stage2_steps)
+    else:
+        swap_kwargs["stage2_steps"] = 3
+    _apply_optional_generate_kwargs(swap_kwargs, req)
+    _invoke_generate_and_save(pipe, **swap_kwargs)
     return pipe
 
 
@@ -1811,13 +1911,21 @@ class LocalVideoGenerator:
         for key, cls_name in (
             ("two_stage", "TI2VidTwoStagesPipeline"),
             ("hq", "TI2VidTwoStagesHQPipeline"),
-            ("keyframe", "KeyframePipeline"),
+            ("keyframe", "KeyframeInterpolationPipeline"),
             ("lipdub", "LipDubPipeline"),
         ):
             cls = getattr(lpm, cls_name, None)
             if cls is not None:
                 self._pipe_classes[key] = cls
                 log.info("Registered MLX pipeline %s (%s)", key, cls_name)
+
+        try:
+            from ltx_face_swap_pipeline import FaceSwapPipeline
+
+            self._pipe_classes["face_swap"] = FaceSwapPipeline
+            log.info("Registered MLX pipeline face_swap (FaceSwapPipeline)")
+        except ImportError as exc:
+            log.warning("FaceSwapPipeline unavailable: %s", exc)
 
         # Legacy standalone spatial upscaler classes (pre-v0.14 monolith pipelines).
         for cls_name in (
@@ -2497,52 +2605,73 @@ class LocalVideoGenerator:
                             raise RuntimeError("face_swap mode requires exactly one LoRA spec")
                         from ltx_face_swap_compose import (
                             crop_face_swap_output_to_main_video,
+                            extract_bfs_guide_keyframe_at_index,
                             format_head_swap_prompt,
                         )
 
+                        ref_path = tmp_video
                         ref_scale = 1.0
                         if vc_items:
                             ref_path, ref_scale = vc_items[0]
-                        else:
-                            ref_path = tmp_video
-                        guide_path, guide_layout, face_swap_nf = _prepare_face_swap_guide_video(
-                            str(ref_path),
-                            tmp_image,
-                            tmpdir=tmpdir,
-                            num_frames=nf,
-                            width=width,
-                            height=height,
-                            fps=float(self.fps),
+                        trimmed_ref = os.path.join(tmpdir, "face_swap_ref_trimmed.mp4")
+                        guide_path, guide_layout, face_swap_nf, canvas_w, canvas_h = (
+                            _prepare_face_swap_guide_video(
+                                str(ref_path),
+                                tmp_image,
+                                tmpdir=tmpdir,
+                                num_frames=nf,
+                                width=width,
+                                height=height,
+                                fps=float(self.fps),
+                            )
                         )
                         tmp_video_conditioning_cleanup.extend(
                             [
-                                os.path.join(tmpdir, "face_swap_ref_trimmed.mp4"),
+                                trimmed_ref,
                                 os.path.join(tmpdir, "face_swap_bfs_v3_guide.mp4"),
                                 guide_path,
                             ]
                         )
+                        kf_path, _kf_idx = extract_bfs_guide_keyframe_at_index(
+                            guide_path,
+                            os.path.join(tmpdir, "face_swap_ic_lora_frame0"),
+                            frame_idx=0,
+                        )
+                        guide_images = _build_ic_lora_image_conditionings(kf_path, face_swap_nf)
                         face_swap_prompt = format_head_swap_prompt(effective_prompt)
                         log.info(
-                            "Face swap: BFS V3 composite guide + IC-LoRA head-swap LoRA "
-                            "(%d frames; identity in chroma side panel, not separate I2V)",
+                            "Face swap: BFS V3 composite %dx%d (%d frames) "
+                            "main panel %dx%d + FaceSwapPipeline",
+                            canvas_w,
+                            canvas_h,
                             face_swap_nf,
+                            guide_layout.video_w,
+                            guide_layout.video_h,
                         )
-                        last_pipe = _run_ic_lora_generation(
+                        if gen.spill_dir and req.job_id:
+                            try:
+                                gen.spill_dir.mkdir(parents=True, exist_ok=True)
+                                slug = _spill_slug(req.prompt)
+                                dest = gen.spill_dir / f"{req.job_id}_{slug}_face_swap_guide.mp4"
+                                shutil.copy2(guide_path, dest)
+                                log.info("Face swap guide saved → %s", dest)
+                            except OSError as exc:
+                                log.warning("Could not save face swap guide debug copy: %s", exc)
+                        last_pipe = _run_face_swap_generation(
                             self,
                             req=req,
                             prompt=face_swap_prompt,
                             resolved_loras=resolved_loras,
-                            vc_items=[(guide_path, float(ref_scale))],
-                            tmp_image=None,
+                            guide_path=guide_path,
+                            guide_scale=float(ref_scale),
                             tmpdir=tmpdir,
                             out_path=out_path,
-                            width=width,
-                            height=height,
+                            width=canvas_w,
+                            height=canvas_h,
                             nf=face_swap_nf,
                             seed=seed,
                             steps=steps,
-                            tmp_video_conditioning_cleanup=tmp_video_conditioning_cleanup,
-                            audio_reference_paths=None,
+                            guide_images=guide_images,
                         )
                         try:
                             crop_face_swap_output_to_main_video(out_path, guide_layout)

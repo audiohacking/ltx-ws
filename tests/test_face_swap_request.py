@@ -43,8 +43,8 @@ def test_build_params_face_swap(tmp_path: Path):
     assert len(params.lora_specs) == 1
 
 
-def test_face_swap_mode_is_not_lipdub():
-    """Face swap must not route through LipDub (lip-sync) pipeline."""
+def test_face_swap_mode_uses_bfs_face_swap_pipeline():
+    """Face swap uses BFS composite + FaceSwapPipeline (stage-2 LoRA + ref), not LipDub."""
     from pathlib import Path
 
     src = Path("ltx_mlx_backend.py").read_text(encoding="utf-8")
@@ -53,6 +53,7 @@ def test_face_swap_mode_is_not_lipdub():
     face_block = src[face_block_start:face_block_end]
     assert '"lipdub"' not in face_block
     assert "_invoke_lipdub_style" not in face_block
-    assert "_run_ic_lora_generation" in face_block
+    assert "_run_face_swap_generation" in face_block
+    assert "_run_ic_lora_generation" not in face_block
+    assert "FaceSwapPipeline" in src or "face_swap" in src
     assert "compose_bfs_v3_guide_video" in src
-    assert "tmp_image=None" in face_block

@@ -17,6 +17,8 @@ def test_format_head_swap_prompt_wraps_plain_text():
     assert "FACE:" in out
     assert "ACTION:" in out
     assert "person talking to camera" in out
+    assert "Blue eyes" not in out
+    assert "side-panel" not in out.lower()
 
 
 def test_format_head_swap_prompt_preserves_existing_trigger():
@@ -50,16 +52,25 @@ def test_prepare_face_swap_guide_trims_and_composes(tmp_path: Path):
     )()
 
     with patch("ltx_media.probe_video_info") as probe, patch(
-        "ltx_media.trim_video_to_spec"
+        "ltx_face_swap_compose.resolve_face_swap_canvas_size",
+        return_value=(768, 512),
+    ), patch(
+        "ltx_media.trim_video_fit_aspect",
+        return_value=(tmp_path / "trimmed.mp4", 512, 288),
     ) as trim, patch("ltx_face_swap_compose.compose_bfs_v3_guide_video") as compose, patch(
+        "ltx_face_swap_compose.compute_bfs_guide_layout",
+    ) as layout_fn, patch(
         "ltx_media.normalize_video_for_ic_lora_reference",
         return_value=121,
     ) as normalize:
-        probe.return_value = type("Info", (), {"num_frames": 889, "fps": 30.0})()
+        probe.return_value = type(
+            "Info", (), {"num_frames": 889, "fps": 30.0, "width": 1920, "height": 1080}
+        )()
         trim.side_effect = lambda _src, dst, **_: Path(dst).write_bytes(b"trimmed") or Path(dst)
+        layout_fn.return_value = layout_obj
         compose.return_value = layout_obj
 
-        guide_path, layout, effective_nf = _prepare_face_swap_guide_video(
+        guide_path, layout, effective_nf, canvas_w, canvas_h = _prepare_face_swap_guide_video(
             str(ref),
             str(face),
             tmpdir=str(tmp_path),
@@ -70,13 +81,24 @@ def test_prepare_face_swap_guide_trims_and_composes(tmp_path: Path):
         )
 
     trim.assert_called_once()
+    layout_fn.assert_called_once()
     compose.assert_called_once()
     normalize.assert_called_once()
-    assert compose.call_args.args[1] == str(face)
-    assert compose.call_args.kwargs["num_frames"] == 121
+    assert compose.call_args.kwargs["width"] == canvas_w
+    assert compose.call_args.kwargs["height"] == canvas_h
     assert guide_path.endswith("face_swap_bfs_v3_guide_norm.mp4")
     assert layout is layout_obj
     assert effective_nf == 121
+    assert canvas_w == 768 and canvas_h == 512
+
+
+def test_canvas_from_video_aspect_preserves_16_9():
+    from ltx_media import canvas_from_video_aspect
+
+    w, h = canvas_from_video_aspect(1920, 1080, 768)
+    assert w == 768
+    assert h == 448  # 432 snapped to nearest multiple of 32
+    assert w % 32 == 0 and h % 32 == 0
 
 
 def test_ic_lora_vae_compatible_frame_count():
@@ -153,6 +175,62 @@ def test_compose_bfs_v3_guide_video_writes_frames(tmp_path: Path):
         stream = container.streams.video[0]
         frames = sum(1 for _ in container.decode(stream))
     assert frames == 9
+
+
+def test_extract_bfs_guide_keyframe_images(tmp_path: Path):
+    pytest.importorskip("av")
+    from PIL import Image
+
+    from ltx_face_swap_compose import compose_bfs_v3_guide_video, extract_bfs_guide_keyframe_images
+
+    src = tmp_path / "src.mp4"
+    face = tmp_path / "face.png"
+    guide = tmp_path / "guide.mp4"
+    kf_dir = tmp_path / "keyframes"
+    _write_h264_mp4(src, frames=25, fps=24.0, width=320, height=240)
+    Image.new("RGB", (256, 256), color=(200, 120, 80)).save(face)
+    compose_bfs_v3_guide_video(
+        src,
+        face,
+        guide,
+        width=320,
+        height=240,
+        num_frames=25,
+        fps=24.0,
+        region_size_px=96,
+    )
+
+    keyframes = extract_bfs_guide_keyframe_images(
+        guide,
+        kf_dir,
+        num_frames=25,
+        interval=8,
+    )
+    assert keyframes[0][1] == 0
+    assert all(Path(p).is_file() for p, *_ in keyframes)
+    assert len(keyframes) >= 3
+    assert keyframes[-1][1] == 24
+
+
+def test_extract_bfs_guide_keyframe_at_index(tmp_path: Path):
+    pytest.importorskip("av")
+    from PIL import Image
+
+    from ltx_face_swap_compose import compose_bfs_v3_guide_video, extract_bfs_guide_keyframe_at_index
+    from tests.test_face_swap_backend import _write_h264_mp4
+
+    src = tmp_path / "src.mp4"
+    face = tmp_path / "face.png"
+    guide = tmp_path / "guide.mp4"
+    kf_dir = tmp_path / "keyframes"
+    _write_h264_mp4(src, frames=9, fps=24.0, width=320, height=240)
+    Image.new("RGB", (256, 256), color=(200, 120, 80)).save(face)
+    compose_bfs_v3_guide_video(
+        src, face, guide, width=320, height=240, num_frames=9, fps=24.0, region_size_px=96,
+    )
+    path, idx = extract_bfs_guide_keyframe_at_index(guide, kf_dir, frame_idx=0)
+    assert idx == 0
+    assert Path(path).is_file()
 
 
 def test_trim_video_to_spec_limits_frames(tmp_path: Path):

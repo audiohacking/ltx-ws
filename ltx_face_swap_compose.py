@@ -2,8 +2,8 @@
 
 The Alissonerdx ``head_swap_v3_*`` LoRA is trained on composite guide clips:
 performance video in the main area plus a persistent identity face in a green
-chroma side panel. IC-LoRA ``video_conditioning`` must receive this composite,
-not raw reference footage with a separate ``images`` anchor.
+chroma side panel. MLX inference uses IC-LoRA ``video_conditioning`` on the
+composite plus a frame-0 composite ``images`` anchor for stage 2.
 """
 
 from __future__ import annotations
@@ -15,6 +15,9 @@ from pathlib import Path
 import logging
 
 log = logging.getLogger(__name__)
+
+# BFS V3 / Comfy hold interval (minimum 4; 8 matches typical IC-LoRA keyframe spacing).
+DEFAULT_BFS_GUIDE_KEYFRAME_INTERVAL = 8
 
 
 @dataclass(frozen=True)
@@ -32,10 +35,61 @@ class FaceSwapGuideLayout:
 
 
 def _fit_inside(src_w: int, src_h: int, max_w: int, max_h: int) -> tuple[int, int]:
-    if src_w <= 0 or src_h <= 0:
-        return 1, 1
-    scale = min(max_w / src_w, max_h / src_h)
-    return max(1, int(round(src_w * scale))), max(1, int(round(src_h * scale)))
+    from ltx_media import dimensions_fit_inside
+
+    return dimensions_fit_inside(src_w, src_h, max_w, max_h)
+
+
+def compute_bfs_guide_layout(
+    width: int,
+    height: int,
+    *,
+    src_width: int,
+    src_height: int,
+    region_size_px: int | None = None,
+    region_position: str = "left",
+) -> FaceSwapGuideLayout:
+    """Pixel layout for BFS composite before encoding (main panel from source aspect)."""
+    width = int(width)
+    height = int(height)
+    region_position = (region_position or "left").strip().lower()
+    if region_position not in ("left", "right", "top", "bottom"):
+        raise ValueError(f"Unsupported region_position: {region_position}")
+
+    region_size_px = int(region_size_px or default_region_size_px(width))
+    if region_position in ("left", "right"):
+        region_size_px = max(1, min(region_size_px, width - 1))
+        video_max_w, video_max_h = width - region_size_px, height
+    else:
+        region_size_px = max(1, min(region_size_px, height - 1))
+        video_max_w, video_max_h = width, height - region_size_px
+
+    fitted_video_w, fitted_video_h = _fit_inside(
+        int(src_width),
+        int(src_height),
+        video_max_w,
+        video_max_h,
+    )
+
+    if region_position == "left":
+        video_x, video_y = region_size_px, (height - fitted_video_h) // 2
+    elif region_position == "right":
+        video_x, video_y = 0, (height - fitted_video_h) // 2
+    elif region_position == "top":
+        video_x, video_y = (width - fitted_video_w) // 2, region_size_px
+    else:
+        video_x, video_y = (width - fitted_video_w) // 2, 0
+
+    return FaceSwapGuideLayout(
+        region_size_px=region_size_px,
+        region_position=region_position,
+        video_x=video_x,
+        video_y=video_y,
+        video_w=fitted_video_w,
+        video_h=fitted_video_h,
+        frame_w=width,
+        frame_h=height,
+    )
 
 
 def _aligned_offset(container_size: int, content_size: int, align: str) -> int:
@@ -66,23 +120,46 @@ def _resize_face_for_region(face, *, region_w: int, region_h: int, face_scale_pc
     return face.resize((tw, th), Image.Resampling.LANCZOS)
 
 
+# BFS V3 recommends ~768px; Comfy workflow defaults to landscape 768×512 class sizes.
+FACE_SWAP_DEFAULT_LONGER_EDGE = 768
+
+
+def resolve_face_swap_canvas_size(
+    src_width: int,
+    src_height: int,
+    *,
+    request_width: int | None = None,
+    request_height: int | None = None,
+) -> tuple[int, int]:
+    """Pick generation canvas from source aspect (no stretch)."""
+    from ltx_media import canvas_from_video_aspect
+
+    longer = FACE_SWAP_DEFAULT_LONGER_EDGE
+    if request_width and request_height:
+        longer = max(int(request_width), int(request_height), 512)
+    elif request_width:
+        longer = max(int(request_width), 512)
+    elif request_height:
+        longer = max(int(request_height), 512)
+    return canvas_from_video_aspect(src_width, src_height, longer)
+
+
 def default_region_size_px(frame_width: int) -> int:
-    """Match typical BFS V3 workflows (~35% width, clamped)."""
-    return max(200, min(400, int(round(frame_width * 0.35))))
+    """Match BFS V3 ComfyUI workflow default (256px side strip)."""
+    return max(200, min(400, 256))
 
 
 def format_head_swap_prompt(user_prompt: str) -> str:
-    """Wrap user text in the BFS V3 ``head_swap:`` trigger format."""
+    """Wrap user text in the BFS V3 ``head_swap:`` trigger format.
+
+    Identity comes from the side-panel reference image in the composite guide;
+    the prompt only needs the ``head_swap:`` trigger and an ``ACTION`` line.
+    """
     text = (user_prompt or "").strip()
     if text.lower().startswith("head_swap:"):
         return text
-    action = text or "A person performing the actions shown in the main video area."
-    return (
-        "head_swap:\n\n"
-        "FACE:\n"
-        "Use the identity from the side-panel reference face only.\n\n"
-        f"ACTION:\n{action}"
-    )
+    action = text or "Perform the actions shown in the main video area."
+    return f"head_swap:\n\nFACE:\n\nACTION:\n{action}"
 
 
 def compose_bfs_v3_guide_video(
@@ -99,8 +176,11 @@ def compose_bfs_v3_guide_video(
     chroma_rgb: tuple[int, int, int] = (0, 255, 0),
     face_scale_pct: float = 90.0,
     face_padding_px: int = 12,
+    layout: FaceSwapGuideLayout | None = None,
+    src_width: int | None = None,
+    src_height: int | None = None,
 ) -> FaceSwapGuideLayout:
-    """Build the BFS V3 composite guide clip used as IC-LoRA reference video."""
+    """Build the BFS V3 composite guide clip (Comfy ReservedRegionFrameComposer)."""
     import av
     import numpy as np
     from PIL import Image
@@ -120,17 +200,37 @@ def compose_bfs_v3_guide_video(
     if region_position not in ("left", "right", "top", "bottom"):
         raise ValueError(f"Unsupported region_position: {region_position}")
 
-    region_size_px = int(region_size_px or default_region_size_px(width))
-    if region_position in ("left", "right"):
-        region_size_px = max(1, min(region_size_px, width - 1))
-        region_w, region_h = region_size_px, height
-        video_max_w, video_max_h = width - region_size_px, height
-    else:
-        region_size_px = max(1, min(region_size_px, height - 1))
-        region_w, region_h = width, region_size_px
-        video_max_w, video_max_h = width, height - region_size_px
+    if layout is None:
+        if src_width is None or src_height is None:
+            with av.open(str(source_video)) as peek:
+                if not peek.streams.video:
+                    raise RuntimeError(f"No video stream in {source_video}")
+                first = next(peek.decode(peek.streams.video[0]))
+                rgb = first.reformat(format="rgb24")
+                arr = np.asarray(rgb.to_ndarray(), dtype=np.uint8)
+                src_height, src_width = arr.shape[:2]
+        layout = compute_bfs_guide_layout(
+            width,
+            height,
+            src_width=int(src_width),
+            src_height=int(src_height),
+            region_size_px=region_size_px,
+            region_position=region_position,
+        )
 
-    fitted_video_w, fitted_video_h = _fit_inside(width, height, video_max_w, video_max_h)
+    region_size_px = layout.region_size_px
+    region_position = layout.region_position
+    fitted_video_w, fitted_video_h = layout.video_w, layout.video_h
+    video_x, video_y = layout.video_x, layout.video_y
+
+    if region_position in ("left", "right"):
+        region_w, region_h = region_size_px, height
+        region_x = 0 if region_position == "left" else width - region_size_px
+        region_y = 0
+    else:
+        region_w, region_h = width, region_size_px
+        region_x = 0
+        region_y = 0 if region_position == "top" else height - region_size_px
 
     with Image.open(identity_image) as im:
         face = _add_white_padding(im.convert("RGBA"))
@@ -141,19 +241,6 @@ def compose_bfs_v3_guide_video(
         face_scale_pct=face_scale_pct,
         face_padding_px=face_padding_px,
     )
-
-    if region_position == "left":
-        region_x, region_y = 0, 0
-        video_x, video_y = region_size_px, (height - fitted_video_h) // 2
-    elif region_position == "right":
-        region_x, region_y = width - region_size_px, 0
-        video_x, video_y = 0, (height - fitted_video_h) // 2
-    elif region_position == "top":
-        region_x, region_y = 0, 0
-        video_x, video_y = (width - fitted_video_w) // 2, region_size_px
-    else:
-        region_x, region_y = 0, height - region_size_px
-        video_x, video_y = (width - fitted_video_w) // 2, 0
 
     local_x = face_padding_px + _aligned_offset(
         max(1, region_w - 2 * face_padding_px),
@@ -188,10 +275,12 @@ def compose_bfs_v3_guide_video(
                 break
             rgb = frame.reformat(format="rgb24")
             arr = np.asarray(rgb.to_ndarray(), dtype=np.uint8)
-            frame_pil = Image.fromarray(arr, mode="RGB").resize(
-                (fitted_video_w, fitted_video_h),
-                Image.Resampling.LANCZOS,
-            )
+            frame_pil = Image.fromarray(arr, mode="RGB")
+            if frame_pil.size != (fitted_video_w, fitted_video_h):
+                frame_pil = frame_pil.resize(
+                    (fitted_video_w, fitted_video_h),
+                    Image.Resampling.LANCZOS,
+                )
             canvas = Image.new("RGBA", (width, height), (0, 0, 0, 255))
             region_img = Image.new("RGBA", (region_w, region_h), chroma_rgba)
             canvas.paste(region_img, (region_x, region_y))
@@ -224,16 +313,6 @@ def compose_bfs_v3_guide_video(
         for packet in out_stream.encode(None):
             vout.mux(packet)
 
-    layout = FaceSwapGuideLayout(
-        region_size_px=region_size_px,
-        region_position=region_position,
-        video_x=video_x,
-        video_y=video_y,
-        video_w=fitted_video_w,
-        video_h=fitted_video_h,
-        frame_w=width,
-        frame_h=height,
-    )
     log.info(
         "Face swap: BFS V3 composite guide %dx%d (%d frames) region=%s %dpx video@%d,%d",
         width,
@@ -245,6 +324,80 @@ def compose_bfs_v3_guide_video(
         video_y,
     )
     return layout
+
+
+def extract_bfs_guide_keyframe_images(
+    guide_video: str | Path,
+    tmpdir: str | Path,
+    *,
+    num_frames: int,
+    interval: int = DEFAULT_BFS_GUIDE_KEYFRAME_INTERVAL,
+    strength: float = 1.0,
+    crf: int = 33,
+) -> list[tuple[str, int, float, int]]:
+    """Sample composite guide frames for AddGuideMulti-style keyframe conditioning."""
+    import av
+    import numpy as np
+    from PIL import Image
+
+    guide_video = Path(guide_video)
+    tmpdir = Path(tmpdir)
+    tmpdir.mkdir(parents=True, exist_ok=True)
+
+    interval = max(1, int(interval))
+    num_frames = max(1, int(num_frames))
+    target_indices = list(range(0, num_frames, interval))
+    if num_frames > 1 and (num_frames - 1) not in target_indices:
+        target_indices.append(num_frames - 1)
+    indices_set = set(target_indices)
+
+    extracted: list[tuple[str, int, float, int]] = []
+    with av.open(str(guide_video)) as container:
+        if not container.streams.video:
+            raise RuntimeError(f"No video stream in {guide_video}")
+        stream = container.streams.video[0]
+        for frame_idx, frame in enumerate(container.decode(stream)):
+            if frame_idx >= num_frames:
+                break
+            if frame_idx not in indices_set:
+                continue
+            rgb = frame.reformat(format="rgb24")
+            arr = np.asarray(rgb.to_ndarray(), dtype=np.uint8)
+            out_path = tmpdir / f"bfs_guide_kf_{frame_idx:05d}.png"
+            Image.fromarray(arr, mode="RGB").save(out_path)
+            extracted.append((str(out_path), frame_idx, float(strength), int(crf)))
+
+    if not extracted:
+        raise RuntimeError(f"No keyframes extracted from BFS guide video {guide_video}")
+
+    log.info(
+        "Face swap: extracted %d composite guide keyframes (interval=%d) "
+        "for AddGuideMulti-style conditioning",
+        len(extracted),
+        interval,
+    )
+    return extracted
+
+
+def extract_bfs_guide_keyframe_at_index(
+    guide_video: str | Path,
+    tmpdir: str | Path,
+    *,
+    frame_idx: int = 0,
+    crf: int = 33,
+) -> tuple[str, int]:
+    """Extract one composite guide frame for ``LTXVAddGuideMulti`` (BFS V3 uses frame 0)."""
+    items = extract_bfs_guide_keyframe_images(
+        guide_video,
+        tmpdir,
+        num_frames=max(1, int(frame_idx) + 1),
+        interval=max(1, int(frame_idx) + 1),
+        crf=crf,
+    )
+    for path, idx, *_ in items:
+        if idx == frame_idx:
+            return path, idx
+    return items[0][0], items[0][1]
 
 
 def crop_face_swap_output_to_main_video(
