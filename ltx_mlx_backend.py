@@ -1642,7 +1642,7 @@ def _run_face_swap_generation(
 
     log.info(
         "Face swap invoke: FaceSwapPipeline lora=%s guide=%s (%dx%d, %d frames) "
-        "frame0_anchor=yes stage2_lora=yes",
+        "guide_vae_init=yes ic_ref_append=no frame0_anchor=yes stage2_lora=yes",
         resolved_loras[0][0],
         guide_path,
         width,

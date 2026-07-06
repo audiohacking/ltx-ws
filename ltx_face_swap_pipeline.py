@@ -1,14 +1,15 @@
 """BFS V3 face swap pipeline for MLX.
 
-Comfy BFS V3 uses dev UNet + ``LTXVAddGuideMulti`` + ``LTXVCropGuides``. MLX has no
-AddGuideMulti port; this pipeline extends :class:`ICLoraPipeline` like LipDub:
+Comfy BFS V3 VAE-encodes the composite guide and denoises with the head-swap LoRA.
+IC-LoRA ``VideoConditionByReferenceLatent`` append would preserve/copy the guide
+pixels (including the original face in the main panel) — wrong for face swap.
 
-- Composite guide → IC-LoRA ``video_conditioning`` (full sequence)
-- Frame-0 composite → ``VideoConditionByLatentIndex`` (AddGuide frame 0)
-- **Stage 2 keeps the head-swap LoRA fused** (stock IC-LoRA reloads clean weights)
-- **Stage 2 re-appends composite video conditioning** (stock IC-LoRA drops it)
+This pipeline instead:
 
-Guide composition and canvas sizing live in ``ltx_face_swap_compose``.
+- VAE-encodes the composite guide as the denoising starting latent (retake-style)
+- Applies frame-0 composite image conditioning (AddGuide frame 0)
+- Keeps head-swap LoRA fused through stage 2 (LipDub pattern)
+- Does **not** append IC-LoRA reference tokens
 """
 
 from __future__ import annotations
@@ -18,12 +19,15 @@ import logging
 import mlx.core as mx
 
 from ltx_core_mlx.components.patchifiers import compute_video_latent_shape
+from ltx_core_mlx.conditioning.types.latent_cond import LatentState, noise_latent_state
 from ltx_core_mlx.model.transformer.model import X0Model
+from ltx_core_mlx.utils.ffmpeg import probe_video_info
 from ltx_core_mlx.utils.memory import aggressive_cleanup
 from ltx_core_mlx.utils.positions import compute_audio_positions, compute_audio_token_count, compute_video_positions
+from ltx_core_mlx.utils.video import load_video_frames_normalized
 from ltx_pipelines_mlx.ic_lora import ICLoraPipeline
 from ltx_pipelines_mlx.scheduler import DISTILLED_SIGMAS, STAGE_2_SIGMAS
-from ltx_pipelines_mlx.utils.helpers import create_noised_state
+from ltx_pipelines_mlx.utils.helpers import create_noised_state, state_with_conditionings
 from ltx_pipelines_mlx.utils.samplers import denoise_loop
 
 logger = logging.getLogger(__name__)
@@ -31,8 +35,93 @@ logger = logging.getLogger(__name__)
 _mx_eval = getattr(mx, "eval")  # noqa: B009
 
 
+def _vae_compatible_frame_count(num_frames: int, source_num_frames: int) -> int:
+    max_frames = min(int(num_frames), int(source_num_frames))
+    k = max(1, (max_frames - 1) // 8)
+    return 1 + k * 8
+
+
+def _encode_guide_video_tokens(
+    guide_path: str,
+    *,
+    video_encoder,
+    video_patchifier,
+    height: int,
+    width: int,
+    num_frames: int,
+) -> tuple[mx.array, tuple[int, int, int]]:
+    """VAE-encode the BFS composite guide to generation tokens (Comfy VAEEncode path)."""
+    info = probe_video_info(guide_path)
+    vae_frames = _vae_compatible_frame_count(num_frames, info.num_frames)
+    _, H_lat, W_lat = compute_video_latent_shape(num_frames, height, width)
+    enc_h = H_lat * 32
+    enc_w = W_lat * 32
+
+    video = load_video_frames_normalized(guide_path, enc_h, enc_w, vae_frames)
+    video = (video * 2.0 - 1.0).astype(mx.bfloat16)
+    encoded = video_encoder.encode(video)
+    _mx_eval(encoded)
+
+    tokens, _ = video_patchifier.patchify(encoded)
+    F = int(encoded.shape[2])
+    H = int(encoded.shape[3])
+    W = int(encoded.shape[4])
+    return tokens, (F, H, W)
+
+
+def _frame_image_conditionings(
+    images,
+    *,
+    enc_h: int,
+    enc_w: int,
+    spatial_dims: tuple[int, int, int],
+    video_encoder,
+    frame_rate: float,
+) -> list:
+    """Frame-0 / keyframe anchors only — no IC-LoRA reference append."""
+    if not images:
+        return []
+    from ltx_pipelines_mlx.utils._orchestration import combined_image_conditionings
+    from ltx_pipelines_mlx.utils.args import ImageConditioningInput
+
+    normalized = [
+        img if isinstance(img, ImageConditioningInput) else ImageConditioningInput(*img) for img in images
+    ]
+    return combined_image_conditionings(
+        normalized,
+        enc_h=enc_h,
+        enc_w=enc_w,
+        spatial_dims=spatial_dims,
+        video_encoder=video_encoder,
+        frame_rate=frame_rate,
+    )
+
+
+def _noised_video_state_from_guide(
+    guide_tokens: mx.array,
+    *,
+    spatial_dims: tuple[int, int, int],
+    positions: mx.array,
+    image_conditionings: list,
+    seed: int,
+    sigma: float = 1.0,
+) -> LatentState:
+    """Build a fully-denoisable state from encoded guide latents (retake-style)."""
+    dtype = mx.bfloat16
+    denoise_mask = mx.ones((1, guide_tokens.shape[1], 1), dtype=dtype)
+    state = LatentState(
+        latent=guide_tokens,
+        clean_latent=guide_tokens,
+        denoise_mask=denoise_mask,
+        positions=positions,
+    )
+    if image_conditionings:
+        state = state_with_conditionings(state, image_conditionings, spatial_dims)
+    return noise_latent_state(state, sigma=sigma, seed=seed)
+
+
 class FaceSwapPipeline(ICLoraPipeline):
-    """BFS head-swap: IC-LoRA composite guide with LipDub-style stage-2 conditioning."""
+    """BFS head-swap: encoded composite init + head-swap LoRA (no IC ref append)."""
 
     def __init__(
         self,
@@ -68,14 +157,16 @@ class FaceSwapPipeline(ICLoraPipeline):
         conditioning_attention_strength: float = 1.0,
         skip_stage_2: bool = False,
     ) -> tuple[mx.array, mx.array]:
-        """Generate with BFS composite guide; stage 2 retains LoRA + video ref."""
+        """Denoise from VAE-encoded composite guide; head-swap LoRA transforms identity."""
+        del conditioning_attention_strength  # IC ref append disabled for face swap
         if not video_conditioning:
             raise ValueError("Face swap requires composite guide video_conditioning")
-        if not (0.0 <= conditioning_attention_strength <= 1.0):
-            raise ValueError(
-                f"conditioning_attention_strength must be in [0.0, 1.0], "
-                f"got {conditioning_attention_strength}"
-            )
+
+        guide_path = str(video_conditioning[0][0])
+        logger.info(
+            "Face swap pipeline: VAE-encode guide init from %s (no IC-LoRA ref append)",
+            guide_path,
+        )
 
         self._load_text_encoder()
         video_embeds, audio_embeds = self._encode_text(prompt)
@@ -92,36 +183,43 @@ class FaceSwapPipeline(ICLoraPipeline):
 
         half_h, half_w = height // 2, width // 2
         F, H_half, W_half = compute_video_latent_shape(num_frames, half_h, half_w)
-        video_shape = (1, F * H_half * W_half, 128)
         audio_T = compute_audio_token_count(num_frames, frame_rate=frame_rate)
         audio_shape = (1, audio_T, 128)
 
-        video_positions_1 = compute_video_positions(F, H_half, W_half, frame_rate=frame_rate)
-        audio_positions = compute_audio_positions(audio_T)
-
-        stage_1_conditionings = self._create_conditionings(
-            images=images,
-            video_conditioning=video_conditioning,
+        guide_tokens_1, spatial_1 = _encode_guide_video_tokens(
+            guide_path,
+            video_encoder=self.vae_encoder,
+            video_patchifier=self.video_patchifier,
             height=half_h,
             width=half_w,
             num_frames=num_frames,
-            frame_rate=frame_rate,
-            conditioning_attention_strength=conditioning_attention_strength,
         )
+        F1, H1, W1 = spatial_1
+        enc_h_half = H1 * 32
+        enc_w_half = W1 * 32
+        video_positions_1 = compute_video_positions(F1, H1, W1, frame_rate=frame_rate)
+        audio_positions = compute_audio_positions(audio_T)
 
-        video_state = create_noised_state(
-            base_shape=video_shape,
-            conditionings=stage_1_conditionings,
-            spatial_dims=(F, H_half, W_half),
+        image_conds_1 = _frame_image_conditionings(
+            images,
+            enc_h=enc_h_half,
+            enc_w=enc_w_half,
+            spatial_dims=(F1, H1, W1),
+            video_encoder=self.vae_encoder,
+            frame_rate=frame_rate,
+        )
+        video_state = _noised_video_state_from_guide(
+            guide_tokens_1,
+            spatial_dims=(F1, H1, W1),
             positions=video_positions_1,
+            image_conditionings=image_conds_1,
             seed=seed,
             sigma=1.0,
-            initial_latent=None,
         )
         audio_state = create_noised_state(
             base_shape=audio_shape,
             conditionings=[],
-            spatial_dims=(F, H_half, W_half),
+            spatial_dims=(F1, H1, W1),
             positions=audio_positions,
             seed=seed + 1,
             sigma=1.0,
@@ -142,8 +240,8 @@ class FaceSwapPipeline(ICLoraPipeline):
         if self.low_memory:
             aggressive_cleanup()
 
-        gen_tokens = output_1.video_latent[:, : F * H_half * W_half, :]
-        video_half = self.video_patchifier.unpatchify(gen_tokens, (F, H_half, W_half))
+        gen_tokens = output_1.video_latent[:, : F1 * H1 * W1, :]
+        video_half = self.video_patchifier.unpatchify(gen_tokens, (F1, H1, W1))
 
         if skip_stage_2:
             audio_latent = self.audio_patchifier.unpatchify(output_1.audio_latent)
@@ -159,20 +257,18 @@ class FaceSwapPipeline(ICLoraPipeline):
         video_upscaled = video_up_mlx.transpose(0, 4, 1, 2, 3)
         _mx_eval(video_upscaled)
 
-        H_full = H_half * 2
-        W_full = W_half * 2
+        H_full = H1 * 2
+        W_full = W1 * 2
         enc_h_full = H_full * 32
         enc_w_full = W_full * 32
 
-        # Stage 2: keep head-swap LoRA + composite IC ref (LipDub pattern).
-        stage_2_conditionings = self._create_conditionings(
-            images=images,
-            video_conditioning=video_conditioning,
-            height=height,
-            width=width,
-            num_frames=num_frames,
+        image_conds_2 = _frame_image_conditionings(
+            images,
+            enc_h=enc_h_full,
+            enc_w=enc_w_full,
+            spatial_dims=(F1, H_full, W_full),
+            video_encoder=self.vae_encoder,
             frame_rate=frame_rate,
-            conditioning_attention_strength=conditioning_attention_strength,
         )
 
         if self.low_memory:
@@ -182,12 +278,12 @@ class FaceSwapPipeline(ICLoraPipeline):
         video_tokens_up, _ = self.video_patchifier.patchify(video_upscaled)
         sigmas_2 = STAGE_2_SIGMAS[: stage2_steps + 1] if stage2_steps else STAGE_2_SIGMAS
         start_sigma = sigmas_2[0]
-        video_positions_2 = compute_video_positions(F, H_full, W_full, frame_rate=frame_rate)
+        video_positions_2 = compute_video_positions(F1, H_full, W_full, frame_rate=frame_rate)
 
         video_state_2 = create_noised_state(
             base_shape=video_tokens_up.shape,
-            conditionings=stage_2_conditionings,
-            spatial_dims=(F, H_full, W_full),
+            conditionings=image_conds_2,
+            spatial_dims=(F1, H_full, W_full),
             positions=video_positions_2,
             seed=seed + 2,
             sigma=start_sigma,
@@ -199,7 +295,7 @@ class FaceSwapPipeline(ICLoraPipeline):
         audio_state_2 = create_noised_state(
             base_shape=audio_tokens_1.shape,
             conditionings=[],
-            spatial_dims=(F, H_full, W_full),
+            spatial_dims=(F1, H_full, W_full),
             positions=audio_positions,
             seed=seed + 2,
             sigma=start_sigma,
@@ -219,8 +315,8 @@ class FaceSwapPipeline(ICLoraPipeline):
             aggressive_cleanup()
 
         video_latent = self.video_patchifier.unpatchify(
-            output_2.video_latent[:, : F * H_full * W_full, :],
-            (F, H_full, W_full),
+            output_2.video_latent[:, : F1 * H_full * W_full, :],
+            (F1, H_full, W_full),
         )
         audio_latent = self.audio_patchifier.unpatchify(output_2.audio_latent)
         return video_latent, audio_latent
@@ -279,4 +375,8 @@ class FaceSwapPipeline(ICLoraPipeline):
         return result
 
 
-__all__ = ["FaceSwapPipeline"]
+__all__ = [
+    "FaceSwapPipeline",
+    "_encode_guide_video_tokens",
+    "_noised_video_state_from_guide",
+]

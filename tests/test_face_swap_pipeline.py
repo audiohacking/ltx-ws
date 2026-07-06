@@ -12,6 +12,15 @@ def test_resolve_face_swap_canvas_exports():
     assert w % 32 == 0 and h % 32 == 0
 
 
+def test_face_swap_pipeline_avoids_ic_ref_append_in_source():
+    from pathlib import Path
+
+    src = Path("ltx_face_swap_pipeline.py").read_text(encoding="utf-8")
+    assert "append_ic_lora_reference_video_conditionings" not in src
+    assert "_encode_guide_video_tokens" in src
+    assert "_noised_video_state_from_guide" in src
+
+
 def test_face_swap_pipeline_class_exports():
     from ltx_face_swap_pipeline import FaceSwapPipeline
     from ltx_pipelines_mlx.ic_lora import ICLoraPipeline
