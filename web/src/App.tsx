@@ -2120,7 +2120,8 @@ export default function App() {
                       <span className="media-panel-title">Face swap inputs</span>
                       <p className="hint hint-inline">
                         Replace the face in your reference video with the identity image.
-                        Audio from the reference clip is preserved when present.
+                        Uses the BFS V3 composite guide (green side panel + face) required by
+                        the head-swap LoRA. Audio from the reference clip is preserved when present.
                         LoRA:{" "}
                         <a
                           href="https://www.runcomfy.com/comfyui-workflows/ltx-2-3-video-face-swap-in-comfyui-realistic-face-replacement-workflow"

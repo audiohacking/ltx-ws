@@ -1,4 +1,4 @@
-"""Face swap uses IC-LoRA (not LipDub) with a trimmed motion reference."""
+"""Face swap uses BFS V3 composite guide video for IC-LoRA conditioning."""
 
 from __future__ import annotations
 
@@ -9,27 +9,59 @@ from unittest.mock import patch
 import pytest
 
 
-def test_prepare_face_swap_reference_trims_to_requested_frames(tmp_path: Path):
-    pytest.importorskip("av")
-    from ltx_mlx_backend import _prepare_face_swap_reference_video
+def test_format_head_swap_prompt_wraps_plain_text():
+    from ltx_face_swap_compose import format_head_swap_prompt
+
+    out = format_head_swap_prompt("person talking to camera")
+    assert out.startswith("head_swap:")
+    assert "FACE:" in out
+    assert "ACTION:" in out
+    assert "person talking to camera" in out
+
+
+def test_format_head_swap_prompt_preserves_existing_trigger():
+    from ltx_face_swap_compose import format_head_swap_prompt
+
+    original = "head_swap:\n\nFACE:\nBlue eyes.\n\nACTION:\nWaves."
+    assert format_head_swap_prompt(original) == original
+
+
+def test_prepare_face_swap_guide_trims_and_composes(tmp_path: Path):
+    from ltx_mlx_backend import _prepare_face_swap_guide_video
 
     ref = tmp_path / "ref.mp4"
-    ref.write_bytes(b"placeholder")
+    face = tmp_path / "face.png"
+    ref.write_bytes(b"mp4")
+    face.write_bytes(b"png")
+
+    layout_obj = type(
+        "Layout",
+        (),
+        {
+            "region_size_px": 200,
+            "region_position": "left",
+            "video_x": 200,
+            "video_y": 0,
+            "video_w": 280,
+            "video_h": 704,
+            "frame_w": 480,
+            "frame_h": 704,
+        },
+    )()
 
     with patch("ltx_media.probe_video_info") as probe, patch(
         "ltx_media.trim_video_to_spec"
-    ) as trim:
-        probe.return_value = type(
-            "Info",
-            (),
-            {"num_frames": 889, "fps": 30.0},
-        )()
-        trim.side_effect = lambda _src, dst, **_: Path(dst).write_bytes(b"trimmed") or Path(
-            dst
-        )
+    ) as trim, patch("ltx_face_swap_compose.compose_bfs_v3_guide_video") as compose, patch(
+        "ltx_media.normalize_video_for_ic_lora_reference",
+        return_value=121,
+    ) as normalize:
+        probe.return_value = type("Info", (), {"num_frames": 889, "fps": 30.0})()
+        trim.side_effect = lambda _src, dst, **_: Path(dst).write_bytes(b"trimmed") or Path(dst)
+        compose.return_value = layout_obj
 
-        out = _prepare_face_swap_reference_video(
+        guide_path, layout, effective_nf = _prepare_face_swap_guide_video(
             str(ref),
+            str(face),
             tmpdir=str(tmp_path),
             num_frames=121,
             width=480,
@@ -38,11 +70,21 @@ def test_prepare_face_swap_reference_trims_to_requested_frames(tmp_path: Path):
         )
 
     trim.assert_called_once()
-    assert trim.call_args.kwargs["num_frames"] == 121
-    assert trim.call_args.kwargs["width"] == 480
-    assert trim.call_args.kwargs["height"] == 704
-    assert trim.call_args.kwargs["fps"] == 24.0
-    assert out.endswith("face_swap_ref_trimmed.mp4")
+    compose.assert_called_once()
+    normalize.assert_called_once()
+    assert compose.call_args.args[1] == str(face)
+    assert compose.call_args.kwargs["num_frames"] == 121
+    assert guide_path.endswith("face_swap_bfs_v3_guide_norm.mp4")
+    assert layout is layout_obj
+    assert effective_nf == 121
+
+
+def test_ic_lora_vae_compatible_frame_count():
+    from ltx_media import ic_lora_vae_compatible_frame_count
+
+    assert ic_lora_vae_compatible_frame_count(121) == 121
+    assert ic_lora_vae_compatible_frame_count(121, source_num_frames=2) == 9
+    assert ic_lora_vae_compatible_frame_count(25) == 25
 
 
 def test_head_swap_lora_skips_pose_preprocess():
@@ -55,10 +97,10 @@ def test_head_swap_lora_skips_pose_preprocess():
     )
     with patch("ltx_mlx_backend._ic_lora_reference_downscale_factor", return_value=1):
         with patch("ltx_mlx_backend._ic_lora_uses_hdr_pipeline", return_value=False):
-            assert not _needs_pose_control_preprocessing([lora], [("ref.mp4", 1.0)])
+            assert not _needs_pose_control_preprocessing([lora], [("guide.mp4", 1.0)])
 
 
-def _write_h264_mp4(path: Path, *, frames: int = 25, fps: float = 24.0) -> None:
+def _write_h264_mp4(path: Path, *, frames: int = 25, fps: float = 24.0, width: int = 128, height: int = 96) -> None:
     pytest.importorskip("av")
     import av
 
@@ -66,17 +108,51 @@ def _write_h264_mp4(path: Path, *, frames: int = 25, fps: float = 24.0) -> None:
 
     fps_frac = ltx_media._pyav_frame_rate(fps)
     with av.open(str(path), "w") as container:
-        stream = container.add_stream("libx264", rate=fps_frac, width=128, height=96)
+        stream = container.add_stream("libx264", rate=fps_frac, width=width, height=height)
         stream.pix_fmt = "yuv420p"
         stream.options = {"crf": "18"}
         stream.time_base = Fraction(fps_frac.denominator, fps_frac.numerator)
         for i in range(frames):
-            frame = av.VideoFrame(128, 96, "yuv420p")
+            frame = av.VideoFrame(width, height, "yuv420p")
             frame.pts = i
             for packet in stream.encode(frame):
                 container.mux(packet)
         for packet in stream.encode(None):
             container.mux(packet)
+
+
+def test_compose_bfs_v3_guide_video_writes_frames(tmp_path: Path):
+    pytest.importorskip("av")
+    from PIL import Image
+
+    from ltx_face_swap_compose import compose_bfs_v3_guide_video
+
+    src = tmp_path / "src.mp4"
+    face = tmp_path / "face.png"
+    out = tmp_path / "guide.mp4"
+    _write_h264_mp4(src, frames=9, fps=24.0, width=320, height=240)
+    Image.new("RGB", (256, 256), color=(200, 120, 80)).save(face)
+
+    layout = compose_bfs_v3_guide_video(
+        src,
+        face,
+        out,
+        width=320,
+        height=240,
+        num_frames=9,
+        fps=24.0,
+        region_size_px=96,
+    )
+    assert out.is_file() and out.stat().st_size > 0
+    assert layout.region_position == "left"
+    assert layout.video_x == layout.region_size_px
+
+    import av
+
+    with av.open(str(out)) as container:
+        stream = container.streams.video[0]
+        frames = sum(1 for _ in container.decode(stream))
+    assert frames == 9
 
 
 def test_trim_video_to_spec_limits_frames(tmp_path: Path):

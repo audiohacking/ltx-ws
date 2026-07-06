@@ -834,6 +834,7 @@ def trim_video_to_spec(
     next_pick = 0.0
     decoded_index = 0
     started = start_seconds <= 0.0
+    last_arr: Any | None = None
 
     with av.open(str(src)) as vin, av.open(str(dst), "w") as out:
         if not vin.streams.video:
@@ -871,6 +872,7 @@ def trim_video_to_spec(
 
             rgb = frame.reformat(width=pad_w, height=pad_h, format="rgb24")
             arr = np.asarray(rgb.to_ndarray(), dtype=np.uint8)
+            last_arr = arr
             out_frame = av.VideoFrame.from_ndarray(arr, format="rgb24")
             out_frame = out_frame.reformat(format="yuv420p")
             out_frame.pts = frames_written
@@ -882,12 +884,112 @@ def trim_video_to_spec(
         if frames_written == 0:
             raise RuntimeError(f"No frames written trimming {src}")
 
+        while frames_written < num_frames and last_arr is not None:
+            out_frame = av.VideoFrame.from_ndarray(last_arr, format="rgb24")
+            out_frame = out_frame.reformat(format="yuv420p")
+            out_frame.pts = frames_written
+            for packet in out_stream.encode(out_frame):
+                out.mux(packet)
+            frames_written += 1
+
         for packet in out_stream.encode(None):
             out.mux(packet)
 
     if not dst.is_file() or dst.stat().st_size == 0:
         raise RuntimeError(f"Video trim produced empty output: {dst}")
     return dst
+
+
+def count_video_frames(path: str | Path) -> int:
+    """Count decoded video frames (more reliable than container metadata alone)."""
+    require_media()
+    path = Path(path)
+    with av.open(str(path)) as container:
+        if not container.streams.video:
+            raise RuntimeError(f"No video stream in {path}")
+        stream = container.streams.video[0]
+        if stream.frames:
+            return int(stream.frames)
+        return sum(1 for _ in container.decode(stream))
+
+
+def ic_lora_vae_compatible_frame_count(
+    num_frames: int,
+    *,
+    source_num_frames: int | None = None,
+) -> int:
+    """Match ``ltx_pipelines_mlx.iclora_utils.append_ic_lora_reference_video_conditionings``."""
+    max_frames = max(1, int(num_frames))
+    if source_num_frames is not None:
+        max_frames = min(max_frames, max(1, int(source_num_frames)))
+    k = max(1, (max_frames - 1) // 8)
+    return 1 + k * 8
+
+
+def normalize_video_for_ic_lora_reference(
+    src: str | Path,
+    dst: str | Path,
+    *,
+    num_frames: int,
+    width: int,
+    height: int,
+    fps: float,
+) -> int:
+    """Re-encode ``src`` to exactly ``vae_frames`` (1+8k), padding with the last frame."""
+    import numpy as np
+
+    require_media()
+    src = Path(src)
+    dst = Path(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    width = int(width)
+    height = int(height)
+    pad_w = width + (width & 1)
+    pad_h = height + (height & 1)
+    fps_frac = _pyav_frame_rate(fps)
+    target_frames = max(1, int(num_frames))
+    decoded: list[Any] = []
+
+    with av.open(str(src)) as vin:
+        if not vin.streams.video:
+            raise RuntimeError(f"No video stream in {src}")
+        stream = vin.streams.video[0]
+        for frame in vin.decode(stream):
+            if len(decoded) >= target_frames:
+                break
+            rgb = frame.reformat(width=pad_w, height=pad_h, format="rgb24")
+            decoded.append(np.asarray(rgb.to_ndarray(), dtype=np.uint8))
+
+    if not decoded:
+        raise RuntimeError(f"No frames decoded from {src}")
+
+    source_count = len(decoded)
+    vae_frames = ic_lora_vae_compatible_frame_count(
+        target_frames,
+        source_num_frames=source_count,
+    )
+    while len(decoded) < vae_frames:
+        decoded.append(decoded[-1].copy())
+
+    with av.open(str(dst), "w") as out:
+        out_stream = out.add_stream(
+            "libx264", rate=fps_frac, width=pad_w, height=pad_h
+        )
+        out_stream.pix_fmt = "yuv420p"
+        out_stream.options = {"crf": "18", "preset": "veryfast"}
+        out_stream.time_base = Fraction(fps_frac.denominator, fps_frac.numerator)
+        for idx, arr in enumerate(decoded[:vae_frames]):
+            out_frame = av.VideoFrame.from_ndarray(arr, format="rgb24")
+            out_frame = out_frame.reformat(format="yuv420p")
+            out_frame.pts = idx
+            for packet in out_stream.encode(out_frame):
+                out.mux(packet)
+        for packet in out_stream.encode(None):
+            out.mux(packet)
+
+    if not dst.is_file() or dst.stat().st_size == 0:
+        raise RuntimeError(f"IC-LoRA reference normalize produced empty output: {dst}")
+    return vae_frames
 
 
 def encode_single_frame(

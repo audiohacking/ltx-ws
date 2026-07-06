@@ -54,3 +54,5 @@ def test_face_swap_mode_is_not_lipdub():
     assert '"lipdub"' not in face_block
     assert "_invoke_lipdub_style" not in face_block
     assert "_run_ic_lora_generation" in face_block
+    assert "compose_bfs_v3_guide_video" in src
+    assert "tmp_image=None" in face_block

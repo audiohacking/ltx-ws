@@ -1402,40 +1402,77 @@ def _invoke_lipdub_style(
     _invoke_generate_and_save(pipe, **lip_kwargs)
 
 
-def _prepare_face_swap_reference_video(
+def _prepare_face_swap_guide_video(
     reference_path: str,
+    identity_image: str,
     *,
     tmpdir: str,
     num_frames: int,
     width: int,
     height: int,
     fps: float,
-) -> str:
-    """Trim/resize reference footage to the requested clip length for IC-LoRA face swap."""
-    from ltx_media import media_available, probe_video_info, trim_video_to_spec
+) -> tuple[str, Any, int]:
+    """Trim reference footage and build the BFS V3 composite IC-LoRA guide clip."""
+    from ltx_face_swap_compose import FaceSwapGuideLayout, compose_bfs_v3_guide_video
+    from ltx_media import (
+        ic_lora_vae_compatible_frame_count,
+        media_available,
+        normalize_video_for_ic_lora_reference,
+        probe_video_info,
+        trim_video_to_spec,
+    )
 
     if not media_available():
-        raise RuntimeError("face_swap requires PyAV to prepare reference video (pip install av)")
+        raise RuntimeError("face_swap requires PyAV to prepare guide video (pip install av)")
 
     info = probe_video_info(reference_path)
+    vae_frames = ic_lora_vae_compatible_frame_count(
+        num_frames,
+        source_num_frames=info.num_frames,
+    )
+    if vae_frames != num_frames:
+        log.info(
+            "Face swap: adjusting target frames %d -> %d for IC-LoRA VAE (1+8k)",
+            num_frames,
+            vae_frames,
+        )
     trimmed_path = os.path.join(tmpdir, "face_swap_ref_trimmed.mp4")
-    if info.num_frames > num_frames or abs(info.fps - fps) > 0.05:
+    if info.num_frames > vae_frames or abs(info.fps - fps) > 0.05:
         log.info(
             "Face swap: trimming reference video %d frames at %.1f fps -> %d frames at %.1f fps",
             info.num_frames,
             info.fps,
-            num_frames,
+            vae_frames,
             fps,
         )
     trim_video_to_spec(
         reference_path,
         trimmed_path,
-        num_frames=num_frames,
+        num_frames=vae_frames,
         width=width,
         height=height,
         fps=fps,
     )
-    return trimmed_path
+    guide_path = os.path.join(tmpdir, "face_swap_bfs_v3_guide.mp4")
+    layout = compose_bfs_v3_guide_video(
+        trimmed_path,
+        identity_image,
+        guide_path,
+        width=width,
+        height=height,
+        num_frames=vae_frames,
+        fps=fps,
+    )
+    normalized_path = os.path.join(tmpdir, "face_swap_bfs_v3_guide_norm.mp4")
+    effective_nf = normalize_video_for_ic_lora_reference(
+        guide_path,
+        normalized_path,
+        num_frames=vae_frames,
+        width=width,
+        height=height,
+        fps=fps,
+    )
+    return normalized_path, layout, effective_nf
 
 
 def _run_ic_lora_generation(
@@ -2458,41 +2495,68 @@ class LocalVideoGenerator:
                             raise RuntimeError("face_swap mode requires face identity image")
                         if len(resolved_loras) != 1:
                             raise RuntimeError("face_swap mode requires exactly one LoRA spec")
+                        from ltx_face_swap_compose import (
+                            crop_face_swap_output_to_main_video,
+                            format_head_swap_prompt,
+                        )
+
                         ref_scale = 1.0
                         if vc_items:
                             ref_path, ref_scale = vc_items[0]
                         else:
                             ref_path = tmp_video
-                        trimmed_ref = _prepare_face_swap_reference_video(
+                        guide_path, guide_layout, face_swap_nf = _prepare_face_swap_guide_video(
                             str(ref_path),
+                            tmp_image,
                             tmpdir=tmpdir,
                             num_frames=nf,
                             width=width,
                             height=height,
                             fps=float(self.fps),
                         )
-                        tmp_video_conditioning_cleanup.append(trimmed_ref)
+                        tmp_video_conditioning_cleanup.extend(
+                            [
+                                os.path.join(tmpdir, "face_swap_ref_trimmed.mp4"),
+                                os.path.join(tmpdir, "face_swap_bfs_v3_guide.mp4"),
+                                guide_path,
+                            ]
+                        )
+                        face_swap_prompt = format_head_swap_prompt(effective_prompt)
                         log.info(
-                            "Face swap: IC-LoRA + head-swap LoRA "
-                            "(identity image + %d-frame motion reference)",
-                            nf,
+                            "Face swap: BFS V3 composite guide + IC-LoRA head-swap LoRA "
+                            "(%d frames; identity in chroma side panel, not separate I2V)",
+                            face_swap_nf,
                         )
                         last_pipe = _run_ic_lora_generation(
                             self,
                             req=req,
-                            prompt=effective_prompt,
+                            prompt=face_swap_prompt,
                             resolved_loras=resolved_loras,
-                            vc_items=[(trimmed_ref, float(ref_scale))],
-                            tmp_image=tmp_image,
+                            vc_items=[(guide_path, float(ref_scale))],
+                            tmp_image=None,
                             tmpdir=tmpdir,
                             out_path=out_path,
                             width=width,
                             height=height,
-                            nf=nf,
+                            nf=face_swap_nf,
                             seed=seed,
                             steps=steps,
                             tmp_video_conditioning_cleanup=tmp_video_conditioning_cleanup,
-                            audio_reference_paths=[tmp_video],
+                            audio_reference_paths=None,
+                        )
+                        try:
+                            crop_face_swap_output_to_main_video(out_path, guide_layout)
+                            log.info(
+                                "Face swap: cropped output to main video area %dx%d",
+                                guide_layout.video_w,
+                                guide_layout.video_h,
+                            )
+                        except Exception as exc:
+                            log.warning("Face swap output crop failed (using full frame): %s", exc)
+                        _maybe_preserve_reference_audio(
+                            out_path,
+                            [tmp_video],
+                            job_id=req.job_id,
                         )
                     elif mode == "ic_lora":
                         if not resolved_loras:
