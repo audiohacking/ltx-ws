@@ -348,13 +348,15 @@ def _lora_catalog(output_dir: Path | None = None) -> tuple[list[dict[str, Any]],
 
     if output_dir is not None:
         for entry in _read_custom_loras(output_dir):
+            before = len(presets)
             _add(
                 str(entry["id"]),
                 str(entry["label"]),
                 str(entry["spec"]),
                 float(entry["scale"]),
             )
-            presets[-1]["custom"] = True
+            if len(presets) > before:
+                presets[-1]["custom"] = True
 
     _add(
         "ic_lora_hdr",

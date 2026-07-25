@@ -653,15 +653,14 @@ export default function App() {
       }
       return next;
     });
-    // Ensure download for the submode primary when builtins are in play; customs
-    // are ensured when the user adds/toggles them via toggleLoraPreset.
     void ensureLoraPresets([icLoraPresetId], config?.lora_presets, { interactive: true });
+    // Intentionally omit config.lora_presets: catalog updates (custom add) must not
+    // re-run this sync and wipe or re-force the HDR/Union primary.
   }, [
     mode,
     icLoraPresetId,
     config?.ic_lora_preset_id,
     config?.ic_lora_motion_preset_id,
-    config?.lora_presets,
     ensureLoraPresets,
   ]);
 
@@ -706,10 +705,13 @@ export default function App() {
         if (mode === "ic_lora") {
           const hdrId = config?.ic_lora_preset_id ?? "ic_lora_hdr";
           const motionId = config?.ic_lora_motion_preset_id ?? "ic_lora_union_motion";
-          if (presetId === hdrId && checked) {
-            next = next.filter((id) => id !== motionId);
-          } else if (presetId === motionId && checked) {
-            next = next.filter((id) => id !== hdrId);
+          const isBuiltin = presetId === hdrId || presetId === motionId;
+          if (checked && isBuiltin) {
+            // One IC-LoRA primary: HDR or Union alone (no stacked community adapters).
+            next = [presetId];
+          } else if (checked && !isBuiltin) {
+            // Custom IC-LoRA (CrossView, etc.) replaces HDR/Union as the primary.
+            next = next.filter((id) => id !== hdrId && id !== motionId);
           }
         }
         if (mode === "face_swap" && checked) {
@@ -746,6 +748,7 @@ export default function App() {
       }
       const data = await r.json();
       const nextPresets = data.lora_presets ?? [];
+      const newId = typeof data.id === "string" ? data.id : "";
       loraPresetsRef.current = nextPresets;
       setConfig((c) =>
         c
@@ -757,14 +760,31 @@ export default function App() {
             }
           : c,
       );
-      const ids: string[] = data.preferred_lora_preset_ids ?? [];
-      setLoraPresetIds(ids);
+      // In IC-LoRA / LipDub, the newly added adapter is the one the user wants applied.
+      let nextIds: string[];
+      if ((mode === "ic_lora" || mode === "lipdub") && newId) {
+        nextIds = [newId];
+      } else {
+        nextIds = [...(data.preferred_lora_preset_ids ?? [])];
+        if (newId && !nextIds.includes(newId)) {
+          nextIds.push(newId);
+        }
+      }
+      setLoraPresetIds(nextIds);
+      void persistLoraSelection(nextIds);
       setCustomLoraUrl("");
       setCustomLoraLabel("");
       setCustomLoraScale("1.0");
-      if (data.id) {
-        await ensureLoraPresets([data.id], nextPresets, { interactive: true });
+      if (newId) {
+        await ensureLoraPresets([newId], nextPresets, { interactive: true });
       }
+      const added = nextPresets.find((p: LoraPreset) => p.id === newId);
+      setLoraActivity({
+        phase: "ready",
+        message: added
+          ? `LoRA ready: ${added.label}`
+          : "Custom LoRA added",
+      });
     } catch (e) {
       setLoraActivity({ phase: "error", message: String(e) });
     } finally {
@@ -2267,8 +2287,8 @@ export default function App() {
                         )}
                       </p>
                       <p className="hint hint-inline">
-                        V2V: upload a reference video, keep HDR for default IC-LoRA, or add a
-                        community adapter (e.g.{" "}
+                        V2V: upload a reference video. Default LoRA is HDR; for community
+                        adapters (e.g.{" "}
                         <a
                           href="https://huggingface.co/Cseti/LTX2.3-22B_IC-LoRA-CrossView-Prompt"
                           target="_blank"
@@ -2276,8 +2296,10 @@ export default function App() {
                         >
                           CrossView Prompt
                         </a>
-                        ) as a custom LoRA and uncheck HDR/Union. No character image needed for
-                        video-only adapters.
+                        ), paste the resolve URL below — it is added to the LoRA list and
+                        selected automatically (HDR/Union are cleared). No character image
+                        needed for video-only adapters. Use that adapter&apos;s prompt
+                        vocabulary.
                       </p>
                       <div className="media-upload-row">
                         <label className="media-upload">

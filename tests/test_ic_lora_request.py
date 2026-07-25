@@ -171,6 +171,31 @@ def test_apply_ic_lora_defaults_respects_custom_only_crossview():
     assert IC_LORA_DEFAULT_SPEC not in [row[0] for row in out["lora_specs"]]
 
 
+def test_lora_catalog_includes_custom_entry(tmp_path: Path):
+    from web_ui import _lora_catalog, _write_custom_loras
+
+    crossview = (
+        "https://huggingface.co/Cseti/LTX2.3-22B_IC-LoRA-CrossView-Prompt/"
+        "resolve/main/LTX2.3-22B_IC-LoRA-CrossView-Prompt_v0.9_13700.safetensors"
+    )
+    _write_custom_loras(
+        tmp_path,
+        [
+            {
+                "id": "custom_crossview",
+                "label": "CrossView Prompt",
+                "spec": crossview,
+                "scale": 1.2,
+            }
+        ],
+    )
+    presets, _ = _lora_catalog(tmp_path)
+    match = next(p for p in presets if p["id"] == "custom_crossview")
+    assert match["spec"] == crossview
+    assert match["custom"] is True
+    assert match["scale"] == pytest.approx(1.2)
+
+
 def test_build_params_passes_reference_strength(tmp_path: Path):
     from web_ui import IC_LORA_DEFAULT_SPEC, _build_params_from_request
 
