@@ -194,6 +194,51 @@ def test_lora_catalog_includes_custom_entry(tmp_path: Path):
     assert match["spec"] == crossview
     assert match["custom"] is True
     assert match["scale"] == pytest.approx(1.2)
+    # Customs are listed after builtins so they remain visible at the end of the menu.
+    assert presets.index(match) > presets.index(
+        next(p for p in presets if p["id"] == "ic_lora_hdr")
+    )
+
+
+def test_lora_catalog_keeps_custom_when_spec_matches_builtin(tmp_path: Path):
+    """Custom entries are keyed by id, so a URL that matches a builtin still appears."""
+    from web_ui import IC_LORA_DEFAULT_SPEC, _lora_catalog, _write_custom_loras
+
+    _write_custom_loras(
+        tmp_path,
+        [
+            {
+                "id": "custom_hdr_copy",
+                "label": "My HDR copy",
+                "spec": IC_LORA_DEFAULT_SPEC,
+                "scale": 1.0,
+            }
+        ],
+    )
+    presets, _ = _lora_catalog(tmp_path)
+    ids = [p["id"] for p in presets]
+    assert "ic_lora_hdr" in ids
+    assert "custom_hdr_copy" in ids
+
+
+def test_add_custom_lora_reuses_same_spec(tmp_path: Path):
+    from web_ui import _lora_catalog, _read_custom_loras, _write_custom_loras
+
+    crossview = (
+        "https://huggingface.co/Cseti/LTX2.3-22B_IC-LoRA-CrossView-Prompt/"
+        "resolve/main/LTX2.3-22B_IC-LoRA-CrossView-Prompt_v0.9_13700.safetensors"
+    )
+    _write_custom_loras(
+        tmp_path,
+        [{"id": "custom_abc12345", "label": "Old", "spec": crossview, "scale": 1.0}],
+    )
+
+    # Exercise catalog + read path used by add_custom_lora dedupe.
+    presets, _ = _lora_catalog(tmp_path)
+    assert any(p["id"] == "custom_abc12345" for p in presets)
+    entries = _read_custom_loras(tmp_path)
+    existing = next(e for e in entries if e["spec"] == crossview)
+    assert existing["id"] == "custom_abc12345"
 
 
 def test_build_params_passes_reference_strength(tmp_path: Path):

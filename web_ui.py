@@ -346,18 +346,6 @@ def _lora_catalog(output_dir: Path | None = None) -> tuple[list[dict[str, Any]],
             continue
         _add(f"env_{i}", f"Env LoRA — {_label_for_spec(path)}", path, scale)
 
-    if output_dir is not None:
-        for entry in _read_custom_loras(output_dir):
-            before = len(presets)
-            _add(
-                str(entry["id"]),
-                str(entry["label"]),
-                str(entry["spec"]),
-                float(entry["scale"]),
-            )
-            if len(presets) > before:
-                presets[-1]["custom"] = True
-
     _add(
         "ic_lora_hdr",
         "IC-LoRA HDR",
@@ -383,6 +371,31 @@ def _lora_catalog(output_dir: Path | None = None) -> tuple[list[dict[str, Any]],
         lipdub_spec,
         LIPDUB_DEFAULT_SCALE,
     )
+
+    # Customs last, keyed by unique id so they always appear in the menu even when
+    # the same URL/scale already exists as a builtin or earlier custom entry.
+    if output_dir is not None:
+        existing_ids = {str(p.get("id") or "") for p in presets}
+        for entry in _read_custom_loras(output_dir):
+            eid = str(entry.get("id") or "").strip()
+            spec = str(entry.get("spec") or "").strip()
+            if not eid or not spec or eid in existing_ids:
+                continue
+            try:
+                scale = float(entry.get("scale", 1.0))
+            except (TypeError, ValueError):
+                scale = 1.0
+            label = str(entry.get("label") or "").strip() or _label_for_spec(spec)
+            presets.append(
+                {
+                    "id": eid,
+                    "label": label,
+                    "spec": spec,
+                    "scale": scale,
+                    "custom": True,
+                }
+            )
+            existing_ids.add(eid)
 
     if output_dir is not None:
         hidden = _read_hidden_lora_ids(output_dir)
@@ -2850,7 +2863,6 @@ def create_app(
         except (TypeError, ValueError):
             raise HTTPException(400, "scale must be a number")
         label = str(body.get("label") or "").strip() or _label_for_lora_spec(spec)
-        lid = f"custom_{uuid.uuid4().hex[:8]}"
         entries = [
             {
                 "id": e["id"],
@@ -2860,16 +2872,43 @@ def create_app(
             }
             for e in _read_custom_loras(state.output_dir)
         ]
-        entries.append({"id": lid, "label": label, "spec": spec, "scale": scale})
+        # Reuse an existing custom with the same normalized URL so the menu does not
+        # accumulate orphan ids that never appear in the catalog.
+        existing = next((e for e in entries if str(e.get("spec") or "") == spec), None)
+        reused = existing is not None
+        if existing is not None:
+            lid = str(existing["id"])
+            existing["label"] = label
+            existing["scale"] = scale
+        else:
+            lid = f"custom_{uuid.uuid4().hex[:8]}"
+            entries.append({"id": lid, "label": label, "spec": spec, "scale": scale})
         _write_custom_loras(state.output_dir, entries)
+
+        # If this id was previously hidden from the menu, un-hide it.
+        hidden = _read_hidden_lora_ids(state.output_dir)
+        if lid in hidden:
+            hidden.discard(lid)
+            _persist_hidden_lora_ids(state.output_dir, hidden)
+
         lora_presets, default_lora_preset_id = _lora_catalog(state.output_dir)
+        preset = next((p for p in lora_presets if p.get("id") == lid), None)
+        if preset is None:
+            raise HTTPException(
+                500,
+                f"Custom LoRA was saved but did not appear in the catalog (id={lid})",
+            )
+
         preferred = state.preferred_lora_preset_ids()
         if lid not in preferred:
             preferred.append(lid)
             state.persist_preferred_loras(preferred)
+
         return {
             "ok": True,
             "id": lid,
+            "reused": reused,
+            "preset": preset,
             "lora_presets": lora_presets,
             "default_lora_preset_id": default_lora_preset_id,
             "preferred_lora_preset_ids": state.preferred_lora_preset_ids(),

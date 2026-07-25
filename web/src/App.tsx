@@ -747,8 +747,14 @@ export default function App() {
         throw new Error(err.detail || "Could not add custom LoRA");
       }
       const data = await r.json();
-      const nextPresets = data.lora_presets ?? [];
+      const nextPresets: LoraPreset[] = data.lora_presets ?? [];
       const newId = typeof data.id === "string" ? data.id : "";
+      const added: LoraPreset | undefined =
+        (data.preset as LoraPreset | undefined) ??
+        nextPresets.find((p) => p.id === newId);
+      if (!newId || !added) {
+        throw new Error("Custom LoRA saved but missing from the LoRA menu catalog");
+      }
       loraPresetsRef.current = nextPresets;
       setConfig((c) =>
         c
@@ -760,30 +766,27 @@ export default function App() {
             }
           : c,
       );
-      // In IC-LoRA / LipDub, the newly added adapter is the one the user wants applied.
-      let nextIds: string[];
-      if ((mode === "ic_lora" || mode === "lipdub") && newId) {
-        nextIds = [newId];
-      } else {
-        nextIds = [...(data.preferred_lora_preset_ids ?? [])];
-        if (newId && !nextIds.includes(newId)) {
+      // Select the new adapter so it shows checked in the menu and is used on generate.
+      setLoraPresetIds((prev) => {
+        let nextIds: string[];
+        if (mode === "ic_lora" || mode === "lipdub" || mode === "face_swap") {
+          nextIds = [newId];
+        } else {
+          nextIds = prev.filter((id) => id !== newId);
           nextIds.push(newId);
         }
-      }
-      setLoraPresetIds(nextIds);
-      void persistLoraSelection(nextIds);
+        void persistLoraSelection(nextIds);
+        return nextIds;
+      });
       setCustomLoraUrl("");
       setCustomLoraLabel("");
       setCustomLoraScale("1.0");
-      if (newId) {
-        await ensureLoraPresets([newId], nextPresets, { interactive: true });
-      }
-      const added = nextPresets.find((p: LoraPreset) => p.id === newId);
+      await ensureLoraPresets([newId], nextPresets, { interactive: true });
       setLoraActivity({
         phase: "ready",
-        message: added
-          ? `LoRA ready: ${added.label}`
-          : "Custom LoRA added",
+        message: data.reused
+          ? `LoRA updated & selected: ${added.label}`
+          : `LoRA ready & selected: ${added.label}`,
       });
     } catch (e) {
       setLoraActivity({ phase: "error", message: String(e) });
