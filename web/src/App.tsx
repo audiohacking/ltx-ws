@@ -639,6 +639,22 @@ export default function App() {
   }, [ensureLoraPresets]);
 
   useEffect(() => {
+    if (
+      mode === "v2v" ||
+      mode === "ic_lora" ||
+      mode === "lipdub" ||
+      mode === "face_swap" ||
+      mode === "a2v" ||
+      mode === "i2v" ||
+      mode === "keyframe" ||
+      mode === "retake" ||
+      mode === "extend"
+    ) {
+      setShowOptions(true);
+    }
+  }, [mode]);
+
+  useEffect(() => {
     const entered = mode === "ic_lora" && prevModeRef.current !== "ic_lora";
     const left = mode !== "ic_lora" && prevModeRef.current === "ic_lora";
     const enteredV2v = mode === "v2v" && prevModeRef.current !== "v2v";
@@ -1953,6 +1969,536 @@ export default function App() {
             </button>
           </div>
 
+          {prompt.trim() && !canSubmit && !busy && serverOk && (
+            <p className="hint hint-inline submit-blocked-hint" role="status">
+              {isV2v || isIcLora
+                ? !hasConditioningVideo
+                  ? "Add a reference video below to enable generate."
+                  : loraPresetIds.length === 0
+                    ? "Select or Add a LoRA in options to enable generate."
+                    : loraBusy
+                      ? "Waiting for LoRA download…"
+                      : "Complete the required inputs to generate."
+                : isFaceSwap && !imagePath
+                  ? "Add a face photo and reference video in the inputs below."
+                  : isLipDub && !hasVideoSource
+                    ? "Add a reference video in the inputs below."
+                    : isA2v && !audioPath && !audioFile
+                      ? "Add an audio file in the inputs below."
+                      : needsImageUpload && !imagePath && !willContinueChain
+                        ? "Add a start image in the inputs below."
+                        : needsVideoUpload && !hasVideoSource
+                          ? "Add a source video in the inputs below."
+                          : "Complete the required inputs to generate."}
+            </p>
+          )}
+
+          {(isA2v || isV2v || isIcLora || isFaceSwap || isLipDub || needsImageUpload || showStartImageOptional || needsVideoUpload || needsEndImageUpload) && (
+            <div className="media-panel">
+              {isLipDub && (
+                <>
+                  <span className="media-panel-title">LipDub inputs</span>
+                  <p className="hint hint-inline">
+                    Lip-sync / dub a reference clip: visual motion from the video,
+                    voice tone from uploaded audio (or the video&apos;s audio track),
+                    and new dialogue in your prompt. Frame count follows the reference
+                    video. Requires the LipDub IC-LoRA.
+                  </p>
+                  {!config?.lipdub_default_spec?.includes("buckets/audiohacking") && (
+                    <p className="hint hint-inline">
+                      LipDub weights are gated on Hugging Face — accept access at{" "}
+                      <a
+                        href={
+                          config?.lipdub_official_hf_url ??
+                          "https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-LipDub"
+                        }
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        Lightricks/LTX-2.3-22b-IC-LoRA-LipDub
+                      </a>
+                      , set <code>HF_TOKEN</code> (or <code>huggingface-cli login</code>
+                      ), then add a <strong>custom LoRA</strong> with the official resolve
+                      URL or set <code>{config?.lipdub_env_var ?? "LTX_WS_LIPDUB_LORA"}</code>{" "}
+                      to a local <code>.safetensors</code> path on the server.
+                    </p>
+                  )}
+                  <label className="media-upload">
+                    <span className="media-upload-label">
+                      Voice tone audio (optional if video has audio)
+                    </span>
+                    <input
+                      ref={audioRef}
+                      type="file"
+                      accept="audio/*"
+                      onChange={(e) => {
+                        const f = e.target.files?.[0];
+                        if (f) handleAudioFileSelected(f);
+                      }}
+                    />
+                    <span className="media-upload-hint">
+                      {audioName ?? "Choose voice-tone audio…"}
+                    </span>
+                  </label>
+                  <label className="media-upload">
+                    <span className="media-upload-label">
+                      I2V anchor image (optional)
+                    </span>
+                    <input
+                      ref={imageRef}
+                      type="file"
+                      accept="image/*"
+                      onChange={async (e) => {
+                        const f = e.target.files?.[0];
+                        if (f) {
+                          setImagePath(await uploadFile(f, "image"));
+                          setImageName(f.name);
+                        }
+                      }}
+                    />
+                    <span className="media-upload-hint">
+                      {imageName ?? "Choose anchor image…"}
+                    </span>
+                  </label>
+                </>
+              )}
+              {isFaceSwap && (
+                <>
+                  <span className="media-panel-title">Face swap inputs</span>
+                  <p className="hint hint-inline">
+                    Replace the face in your reference video with the identity image.
+                    Uses the BFS V3 composite guide (green side panel + face) required by
+                    the head-swap LoRA. Audio from the reference clip is preserved when present.
+                    LoRA:{" "}
+                    <a
+                      href="https://www.runcomfy.com/comfyui-workflows/ltx-2-3-video-face-swap-in-comfyui-realistic-face-replacement-workflow"
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      LTX 2.3 face swap workflow
+                    </a>
+                    .
+                  </p>
+                  <label className="media-upload">
+                    <span className="media-upload-label">Face identity image (required)</span>
+                    <input
+                      ref={imageRef}
+                      type="file"
+                      accept="image/*"
+                      onChange={async (e) => {
+                        const f = e.target.files?.[0];
+                        if (f) {
+                          setImagePath(await uploadFile(f, "image"));
+                          setImageName(f.name);
+                        }
+                      }}
+                    />
+                    <span className="media-upload-hint">
+                      {imageName ?? "Choose face photo…"}
+                    </span>
+                  </label>
+                </>
+              )}
+              {isV2v && (
+                <>
+                  <span className="media-panel-title">V2V + LoRA inputs</span>
+                  <p className="hint hint-inline">
+                    Upload a reference clip here, then pick a community / custom IC-LoRA
+                    in Options (e.g.{" "}
+                    <a
+                      href="https://huggingface.co/Cseti/LTX2.3-22B_IC-LoRA-CrossView-Prompt"
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      CrossView Prompt
+                    </a>
+                    ). No HDR/Union defaults. Strength <strong>1.2–1.5</strong> on
+                    distilled. CrossView prompts use the fixed vocabulary, e.g.{" "}
+                    <code>crossview. new camera angle: to the right, lower, closer.</code>
+                  </p>
+                  <div className="media-upload-row">
+                    <label className="media-upload">
+                      <span className="media-upload-label">Reference video (required)</span>
+                      <input
+                        ref={conditioningVideoRef}
+                        type="file"
+                        accept="video/*"
+                        onChange={async (e) => {
+                          const f = e.target.files?.[0];
+                          if (f) {
+                            setConditioningClipId(null);
+                            setConditioningVideoPath(await uploadFile(f, "video"));
+                            setConditioningVideoName(f.name);
+                          }
+                        }}
+                      />
+                      <span className="media-upload-hint">
+                        {conditioningVideoName ?? "Choose reference video…"}
+                      </span>
+                    </label>
+                  </div>
+                  {videoLibraryClips.length > 0 && (
+                    <label className="clip-source-picker">
+                      <span className="media-upload-label">Or reference from library</span>
+                      <select
+                        value={conditioningClipId ?? ""}
+                        onChange={(e) => {
+                          const id = e.target.value || null;
+                          setConditioningClipId(id);
+                          if (id) {
+                            setConditioningVideoPath(null);
+                            setConditioningVideoName(null);
+                            if (conditioningVideoRef.current) {
+                              conditioningVideoRef.current.value = "";
+                            }
+                          }
+                        }}
+                      >
+                        <option value="">Select a clip…</option>
+                        {videoLibraryClips.map((c) => {
+                          const label = clipDisplayPrompt(c.prompt);
+                          const meta = [
+                            c.label,
+                            c.width && c.height ? `${c.width}×${c.height}` : null,
+                          ]
+                            .filter(Boolean)
+                            .join(" · ");
+                          return (
+                            <option key={c.id} value={c.id}>
+                              {meta ? `${label} (${meta})` : label}
+                            </option>
+                          );
+                        })}
+                      </select>
+                    </label>
+                  )}
+                  <label className="ic-lora-scale">
+                    Reference attention strength
+                    <input
+                      type="number"
+                      min={0}
+                      max={1}
+                      step={0.05}
+                      value={referenceStrength}
+                      disabled={!hasConditioningVideo}
+                      title="How strongly the reference video guides the result (0–1)"
+                      onChange={(e) =>
+                        setReferenceStrength(
+                          Math.min(1, Math.max(0, Number(e.target.value) || 0)),
+                        )
+                      }
+                    />
+                  </label>
+                </>
+              )}
+              {isIcLora && (
+                <>
+                  <span className="media-panel-title">IC-LoRA inputs</span>
+                  <p className="hint hint-inline ic-lora-active-mode">
+                    Mode: <strong>{icLoraModeLabel}</strong>
+                    {!config?.pose_control_available && icLoraSubMode === "motion_transfer" && (
+                      <>
+                        {" "}
+                        (requires <code>pip install mediapipe</code>)
+                      </>
+                    )}
+                  </p>
+                  <p className="hint hint-inline">
+                    Built-in HDR (video-only) or Union Control (video + character image).
+                    For CrossView / other community adapters, use{" "}
+                    <strong>V2V + LoRA</strong> instead.
+                  </p>
+                  <div className="media-upload-row">
+                    <label className="media-upload">
+                      <span className="media-upload-label">Reference video (required)</span>
+                      <input
+                        ref={conditioningVideoRef}
+                        type="file"
+                        accept="video/*"
+                        onChange={async (e) => {
+                          const f = e.target.files?.[0];
+                          if (f) {
+                            setConditioningClipId(null);
+                            setConditioningVideoPath(await uploadFile(f, "video"));
+                            setConditioningVideoName(f.name);
+                          }
+                        }}
+                      />
+                      <span className="media-upload-hint">
+                        {conditioningVideoName ?? "Choose motion reference…"}
+                      </span>
+                    </label>
+                    <label className="media-upload">
+                      <span className="media-upload-label">
+                        Character reference image (optional → Union Control)
+                      </span>
+                      <input
+                        ref={imageRef}
+                        type="file"
+                        accept="image/*"
+                        onChange={async (e) => {
+                          const f = e.target.files?.[0];
+                          if (f) {
+                            setImagePath(await uploadFile(f, "image"));
+                            setImageName(f.name);
+                          }
+                        }}
+                      />
+                      <span className="media-upload-hint">
+                        {imageName ?? "Choose character image…"}
+                      </span>
+                    </label>
+                  </div>
+                  {videoLibraryClips.length > 0 && (
+                    <label className="clip-source-picker">
+                      <span className="media-upload-label">
+                        Or motion reference from library
+                      </span>
+                      <select
+                        value={conditioningClipId ?? ""}
+                        onChange={(e) => {
+                          const id = e.target.value || null;
+                          setConditioningClipId(id);
+                          if (id) {
+                            setConditioningVideoPath(null);
+                            setConditioningVideoName(null);
+                            if (conditioningVideoRef.current) {
+                              conditioningVideoRef.current.value = "";
+                            }
+                          }
+                        }}
+                      >
+                        <option value="">Select a clip…</option>
+                        {videoLibraryClips.map((c) => {
+                          const label = clipDisplayPrompt(c.prompt);
+                          const meta = [
+                            c.label,
+                            c.width && c.height ? `${c.width}×${c.height}` : null,
+                          ]
+                            .filter(Boolean)
+                            .join(" · ");
+                          return (
+                            <option key={c.id} value={c.id}>
+                              {meta ? `${label} (${meta})` : label}
+                            </option>
+                          );
+                        })}
+                      </select>
+                    </label>
+                  )}
+                  <label className="ic-lora-scale">
+                    Motion conditioning strength
+                    <input
+                      type="number"
+                      min={0}
+                      max={2}
+                      step={0.05}
+                      value={conditioningVideoScale}
+                      disabled={!hasConditioningVideo}
+                      onChange={(e) =>
+                        setConditioningVideoScale(
+                          Math.min(2, Math.max(0, Number(e.target.value) || 0)),
+                        )
+                      }
+                    />
+                  </label>
+                  <label className="ic-lora-scale">
+                    Reference attention strength
+                    <input
+                      type="number"
+                      min={0}
+                      max={1}
+                      step={0.05}
+                      value={referenceStrength}
+                      disabled={!hasConditioningVideo}
+                      title="IC-LoRA conditioning_attention_strength (0–1)"
+                      onChange={(e) =>
+                        setReferenceStrength(
+                          Math.min(1, Math.max(0, Number(e.target.value) || 0)),
+                        )
+                      }
+                    />
+                  </label>
+                  {hasConditioningVideo && (
+                    <p className="media-source-note">
+                      {conditioningClipId
+                        ? "Using library clip as motion reference."
+                        : "Using uploaded file as motion reference."}
+                      {" "}
+                      Motion strength scales the reference clip weight; attention strength
+                      controls how tightly the model follows it (default 1.0).
+                    </p>
+                  )}
+                </>
+              )}
+              {isA2v && (
+                <>
+                  <span className="media-panel-title">Audio to video inputs</span>
+                  <div className="media-upload-row">
+                    <label className="media-upload">
+                      <span className="media-upload-label">
+                        Start image (optional, clip 1 only)
+                      </span>
+                      <input
+                        ref={imageRef}
+                        type="file"
+                        accept="image/*"
+                        onChange={async (e) => {
+                          const f = e.target.files?.[0];
+                          if (f) {
+                            setImagePath(await uploadFile(f, "image"));
+                            setImageName(f.name);
+                          }
+                        }}
+                      />
+                      <span className="media-upload-hint">
+                        {imageName ?? "Choose image file…"}
+                      </span>
+                    </label>
+                  </div>
+                  <AudioTrimControl
+                    fileName={audioName}
+                    previewUrl={audioPreviewUrl}
+                    durationSeconds={audioDurationSeconds}
+                    startSeconds={audioStartSeconds}
+                    clipDurationSeconds={audioClipDurationSeconds}
+                    maxStart={audioStartSliderMax}
+                    trimAvailable={audioTrimAvailable}
+                    disabled={busy}
+                    fileInputRef={audioRef}
+                    onFileSelected={handleAudioFileSelected}
+                    onStartChange={setAudioStartSeconds}
+                  />
+                  {showChainedImageHint && chainMethod === "autocontinue" && (
+                    <p className="hint">
+                      With autocontinue / audiocontinue, the start image is used for
+                      clip 1 only; later clips use the last frame of the prior clip.
+                    </p>
+                  )}
+                </>
+              )}
+              {!isA2v && !isLipDub && (needsImageUpload || showStartImageOptional) && (
+                <>
+                  <span className="media-panel-title">Source media</span>
+                  <label className="media-upload">
+                  <span className="media-upload-label">
+                    {needsImageUpload
+                      ? "Source image (required)"
+                      : "Start image (optional)"}
+                  </span>
+                  <input
+                    ref={imageRef}
+                    type="file"
+                    accept="image/*"
+                    onChange={async (e) => {
+                      const f = e.target.files?.[0];
+                      if (f) {
+                        setImagePath(await uploadFile(f, "image"));
+                        setImageName(f.name);
+                      }
+                    }}
+                  />
+                  <span className="media-upload-hint">
+                    {imageName ?? "Choose image file…"}
+                  </span>
+                </label>
+                {needsEndImageUpload && (
+                  <label className="media-upload">
+                    <span className="media-upload-label">End image (required)</span>
+                    <input
+                      ref={endImageRef}
+                      type="file"
+                      accept="image/*"
+                      onChange={async (e) => {
+                        const f = e.target.files?.[0];
+                        if (f) {
+                          setEndImagePath(await uploadFile(f, "image"));
+                          setEndImageName(f.name);
+                        }
+                      }}
+                    />
+                    <span className="media-upload-hint">
+                      {endImageName ?? "Choose end frame…"}
+                    </span>
+                  </label>
+                )}
+                </>
+              )}
+              {needsVideoUpload && (
+                <>
+                  {!isA2v && (
+                    <span className="media-panel-title">
+                      {isFaceSwap
+                        ? "Reference video (required)"
+                        : isLipDub
+                          ? "Reference video (required, visual motion)"
+                          : "Source video"}
+                    </span>
+                  )}
+                  <label className="media-upload">
+                    <span className="media-upload-label">Upload from disk</span>
+                    <input
+                      ref={videoRef}
+                      type="file"
+                      accept="video/*"
+                      onChange={async (e) => {
+                        const f = e.target.files?.[0];
+                        if (f) {
+                          setSourceClipId(null);
+                          setVideoPath(await uploadFile(f, "video"));
+                        }
+                      }}
+                    />
+                    <span className="media-upload-hint">
+                      {videoPath ? "✓ file selected" : "Choose video file…"}
+                    </span>
+                  </label>
+                  {videoLibraryClips.length > 0 && (
+                    <label className="clip-source-picker">
+                      <span className="media-upload-label">Or from library</span>
+                      <select
+                        value={sourceClipId ?? ""}
+                        onChange={(e) => {
+                          const id = e.target.value || null;
+                          setSourceClipId(id);
+                          if (id) {
+                            setVideoPath(null);
+                            if (videoRef.current) videoRef.current.value = "";
+                          }
+                        }}
+                      >
+                        <option value="">Select a clip…</option>
+                        {videoLibraryClips.map((c) => {
+                          const label = clipDisplayPrompt(c.prompt);
+                          const meta = [
+                            c.label,
+                            c.width && c.height ? `${c.width}×${c.height}` : null,
+                          ]
+                            .filter(Boolean)
+                            .join(" · ");
+                          return (
+                            <option key={c.id} value={c.id}>
+                              {meta ? `${label} (${meta})` : label}
+                            </option>
+                          );
+                        })}
+                      </select>
+                    </label>
+                  )}
+                  {hasVideoSource && (
+                    <p className="media-source-note">
+                      {sourceClipId
+                        ? "Using library clip as reference video."
+                        : isLipDub
+                          ? "Using uploaded reference video. Add voice-tone audio above if the clip has no audio track."
+                          : "Using uploaded file as source video."}
+                    </p>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+
           <button
             type="button"
             className="options-toggle"
@@ -2000,6 +2546,22 @@ export default function App() {
                       const next = e.target.value;
                       setMode(next);
                       clearMediaForMode(next);
+                      // Keep options open so Mode/LoRA stay visible with media inputs.
+                      if (
+                        [
+                          "v2v",
+                          "ic_lora",
+                          "lipdub",
+                          "face_swap",
+                          "a2v",
+                          "i2v",
+                          "keyframe",
+                          "retake",
+                          "extend",
+                        ].includes(next)
+                      ) {
+                        setShowOptions(true);
+                      }
                     }}
                   >
                     {config.generation_modes.map((m) => (
@@ -2253,523 +2815,7 @@ export default function App() {
                 </div>
               )}
 
-              {(isA2v || isV2v || isIcLora || isFaceSwap || isLipDub || needsImageUpload || showStartImageOptional || needsVideoUpload || needsEndImageUpload) && (
-                <div className="media-panel">
-                  {isLipDub && (
-                    <>
-                      <span className="media-panel-title">LipDub inputs</span>
-                      <p className="hint hint-inline">
-                        Lip-sync / dub a reference clip: visual motion from the video,
-                        voice tone from uploaded audio (or the video&apos;s audio track),
-                        and new dialogue in your prompt. Frame count follows the reference
-                        video. Requires the LipDub IC-LoRA.
-                      </p>
-                      {!config?.lipdub_default_spec?.includes("buckets/audiohacking") && (
-                        <p className="hint hint-inline">
-                          LipDub weights are gated on Hugging Face — accept access at{" "}
-                          <a
-                            href={
-                              config?.lipdub_official_hf_url ??
-                              "https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-LipDub"
-                            }
-                            target="_blank"
-                            rel="noreferrer"
-                          >
-                            Lightricks/LTX-2.3-22b-IC-LoRA-LipDub
-                          </a>
-                          , set <code>HF_TOKEN</code> (or <code>huggingface-cli login</code>
-                          ), then add a <strong>custom LoRA</strong> with the official resolve
-                          URL or set <code>{config?.lipdub_env_var ?? "LTX_WS_LIPDUB_LORA"}</code>{" "}
-                          to a local <code>.safetensors</code> path on the server.
-                        </p>
-                      )}
-                      <label className="media-upload">
-                        <span className="media-upload-label">
-                          Voice tone audio (optional if video has audio)
-                        </span>
-                        <input
-                          ref={audioRef}
-                          type="file"
-                          accept="audio/*"
-                          onChange={(e) => {
-                            const f = e.target.files?.[0];
-                            if (f) handleAudioFileSelected(f);
-                          }}
-                        />
-                        <span className="media-upload-hint">
-                          {audioName ?? "Choose voice-tone audio…"}
-                        </span>
-                      </label>
-                      <label className="media-upload">
-                        <span className="media-upload-label">
-                          I2V anchor image (optional)
-                        </span>
-                        <input
-                          ref={imageRef}
-                          type="file"
-                          accept="image/*"
-                          onChange={async (e) => {
-                            const f = e.target.files?.[0];
-                            if (f) {
-                              setImagePath(await uploadFile(f, "image"));
-                              setImageName(f.name);
-                            }
-                          }}
-                        />
-                        <span className="media-upload-hint">
-                          {imageName ?? "Choose anchor image…"}
-                        </span>
-                      </label>
-                    </>
-                  )}
-                  {isFaceSwap && (
-                    <>
-                      <span className="media-panel-title">Face swap inputs</span>
-                      <p className="hint hint-inline">
-                        Replace the face in your reference video with the identity image.
-                        Uses the BFS V3 composite guide (green side panel + face) required by
-                        the head-swap LoRA. Audio from the reference clip is preserved when present.
-                        LoRA:{" "}
-                        <a
-                          href="https://www.runcomfy.com/comfyui-workflows/ltx-2-3-video-face-swap-in-comfyui-realistic-face-replacement-workflow"
-                          target="_blank"
-                          rel="noreferrer"
-                        >
-                          LTX 2.3 face swap workflow
-                        </a>
-                        .
-                      </p>
-                      <label className="media-upload">
-                        <span className="media-upload-label">Face identity image (required)</span>
-                        <input
-                          ref={imageRef}
-                          type="file"
-                          accept="image/*"
-                          onChange={async (e) => {
-                            const f = e.target.files?.[0];
-                            if (f) {
-                              setImagePath(await uploadFile(f, "image"));
-                              setImageName(f.name);
-                            }
-                          }}
-                        />
-                        <span className="media-upload-hint">
-                          {imageName ?? "Choose face photo…"}
-                        </span>
-                      </label>
-                    </>
-                  )}
-                  {isV2v && (
-                    <>
-                      <span className="media-panel-title">V2V + LoRA inputs</span>
-                      <p className="hint hint-inline">
-                        Re-render a reference video with a community / custom IC-LoRA
-                        (e.g.{" "}
-                        <a
-                          href="https://huggingface.co/Cseti/LTX2.3-22B_IC-LoRA-CrossView-Prompt"
-                          target="_blank"
-                          rel="noreferrer"
-                        >
-                          CrossView Prompt
-                        </a>
-                        ). No HDR/Union defaults — pick the LoRA in the menu (or Add URL).
-                        Strength <strong>1.2–1.5</strong> on distilled. CrossView prompts
-                        use the fixed vocabulary, e.g.{" "}
-                        <code>crossview. new camera angle: to the right, lower, closer.</code>
-                      </p>
-                      <div className="media-upload-row">
-                        <label className="media-upload">
-                          <span className="media-upload-label">Reference video (required)</span>
-                          <input
-                            ref={conditioningVideoRef}
-                            type="file"
-                            accept="video/*"
-                            onChange={async (e) => {
-                              const f = e.target.files?.[0];
-                              if (f) {
-                                setConditioningClipId(null);
-                                setConditioningVideoPath(await uploadFile(f, "video"));
-                                setConditioningVideoName(f.name);
-                              }
-                            }}
-                          />
-                          <span className="media-upload-hint">
-                            {conditioningVideoName ?? "Choose reference video…"}
-                          </span>
-                        </label>
-                      </div>
-                      {videoLibraryClips.length > 0 && (
-                        <label className="clip-source-picker">
-                          <span className="media-upload-label">Or reference from library</span>
-                          <select
-                            value={conditioningClipId ?? ""}
-                            onChange={(e) => {
-                              const id = e.target.value || null;
-                              setConditioningClipId(id);
-                              if (id) {
-                                setConditioningVideoPath(null);
-                                setConditioningVideoName(null);
-                                if (conditioningVideoRef.current) {
-                                  conditioningVideoRef.current.value = "";
-                                }
-                              }
-                            }}
-                          >
-                            <option value="">Select a clip…</option>
-                            {videoLibraryClips.map((c) => {
-                              const label = clipDisplayPrompt(c.prompt);
-                              const meta = [
-                                c.label,
-                                c.width && c.height ? `${c.width}×${c.height}` : null,
-                              ]
-                                .filter(Boolean)
-                                .join(" · ");
-                              return (
-                                <option key={c.id} value={c.id}>
-                                  {meta ? `${label} (${meta})` : label}
-                                </option>
-                              );
-                            })}
-                          </select>
-                        </label>
-                      )}
-                      <label className="ic-lora-scale">
-                        Reference attention strength
-                        <input
-                          type="number"
-                          min={0}
-                          max={1}
-                          step={0.05}
-                          value={referenceStrength}
-                          disabled={!hasConditioningVideo}
-                          title="How strongly the reference video guides the result (0–1)"
-                          onChange={(e) =>
-                            setReferenceStrength(
-                              Math.min(1, Math.max(0, Number(e.target.value) || 0)),
-                            )
-                          }
-                        />
-                      </label>
-                      {hasConditioningVideo ? (
-                        <p className="media-source-note">
-                          {conditioningClipId
-                            ? "Using library clip as V2V reference."
-                            : "Using uploaded file as V2V reference."}
-                        </p>
-                      ) : (
-                        <p className="media-source-note">
-                          Upload a reference video (or pick one from the library) to enable Generate.
-                        </p>
-                      )}
-                    </>
-                  )}
-                  {isIcLora && (
-                    <>
-                      <span className="media-panel-title">IC-LoRA inputs</span>
-                      <p className="hint hint-inline ic-lora-active-mode">
-                        Mode: <strong>{icLoraModeLabel}</strong>
-                        {!config?.pose_control_available && icLoraSubMode === "motion_transfer" && (
-                          <>
-                            {" "}
-                            (requires <code>pip install mediapipe</code>)
-                          </>
-                        )}
-                      </p>
-                      <p className="hint hint-inline">
-                        Built-in HDR (video-only) or Union Control (video + character image).
-                        For CrossView / other community adapters, use{" "}
-                        <strong>V2V + LoRA</strong> instead.
-                      </p>
-                      <div className="media-upload-row">
-                        <label className="media-upload">
-                          <span className="media-upload-label">Reference video (required)</span>
-                          <input
-                            ref={conditioningVideoRef}
-                            type="file"
-                            accept="video/*"
-                            onChange={async (e) => {
-                              const f = e.target.files?.[0];
-                              if (f) {
-                                setConditioningClipId(null);
-                                setConditioningVideoPath(await uploadFile(f, "video"));
-                                setConditioningVideoName(f.name);
-                              }
-                            }}
-                          />
-                          <span className="media-upload-hint">
-                            {conditioningVideoName ?? "Choose motion reference…"}
-                          </span>
-                        </label>
-                        <label className="media-upload">
-                          <span className="media-upload-label">
-                            Character reference image (optional → Union Control)
-                          </span>
-                          <input
-                            ref={imageRef}
-                            type="file"
-                            accept="image/*"
-                            onChange={async (e) => {
-                              const f = e.target.files?.[0];
-                              if (f) {
-                                setImagePath(await uploadFile(f, "image"));
-                                setImageName(f.name);
-                              }
-                            }}
-                          />
-                          <span className="media-upload-hint">
-                            {imageName ?? "Choose character image…"}
-                          </span>
-                        </label>
-                      </div>
-                      {videoLibraryClips.length > 0 && (
-                        <label className="clip-source-picker">
-                          <span className="media-upload-label">
-                            Or motion reference from library
-                          </span>
-                          <select
-                            value={conditioningClipId ?? ""}
-                            onChange={(e) => {
-                              const id = e.target.value || null;
-                              setConditioningClipId(id);
-                              if (id) {
-                                setConditioningVideoPath(null);
-                                setConditioningVideoName(null);
-                                if (conditioningVideoRef.current) {
-                                  conditioningVideoRef.current.value = "";
-                                }
-                              }
-                            }}
-                          >
-                            <option value="">Select a clip…</option>
-                            {videoLibraryClips.map((c) => {
-                              const label = clipDisplayPrompt(c.prompt);
-                              const meta = [
-                                c.label,
-                                c.width && c.height ? `${c.width}×${c.height}` : null,
-                              ]
-                                .filter(Boolean)
-                                .join(" · ");
-                              return (
-                                <option key={c.id} value={c.id}>
-                                  {meta ? `${label} (${meta})` : label}
-                                </option>
-                              );
-                            })}
-                          </select>
-                        </label>
-                      )}
-                      <label className="ic-lora-scale">
-                        Motion conditioning strength
-                        <input
-                          type="number"
-                          min={0}
-                          max={2}
-                          step={0.05}
-                          value={conditioningVideoScale}
-                          disabled={!hasConditioningVideo}
-                          onChange={(e) =>
-                            setConditioningVideoScale(
-                              Math.min(2, Math.max(0, Number(e.target.value) || 0)),
-                            )
-                          }
-                        />
-                      </label>
-                      <label className="ic-lora-scale">
-                        Reference attention strength
-                        <input
-                          type="number"
-                          min={0}
-                          max={1}
-                          step={0.05}
-                          value={referenceStrength}
-                          disabled={!hasConditioningVideo}
-                          title="IC-LoRA conditioning_attention_strength (0–1)"
-                          onChange={(e) =>
-                            setReferenceStrength(
-                              Math.min(1, Math.max(0, Number(e.target.value) || 0)),
-                            )
-                          }
-                        />
-                      </label>
-                      {hasConditioningVideo && (
-                        <p className="media-source-note">
-                          {conditioningClipId
-                            ? "Using library clip as motion reference."
-                            : "Using uploaded file as motion reference."}
-                          {" "}
-                          Motion strength scales the reference clip weight; attention strength
-                          controls how tightly the model follows it (default 1.0).
-                        </p>
-                      )}
-                    </>
-                  )}
-                  {isA2v && (
-                    <>
-                      <span className="media-panel-title">Audio to video inputs</span>
-                      <div className="media-upload-row">
-                        <label className="media-upload">
-                          <span className="media-upload-label">
-                            Start image (optional, clip 1 only)
-                          </span>
-                          <input
-                            ref={imageRef}
-                            type="file"
-                            accept="image/*"
-                            onChange={async (e) => {
-                              const f = e.target.files?.[0];
-                              if (f) {
-                                setImagePath(await uploadFile(f, "image"));
-                                setImageName(f.name);
-                              }
-                            }}
-                          />
-                          <span className="media-upload-hint">
-                            {imageName ?? "Choose image file…"}
-                          </span>
-                        </label>
-                      </div>
-                      <AudioTrimControl
-                        fileName={audioName}
-                        previewUrl={audioPreviewUrl}
-                        durationSeconds={audioDurationSeconds}
-                        startSeconds={audioStartSeconds}
-                        clipDurationSeconds={audioClipDurationSeconds}
-                        maxStart={audioStartSliderMax}
-                        trimAvailable={audioTrimAvailable}
-                        disabled={busy}
-                        fileInputRef={audioRef}
-                        onFileSelected={handleAudioFileSelected}
-                        onStartChange={setAudioStartSeconds}
-                      />
-                      {showChainedImageHint && chainMethod === "autocontinue" && (
-                        <p className="hint">
-                          With autocontinue / audiocontinue, the start image is used for
-                          clip 1 only; later clips use the last frame of the prior clip.
-                        </p>
-                      )}
-                    </>
-                  )}
-                  {!isA2v && !isLipDub && (needsImageUpload || showStartImageOptional) && (
-                    <>
-                      <span className="media-panel-title">Source media</span>
-                      <label className="media-upload">
-                      <span className="media-upload-label">
-                        {needsImageUpload
-                          ? "Source image (required)"
-                          : "Start image (optional)"}
-                      </span>
-                      <input
-                        ref={imageRef}
-                        type="file"
-                        accept="image/*"
-                        onChange={async (e) => {
-                          const f = e.target.files?.[0];
-                          if (f) {
-                            setImagePath(await uploadFile(f, "image"));
-                            setImageName(f.name);
-                          }
-                        }}
-                      />
-                      <span className="media-upload-hint">
-                        {imageName ?? "Choose image file…"}
-                      </span>
-                    </label>
-                    {needsEndImageUpload && (
-                      <label className="media-upload">
-                        <span className="media-upload-label">End image (required)</span>
-                        <input
-                          ref={endImageRef}
-                          type="file"
-                          accept="image/*"
-                          onChange={async (e) => {
-                            const f = e.target.files?.[0];
-                            if (f) {
-                              setEndImagePath(await uploadFile(f, "image"));
-                              setEndImageName(f.name);
-                            }
-                          }}
-                        />
-                        <span className="media-upload-hint">
-                          {endImageName ?? "Choose end frame…"}
-                        </span>
-                      </label>
-                    )}
-                    </>
-                  )}
-                  {needsVideoUpload && (
-                    <>
-                      {!isA2v && (
-                        <span className="media-panel-title">
-                          {isFaceSwap
-                            ? "Reference video (required)"
-                            : isLipDub
-                              ? "Reference video (required, visual motion)"
-                              : "Source video"}
-                        </span>
-                      )}
-                      <label className="media-upload">
-                        <span className="media-upload-label">Upload from disk</span>
-                        <input
-                          ref={videoRef}
-                          type="file"
-                          accept="video/*"
-                          onChange={async (e) => {
-                            const f = e.target.files?.[0];
-                            if (f) {
-                              setSourceClipId(null);
-                              setVideoPath(await uploadFile(f, "video"));
-                            }
-                          }}
-                        />
-                        <span className="media-upload-hint">
-                          {videoPath ? "✓ file selected" : "Choose video file…"}
-                        </span>
-                      </label>
-                      {videoLibraryClips.length > 0 && (
-                        <label className="clip-source-picker">
-                          <span className="media-upload-label">Or from library</span>
-                          <select
-                            value={sourceClipId ?? ""}
-                            onChange={(e) => {
-                              const id = e.target.value || null;
-                              setSourceClipId(id);
-                              if (id) {
-                                setVideoPath(null);
-                                if (videoRef.current) videoRef.current.value = "";
-                              }
-                            }}
-                          >
-                            <option value="">Select a clip…</option>
-                            {videoLibraryClips.map((c) => {
-                              const label = clipDisplayPrompt(c.prompt);
-                              const meta = [
-                                c.label,
-                                c.width && c.height ? `${c.width}×${c.height}` : null,
-                              ]
-                                .filter(Boolean)
-                                .join(" · ");
-                              return (
-                                <option key={c.id} value={c.id}>
-                                  {meta ? `${label} (${meta})` : label}
-                                </option>
-                              );
-                            })}
-                          </select>
-                        </label>
-                      )}
-                      {hasVideoSource && (
-                        <p className="media-source-note">
-                          {sourceClipId
-                            ? "Using library clip as reference video."
-                            : isLipDub
-                              ? "Using uploaded reference video. Add voice-tone audio above if the clip has no audio track."
-                              : "Using uploaded file as source video."}
-                        </p>
-                      )}
-                    </>
-                  )}
-                </div>
-              )}
+
 
               {(mode === "retake" || mode === "extend") && (
                 <div className="options-grid">
