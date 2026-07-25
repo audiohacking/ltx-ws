@@ -1173,7 +1173,6 @@ export default function App() {
   const needsEndImageUpload = mode === "keyframe";
   const needsVideoUpload =
     mode === "retake" || mode === "extend" || mode === "lipdub" || mode === "face_swap";
-  const showStartImageOptional = mode === "generate";
   const isT2vLike = mode === "generate" || mode === "i2v";
   const showChainMethodChoice =
     isT2vLike && !audiocontinue && isMultiClip;
@@ -2253,7 +2252,7 @@ export default function App() {
                 </div>
               )}
 
-              {(isA2v || isV2v || isIcLora || isFaceSwap || isLipDub || needsImageUpload || showStartImageOptional || needsVideoUpload || needsEndImageUpload) && (
+              {(isA2v || isV2v || isIcLora || isFaceSwap || isLipDub || needsImageUpload || needsVideoUpload || needsEndImageUpload) && (
                 <div className="media-panel">
                   {isLipDub && (
                     <>
@@ -2649,14 +2648,12 @@ export default function App() {
                       )}
                     </>
                   )}
-                  {!isA2v && !isLipDub && (needsImageUpload || showStartImageOptional) && (
+                  {!isA2v && !isLipDub && needsImageUpload && (
                     <>
                       <span className="media-panel-title">Source media</span>
                       <label className="media-upload">
                       <span className="media-upload-label">
-                        {needsImageUpload
-                          ? "Source image (required)"
-                          : "Start image (optional)"}
+                        Source image (required)
                       </span>
                       <input
                         ref={imageRef}
