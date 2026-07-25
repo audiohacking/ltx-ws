@@ -15,6 +15,7 @@ Generate text-to-video, image-to-video, audio-to-video, retake, extend, and mult
 | **Text / image / audio to video** | Standard generation modes from prompt, still image, or audio track |
 | **Multi-clip chains** | Build longer videos with **autocontinue** (last frame → next clip) or **native extend** (extend prior clip in-place) |
 | **Retake & extend** | Edit a segment of existing footage or append/prepend new motion |
+| **Face swap (BFS V3)** | Replace face in reference video using identity image + head-swap LoRA (Comfy-aligned MLX port) |
 | **Web UI** | Browser library, progress, LoRA picker, duration presets, clip multiplier |
 | **CLI client** | Scriptable batch runs, autocontinue, PyAV merge (`autoconcat`) |
 | **MCP tools** | Drive generation from Cursor, Claude, or other MCP clients |
@@ -46,8 +47,8 @@ cd ltx-ws
 uv venv --python 3.12 --seed && source .venv/bin/activate
 uv pip install -r requirements.txt
 uv pip install \
-  "ltx-core-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@v0.14.15#subdirectory=packages/ltx-core-mlx" \
-  "ltx-pipelines-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@v0.14.15#subdirectory=packages/ltx-pipelines-mlx"
+  "ltx-core-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@v0.14.19#subdirectory=packages/ltx-core-mlx" \
+  "ltx-pipelines-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git@v0.14.19#subdirectory=packages/ltx-pipelines-mlx"
 
 # Web UI (first time, or after editing web/)
 cd web && npm install && npm run build && cd ..

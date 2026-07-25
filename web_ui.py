@@ -51,11 +51,13 @@ GENERATION_MODES = [
     {"id": "generate", "label": "Text to video"},
     {"id": "i2v", "label": "Image to video (i2v)"},
     {"id": "a2v", "label": "Audio to video (a2v)"},
+    {"id": "v2v", "label": "V2V (reference ± optional LoRA)"},
     {"id": "retake", "label": "Retake (edit region)"},
     {"id": "extend", "label": "Extend video"},
     {"id": "keyframe", "label": "Keyframe interpolation"},
     {"id": "lipdub", "label": "LipDub (experimental)"},
-    {"id": "ic_lora", "label": "IC-LoRA (motion / character ref)"},
+    {"id": "ic_lora", "label": "IC-LoRA (HDR / Union Control)"},
+    {"id": "face_swap", "label": "Face swap (LTX 2.3)"},
 ]
 
 CHAIN_METHODS = [
@@ -91,7 +93,31 @@ IC_LORA_UNION_MOTION_SPEC = (
 )
 IC_LORA_DEFAULT_SCALE = 1.0
 IC_LORA_BUILTIN_SPECS = frozenset({IC_LORA_DEFAULT_SPEC, IC_LORA_UNION_MOTION_SPEC})
+FACE_SWAP_PRESET_ID = "face_swap_head"
+FACE_SWAP_DEFAULT_SPEC = (
+    "https://huggingface.co/Alissonerdx/BFS-Best-Face-Swap-Video/"
+    "resolve/main/ltx-2.3/head_swap_v3_rank_adaptive_fro_098.safetensors"
+)
+FACE_SWAP_DEFAULT_SCALE = 0.98
+LIPDUB_PRESET_ID = "lipdub_ic_lora"
+LIPDUB_OFFICIAL_REPO = "Lightricks/LTX-2.3-22b-IC-LoRA-LipDub"
+LIPDUB_OFFICIAL_FILENAME = "ltx-2.3-22b-ic-lora-lipdub-0.9.safetensors"
+LIPDUB_OFFICIAL_GATED_SPEC = (
+    f"https://huggingface.co/{LIPDUB_OFFICIAL_REPO}/resolve/main/{LIPDUB_OFFICIAL_FILENAME}"
+)
+LIPDUB_PUBLIC_BUCKET_SPEC = (
+    "https://huggingface.co/buckets/audiohacking/LTX-2.3-22b-IC-LoRA-LipDub-bucket/"
+    f"resolve/{LIPDUB_OFFICIAL_FILENAME}"
+)
+LIPDUB_DEFAULT_SPEC = LIPDUB_PUBLIC_BUCKET_SPEC
+ENV_LIPDUB_LORA = "LTX_WS_LIPDUB_LORA"
+LIPDUB_DEFAULT_SCALE = 1.0
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "web_outputs"
+
+
+def _builtin_lipdub_spec() -> str:
+    """Built-in LipDub LoRA URL/path: ``LTX_WS_LIPDUB_LORA`` env override, else public bucket."""
+    return os.environ.get(ENV_LIPDUB_LORA, "").strip() or LIPDUB_DEFAULT_SPEC
 
 
 def _pose_control_available() -> bool:
@@ -152,16 +178,22 @@ def _label_for_lora_spec(spec: str) -> str:
 
 
 def _read_custom_loras(output_dir: Path) -> list[dict[str, Any]]:
+    from ltx_mlx_backend import _normalize_lora_spec
+
     raw = read_web_settings(output_dir).get("custom_loras")
     if not isinstance(raw, list):
         return []
     out: list[dict[str, Any]] = []
+    dirty = False
     for item in raw:
         if not isinstance(item, dict):
             continue
-        spec = str(item.get("spec") or "").strip()
+        spec = _normalize_lora_spec(str(item.get("spec") or "").strip())
         if not spec:
             continue
+        original = str(item.get("spec") or "").strip()
+        if spec != original:
+            dirty = True
         lid = str(item.get("id") or "").strip() or f"custom_{uuid.uuid4().hex[:8]}"
         try:
             scale = float(item.get("scale", 1.0))
@@ -169,6 +201,12 @@ def _read_custom_loras(output_dir: Path) -> list[dict[str, Any]]:
             scale = 1.0
         label = str(item.get("label") or "").strip() or _label_for_lora_spec(spec)
         out.append({"id": lid, "label": label, "spec": spec, "scale": scale, "custom": True})
+    if dirty:
+        # Persist repaired URLs (Path()-mangled https:/… → https://…).
+        _write_custom_loras(
+            output_dir,
+            [{"id": e["id"], "label": e["label"], "spec": e["spec"], "scale": e["scale"]} for e in out],
+        )
     return out
 
 
@@ -321,16 +359,6 @@ def _lora_catalog(output_dir: Path | None = None) -> tuple[list[dict[str, Any]],
             continue
         _add(f"env_{i}", f"Env LoRA — {_label_for_spec(path)}", path, scale)
 
-    if output_dir is not None:
-        for entry in _read_custom_loras(output_dir):
-            _add(
-                str(entry["id"]),
-                str(entry["label"]),
-                str(entry["spec"]),
-                float(entry["scale"]),
-            )
-            presets[-1]["custom"] = True
-
     _add(
         "ic_lora_hdr",
         "IC-LoRA HDR",
@@ -343,6 +371,44 @@ def _lora_catalog(output_dir: Path | None = None) -> tuple[list[dict[str, Any]],
         IC_LORA_UNION_MOTION_SPEC,
         1.0,
     )
+    _add(
+        FACE_SWAP_PRESET_ID,
+        "Face swap — head swap LoRA (LTX 2.3)",
+        FACE_SWAP_DEFAULT_SPEC,
+        FACE_SWAP_DEFAULT_SCALE,
+    )
+    lipdub_spec = _builtin_lipdub_spec()
+    _add(
+        LIPDUB_PRESET_ID,
+        "LipDub — IC-LoRA (LTX 2.3)",
+        lipdub_spec,
+        LIPDUB_DEFAULT_SCALE,
+    )
+
+    # Customs last, keyed by unique id so they always appear in the menu even when
+    # the same URL/scale already exists as a builtin or earlier custom entry.
+    if output_dir is not None:
+        existing_ids = {str(p.get("id") or "") for p in presets}
+        for entry in _read_custom_loras(output_dir):
+            eid = str(entry.get("id") or "").strip()
+            spec = str(entry.get("spec") or "").strip()
+            if not eid or not spec or eid in existing_ids:
+                continue
+            try:
+                scale = float(entry.get("scale", 1.0))
+            except (TypeError, ValueError):
+                scale = 1.0
+            label = str(entry.get("label") or "").strip() or _label_for_spec(spec)
+            presets.append(
+                {
+                    "id": eid,
+                    "label": label,
+                    "spec": spec,
+                    "scale": scale,
+                    "custom": True,
+                }
+            )
+            existing_ids.add(eid)
 
     if output_dir is not None:
         hidden = _read_hidden_lora_ids(output_dir)
@@ -400,6 +466,54 @@ def web_dist_stale() -> bool:
     except ValueError:
         return False
     return newest_src > newest_js.stat().st_mtime
+
+
+def ensure_web_dist_built(*, auto_build: bool = True) -> bool:
+    """Rebuild web/dist when missing/stale so git pulls show UI changes.
+
+    ``web/dist`` is gitignored, so pulling source alone leaves a stale UI.
+    Returns True when a usable dist exists after this call.
+    """
+    dist = resolve_web_dist()
+    if dist.is_dir() and not web_dist_stale():
+        return True
+    if not auto_build:
+        return dist.is_dir() and not web_dist_stale()
+
+    web_dir = REPO_ROOT / "web"
+    pkg = web_dir / "package.json"
+    if not pkg.is_file():
+        log.warning("Web UI package.json missing at %s — cannot auto-build", pkg)
+        return False
+
+    npm = shutil.which("npm")
+    if not npm:
+        log.warning(
+            "web/dist is stale/missing and npm was not found — run: cd web && npm run build"
+        )
+        return False
+
+    cmd = [npm, "run", "build"]
+    if not (web_dir / "node_modules").is_dir():
+        cmd = [npm, "install", "--no-fund", "--no-audit"]
+        log.info("Installing Web UI deps (node_modules missing)…")
+        try:
+            subprocess.run(cmd, cwd=str(web_dir), check=True)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            log.warning("Web UI npm install failed: %s", exc)
+            return False
+        cmd = [npm, "run", "build"]
+
+    log.info("Building Web UI (web/dist missing or older than web/src)…")
+    try:
+        subprocess.run(cmd, cwd=str(web_dir), check=True)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        log.warning("Web UI build failed: %s — run: cd web && npm run build", exc)
+        return False
+    ok = dist.is_dir() and not web_dist_stale()
+    if ok:
+        log.info("Web UI build ready at %s", dist)
+    return ok
 
 
 def resolve_favicon_path() -> Path | None:
@@ -717,7 +831,7 @@ def _clip_audio_duration_seconds(body: dict[str, Any]) -> float:
 
 
 def _apply_audio_start_offset(body: dict[str, Any]) -> tuple[dict[str, Any], list[Path]]:
-    """Crop a2v/lipdub audio from ``audio_start_seconds`` before generation."""
+    """Crop a2v audio from ``audio_start_seconds`` before generation."""
     temps: list[Path] = []
     try:
         start = float(body.get("audio_start_seconds") or 0)
@@ -729,7 +843,7 @@ def _apply_audio_start_offset(body: dict[str, Any]) -> tuple[dict[str, Any], lis
     if not audio_path:
         return body, temps
     ui_mode = (body.get("mode") or "generate").strip().lower()
-    if ui_mode not in ("a2v", "lipdub"):
+    if ui_mode != "a2v":
         return body, temps
     if not media_available():
         raise ValueError("Audio start offset requires PyAV — install with: pip install av")
@@ -846,7 +960,7 @@ def resolve_source_video_path(state: AppState, body: dict[str, Any]) -> str | No
 
 
 def _validate_source_video_request(state: AppState, body: dict[str, Any], ui_mode: str) -> None:
-    if ui_mode not in ("retake", "extend", "lipdub"):
+    if ui_mode not in ("retake", "extend", "lipdub", "face_swap"):
         return
     if not body.get("video_path") and not body.get("source_clip_id"):
         raise HTTPException(400, f"{ui_mode} mode requires a source video (upload or library clip)")
@@ -1409,9 +1523,9 @@ def _resolve_ic_lora_video_conditioning(
     state: AppState,
     body: dict[str, Any],
 ) -> dict[str, Any]:
-    """Normalize IC-LoRA motion-reference fields into ``video_conditioning``."""
+    """Normalize IC-LoRA / V2V motion-reference fields into ``video_conditioning``."""
     body = dict(body)
-    if (body.get("mode") or "generate").strip().lower() != "ic_lora":
+    if (body.get("mode") or "generate").strip().lower() not in ("ic_lora", "v2v"):
         return body
     if body.get("video_conditioning"):
         return body
@@ -1454,8 +1568,9 @@ def _ic_lora_primary_spec(*, has_motion: bool, has_character: bool) -> str:
 
 
 def _apply_ic_lora_defaults(body: dict[str, Any]) -> dict[str, Any]:
-    """Ensure the correct primary IC-LoRA is first; keep extra user-selected LoRAs.
+    """Ensure a sensible primary IC-LoRA; keep extra user-selected LoRAs.
 
+  - Custom-only LoRA list (e.g. CrossView Prompt) → leave as-is (no HDR/Union inject).
   - Motion video + character image → Union Control (pose motion transfer).
   - Motion video only → HDR IC-LoRA (V2V / T2V + reference video).
   - No motion video → HDR IC-LoRA (pure T2V).
@@ -1463,23 +1578,39 @@ def _apply_ic_lora_defaults(body: dict[str, Any]) -> dict[str, Any]:
     if (body.get("mode") or "generate").strip().lower() != "ic_lora":
         return body
     new_body = dict(body)
-    has_motion = _ic_lora_has_motion_reference(new_body)
-    has_character = bool(new_body.get("image_path"))
-    primary = _ic_lora_primary_spec(has_motion=has_motion, has_character=has_character)
-    merged: list[list[Any]] = [[primary, IC_LORA_DEFAULT_SCALE]]
-    seen = {primary}
+
+    parsed: list[list[Any]] = []
+    seen_specs: set[str] = set()
     for item in new_body.get("lora_specs") or []:
         if not isinstance(item, (list, tuple)) or len(item) < 2:
             continue
         spec = str(item[0]).strip()
-        if not spec or spec in seen:
-            continue
-        if spec in IC_LORA_BUILTIN_SPECS and spec != primary:
+        if not spec or spec in seen_specs:
             continue
         try:
             scale = float(item[1])
         except (TypeError, ValueError):
             scale = IC_LORA_DEFAULT_SCALE
+        parsed.append([spec, scale])
+        seen_specs.add(spec)
+
+    has_builtin = any(spec in IC_LORA_BUILTIN_SPECS for spec, _ in parsed)
+    custom_only = bool(parsed) and not has_builtin
+    if custom_only:
+        # User chose a non-builtin IC-LoRA (CrossView, community adapters, …).
+        new_body["lora_specs"] = parsed
+        return new_body
+
+    has_motion = _ic_lora_has_motion_reference(new_body)
+    has_character = bool(new_body.get("image_path"))
+    primary = _ic_lora_primary_spec(has_motion=has_motion, has_character=has_character)
+    merged: list[list[Any]] = [[primary, IC_LORA_DEFAULT_SCALE]]
+    seen = {primary}
+    for spec, scale in parsed:
+        if spec in seen:
+            continue
+        if spec in IC_LORA_BUILTIN_SPECS and spec != primary:
+            continue
         merged.append([spec, scale])
         seen.add(spec)
     new_body["lora_specs"] = merged
@@ -1491,6 +1622,9 @@ def _api_mode(mode: str) -> str:
     m = (mode or "generate").strip().lower()
     if m == "i2v":
         return "generate"
+    # V2V + LoRA uses the same ICLoraPipeline path as IC-LoRA, without HDR/Union defaults.
+    if m == "v2v":
+        return "ic_lora"
     return m
 
 
@@ -1499,6 +1633,15 @@ def _resolve_seed(raw: Any) -> int:
     if raw is None:
         return -1
     return int(raw)
+
+
+def _optional_float(raw: Any) -> float | None:
+    if raw in (None, ""):
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 def _local_file_ref(path: str | None) -> str | None:
@@ -1518,11 +1661,20 @@ def _build_params_from_request(body: dict[str, Any], *, state: AppState | None =
     ) = _import_videofentanyl()
     ui_mode = (body.get("mode") or "generate").strip().lower()
     mode = _api_mode(ui_mode)
-    image_path = body.get("image_path") if ui_mode in ("i2v", "a2v", "generate", "keyframe", "ic_lora") else None
+    image_path = body.get("image_path") if ui_mode in (
+        "i2v",
+        "a2v",
+        "generate",
+        "keyframe",
+        "ic_lora",
+        "v2v",
+        "lipdub",
+        "face_swap",
+    ) else None
     end_image_path = body.get("end_image_path") if ui_mode == "keyframe" else None
     audio_path = body.get("audio_path") if ui_mode in ("a2v", "lipdub") else None
     video_path: str | None = None
-    if ui_mode in ("retake", "extend", "lipdub"):
+    if ui_mode in ("retake", "extend", "lipdub", "face_swap"):
         if state is not None:
             video_path = resolve_source_video_path(state, body)
         else:
@@ -1605,8 +1757,9 @@ def _build_params_from_request(body: dict[str, Any], *, state: AppState | None =
         stg_scale=body.get("stg_scale"),
         stage2_steps=body.get("stage2_steps"),
         no_regen_audio=bool(body.get("no_regen_audio", False)),
-        reference_strength=body.get("reference_strength"),
+        reference_strength=_optional_float(body.get("reference_strength")),
         audio_start_seconds=audio_start_seconds,
+        negative_prompt=str(body.get("negative_prompt") or "").strip(),
     )
 
 
@@ -1788,6 +1941,7 @@ async def _run_clip_inprocess(
                         no_regen_audio=bool(getattr(params, "no_regen_audio", False)),
                         reference_strength=getattr(params, "reference_strength", None),
                         audio_start_seconds=getattr(params, "audio_start_seconds", None),
+                        negative_prompt=str(getattr(params, "negative_prompt", "") or ""),
                     )
                 )
                 while not gen_task.done():
@@ -2733,6 +2887,13 @@ def create_app(
             "ic_lora_motion_preset_id": IC_LORA_MOTION_PRESET_ID,
             "ic_lora_default_spec": IC_LORA_DEFAULT_SPEC,
             "ic_lora_union_motion_spec": IC_LORA_UNION_MOTION_SPEC,
+            "face_swap_preset_id": FACE_SWAP_PRESET_ID,
+            "face_swap_default_spec": FACE_SWAP_DEFAULT_SPEC,
+            "lipdub_preset_id": LIPDUB_PRESET_ID,
+            "lipdub_default_spec": _builtin_lipdub_spec(),
+            "lipdub_official_gated_spec": LIPDUB_OFFICIAL_GATED_SPEC,
+            "lipdub_official_hf_url": f"https://huggingface.co/{LIPDUB_OFFICIAL_REPO}",
+            "lipdub_env_var": ENV_LIPDUB_LORA,
             "pose_control_available": _pose_control_available(),
             "pyav_available": media_available(),
             "audio_trim_available": media_available(),
@@ -2757,8 +2918,8 @@ def create_app(
             raise HTTPException(400, "spec or url is required")
         if not (
             spec.startswith(("http://", "https://"))
-            or spec.endswith(".safetensors")
-            or Path(spec).expanduser().exists()
+            or (spec.endswith(".safetensors") and Path(spec).expanduser().is_file())
+            or Path(spec).expanduser().is_file()
         ):
             raise HTTPException(
                 400,
@@ -2769,7 +2930,6 @@ def create_app(
         except (TypeError, ValueError):
             raise HTTPException(400, "scale must be a number")
         label = str(body.get("label") or "").strip() or _label_for_lora_spec(spec)
-        lid = f"custom_{uuid.uuid4().hex[:8]}"
         entries = [
             {
                 "id": e["id"],
@@ -2779,16 +2939,43 @@ def create_app(
             }
             for e in _read_custom_loras(state.output_dir)
         ]
-        entries.append({"id": lid, "label": label, "spec": spec, "scale": scale})
+        # Reuse an existing custom with the same normalized URL so the menu does not
+        # accumulate orphan ids that never appear in the catalog.
+        existing = next((e for e in entries if str(e.get("spec") or "") == spec), None)
+        reused = existing is not None
+        if existing is not None:
+            lid = str(existing["id"])
+            existing["label"] = label
+            existing["scale"] = scale
+        else:
+            lid = f"custom_{uuid.uuid4().hex[:8]}"
+            entries.append({"id": lid, "label": label, "spec": spec, "scale": scale})
         _write_custom_loras(state.output_dir, entries)
+
+        # If this id was previously hidden from the menu, un-hide it.
+        hidden = _read_hidden_lora_ids(state.output_dir)
+        if lid in hidden:
+            hidden.discard(lid)
+            _persist_hidden_lora_ids(state.output_dir, hidden)
+
         lora_presets, default_lora_preset_id = _lora_catalog(state.output_dir)
+        preset = next((p for p in lora_presets if p.get("id") == lid), None)
+        if preset is None:
+            raise HTTPException(
+                500,
+                f"Custom LoRA was saved but did not appear in the catalog (id={lid})",
+            )
+
         preferred = state.preferred_lora_preset_ids()
         if lid not in preferred:
             preferred.append(lid)
             state.persist_preferred_loras(preferred)
+
         return {
             "ok": True,
             "id": lid,
+            "reused": reused,
+            "preset": preset,
             "lora_presets": lora_presets,
             "default_lora_preset_id": default_lora_preset_id,
             "preferred_lora_preset_ids": state.preferred_lora_preset_ids(),
@@ -2835,8 +3022,10 @@ def create_app(
             async with lock:
                 result = await asyncio.to_thread(_ensure_lora_downloaded, spec)
         except Exception as exc:
+            from ltx_mlx_backend import format_lora_download_error
+
             log.warning("LoRA ensure failed for %s: %s", spec, exc)
-            raise HTTPException(500, f"LoRA download failed: {exc}") from exc
+            raise HTTPException(500, format_lora_download_error(exc, spec)) from exc
         log.info(
             "LoRA ensure complete: %s (cached=%s)",
             spec[:160],
@@ -2964,8 +3153,33 @@ def create_app(
             raise HTTPException(400, "a2v mode requires an audio upload")
         _validate_source_video_request(state, body, ui_mode)
         body = _resolve_ic_lora_video_conditioning(state, body)
+        if ui_mode == "v2v":
+            if not body.get("video_conditioning"):
+                raise HTTPException(400, "v2v mode requires a reference video")
+            # LoRA is optional: empty = pure reference-video conditioning (motion transfer).
+            for lora_item in body.get("lora_specs") or []:
+                if not isinstance(lora_item, (list, tuple)) or not lora_item:
+                    continue
+                spec = str(lora_item[0])
+                try:
+                    await asyncio.to_thread(_ensure_lora_downloaded, spec)
+                except Exception as exc:
+                    raise HTTPException(
+                        400,
+                        f"Could not download V2V LoRA weights ({spec}): {exc}",
+                    ) from exc
         if ui_mode == "ic_lora":
             body = _apply_ic_lora_defaults(body)
+            if not body.get("video_conditioning") and not body.get("image_path"):
+                # HDR T2V (upstream hdr-ic-lora without --video-conditioning).
+                pass
+            elif not body.get("video_conditioning"):
+                # Union / motion transfer always needs a reference clip.
+                raise HTTPException(
+                    400,
+                    "IC-LoRA with a character image requires a reference video "
+                    "(Union Control). For HDR text-to-video, omit the character image.",
+                )
             for lora_item in body.get("lora_specs") or []:
                 if not isinstance(lora_item, (list, tuple)) or not lora_item:
                     continue
@@ -2982,7 +3196,54 @@ def create_app(
         if ui_mode == "lipdub":
             lora_items = body.get("lora_specs") or []
             if len(lora_items) != 1:
-                raise HTTPException(400, "lipdub requires exactly one LoRA preset")
+                raise HTTPException(400, "lipdub requires exactly one LoRA preset (LipDub IC-LoRA)")
+            _validate_source_video_request(state, body, ui_mode)
+            if not body.get("audio_path") and media_available():
+                try:
+                    ref_path = resolve_source_video_path(state, body)
+                except ValueError as exc:
+                    raise HTTPException(400, str(exc)) from exc
+                if ref_path:
+                    from ltx_media import probe_video_info
+
+                    info = probe_video_info(ref_path)
+                    if not info.has_audio:
+                        raise HTTPException(
+                            400,
+                            "lipdub requires voice-tone audio: upload an audio file or "
+                            "use a reference video with an audio track",
+                        )
+            for lora_item in lora_items:
+                if not isinstance(lora_item, (list, tuple)) or not lora_item:
+                    continue
+                spec = str(lora_item[0])
+                try:
+                    await asyncio.to_thread(_ensure_lora_downloaded, spec)
+                except Exception as exc:
+                    from ltx_mlx_backend import format_lora_download_error
+
+                    raise HTTPException(
+                        400,
+                        format_lora_download_error(exc, spec),
+                    ) from exc
+        if ui_mode == "face_swap":
+            if not body.get("image_path"):
+                raise HTTPException(400, "face_swap requires a face identity image")
+            lora_items = body.get("lora_specs") or []
+            if len(lora_items) != 1:
+                raise HTTPException(400, "face_swap requires exactly one LoRA preset (head swap)")
+            _validate_source_video_request(state, body, ui_mode)
+            for lora_item in lora_items:
+                if not isinstance(lora_item, (list, tuple)) or not lora_item:
+                    continue
+                spec = str(lora_item[0])
+                try:
+                    await asyncio.to_thread(_ensure_lora_downloaded, spec)
+                except Exception as exc:
+                    raise HTTPException(
+                        400,
+                        f"Could not download face-swap LoRA weights ({spec}): {exc}",
+                    ) from exc
 
         _validate_request_media_paths(body)
         try:

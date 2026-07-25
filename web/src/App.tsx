@@ -257,30 +257,47 @@ function LoraMultiSelect({
       </button>
       {open && (
         <div className="multi-select-menu" role="listbox" aria-label="LoRA presets">
-          {presets.map((p) => (
-            <label key={p.id} className="multi-select-item">
-              <input
-                type="checkbox"
-                checked={selectedIds.includes(p.id)}
-                disabled={disabled}
-                onChange={(e) => onToggle(p.id, e.target.checked)}
-              />
-              <span className="multi-select-item-label">{p.label}</span>
-              <button
-                type="button"
-                className="lora-remove"
-                title="Remove from list"
-                disabled={disabled}
-                onClick={(e) => {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  onRemovePreset(p);
-                }}
+          {presets.map((p) => {
+            const checked = selectedIds.includes(p.id);
+            return (
+              <div
+                key={p.id}
+                className={`multi-select-item${checked ? " is-selected" : ""}`}
+                role="option"
+                aria-selected={checked}
               >
-                ×
-              </button>
-            </label>
-          ))}
+                <input
+                  type="checkbox"
+                  checked={checked}
+                  disabled={disabled}
+                  aria-label={p.label}
+                  onChange={(e) => onToggle(p.id, e.target.checked)}
+                />
+                <span
+                  className="multi-select-item-label"
+                  title={p.label}
+                  onClick={() => {
+                    if (!disabled) onToggle(p.id, !checked);
+                  }}
+                >
+                  {p.label}
+                </span>
+                <button
+                  type="button"
+                  className="lora-remove"
+                  title="Remove from list"
+                  disabled={disabled}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    onRemovePreset(p);
+                  }}
+                >
+                  ×
+                </button>
+              </div>
+            );
+          })}
         </div>
       )}
     </div>
@@ -294,6 +311,8 @@ export default function App() {
   const [chainId, setChainId] = useState<string | null>(null);
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
   const [prompt, setPrompt] = useState("");
+  const [negativePrompt, setNegativePrompt] = useState("");
+  const [showNegativePrompt, setShowNegativePrompt] = useState(false);
   const [busy, setBusy] = useState(false);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [progress, setProgress] = useState<ProgressState | null>(null);
@@ -324,10 +343,12 @@ export default function App() {
   const [audioDurationSeconds, setAudioDurationSeconds] = useState<number | null>(null);
   const [audioStartSeconds, setAudioStartSeconds] = useState(0);
   const [videoPath, setVideoPath] = useState<string | null>(null);
+  const [videoName, setVideoName] = useState<string | null>(null);
   const [conditioningVideoPath, setConditioningVideoPath] = useState<string | null>(null);
   const [conditioningVideoName, setConditioningVideoName] = useState<string | null>(null);
   const [conditioningClipId, setConditioningClipId] = useState<string | null>(null);
   const [conditioningVideoScale, setConditioningVideoScale] = useState(1.0);
+  const [referenceStrength, setReferenceStrength] = useState(1.0);
   const [sourceClipId, setSourceClipId] = useState<string | null>(null);
   const [retakeStart, setRetakeStart] = useState(1);
   const [retakeEnd, setRetakeEnd] = useState(1);
@@ -389,11 +410,14 @@ export default function App() {
       case "motion_transfer":
         return "Union Control — motion transfer (video + character)";
       case "v2v":
-        return "HDR — reference video only (V2V / T2V + video)";
+        return "HDR IC-LoRA — reference video (built-in)";
       default:
-        return "HDR — text to video (no reference video)";
+        return "HDR IC-LoRA — add a reference video";
     }
   }, [icLoraSubMode]);
+
+  const faceSwapPresetId = config?.face_swap_preset_id ?? "face_swap_head";
+  const lipDubPresetId = config?.lipdub_preset_id ?? "lipdub_ic_lora";
 
   const chainParts = useMemo(() => {
     if (!chainId || !selectedClipId) return [];
@@ -420,7 +444,7 @@ export default function App() {
     setChainId(null);
     setSourceClipId(null);
     setMode((current) => {
-      if (["retake", "extend", "lipdub"].includes(current)) return "generate";
+      if (["retake", "extend", "lipdub", "face_swap"].includes(current)) return "generate";
       if (current === "i2v" && !imagePath) return "generate";
       if (current === "a2v" && !audioPath && !audioFile) return "generate";
       if (current === "keyframe" && (!imagePath || !endImagePath)) return "generate";
@@ -469,7 +493,7 @@ export default function App() {
         releaseClipContext();
       } else if (deleted && sourceClipId === deleted.id) {
         setMode((current) =>
-          ["retake", "extend", "lipdub"].includes(current) ? "generate" : current,
+          ["retake", "extend", "lipdub", "face_swap"].includes(current) ? "generate" : current,
         );
       }
     },
@@ -618,16 +642,25 @@ export default function App() {
   useEffect(() => {
     const entered = mode === "ic_lora" && prevModeRef.current !== "ic_lora";
     const left = mode !== "ic_lora" && prevModeRef.current === "ic_lora";
+    const enteredV2v = mode === "v2v" && prevModeRef.current !== "v2v";
     prevModeRef.current = mode;
 
     if (entered) {
       preIcLoraPresetIdsRef.current = loraPresetIds;
+      // Drop carry-over LoRAs from other modes so HDR/Union can be applied cleanly.
+      setLoraPresetIds([]);
     } else if (left && preIcLoraPresetIdsRef.current !== null) {
       setLoraPresetIds(preIcLoraPresetIdsRef.current);
       preIcLoraPresetIdsRef.current = null;
     }
+    if (enteredV2v) {
+      const hdrId = config?.ic_lora_preset_id ?? "ic_lora_hdr";
+      const motionId = config?.ic_lora_motion_preset_id ?? "ic_lora_union_motion";
+      // V2V is custom-LoRA oriented — drop built-in HDR/Union so they are not applied.
+      setLoraPresetIds((prev) => prev.filter((id) => id !== hdrId && id !== motionId));
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- snapshot on mode enter only
-  }, [mode]);
+  }, [mode, config?.ic_lora_preset_id, config?.ic_lora_motion_preset_id]);
 
   useEffect(() => {
     if (mode !== "ic_lora" || !icLoraPresetId) return;
@@ -635,6 +668,11 @@ export default function App() {
     const motionId = config?.ic_lora_motion_preset_id ?? "ic_lora_union_motion";
     setLoraPresetIds((prev) => {
       const extras = prev.filter((id) => id !== hdrId && id !== motionId);
+      const hasBuiltin = prev.includes(hdrId) || prev.includes(motionId);
+      // Rare: user cleared builtins — don't force HDR back if they emptied the list mid-edit.
+      if (prev.length > 0 && !hasBuiltin) {
+        return prev;
+      }
       const next = [icLoraPresetId, ...extras];
       if (next.length === prev.length && next.every((id, i) => prev[i] === id)) {
         return prev;
@@ -642,14 +680,29 @@ export default function App() {
       return next;
     });
     void ensureLoraPresets([icLoraPresetId], config?.lora_presets, { interactive: true });
+    // Intentionally omit config.lora_presets: catalog updates (custom add) must not
+    // re-run this sync and wipe or re-force the HDR/Union primary.
   }, [
     mode,
     icLoraPresetId,
     config?.ic_lora_preset_id,
     config?.ic_lora_motion_preset_id,
-    config?.lora_presets,
     ensureLoraPresets,
   ]);
+
+  useEffect(() => {
+    if (mode !== "face_swap" || !faceSwapPresetId) return;
+    setLoraPresetIds([faceSwapPresetId]);
+    void ensureLoraPresets([faceSwapPresetId], config?.lora_presets, { interactive: true });
+  }, [mode, faceSwapPresetId, config?.lora_presets, ensureLoraPresets]);
+
+  useEffect(() => {
+    if (mode !== "lipdub" || !lipDubPresetId) return;
+    const preset = config?.lora_presets?.find((p) => p.id === lipDubPresetId && p.spec);
+    if (!preset) return;
+    setLoraPresetIds([lipDubPresetId]);
+    void ensureLoraPresets([lipDubPresetId], config?.lora_presets, { interactive: true });
+  }, [mode, lipDubPresetId, config?.lora_presets, ensureLoraPresets]);
 
   const persistLoraSelection = useCallback(async (ids: string[]) => {
     try {
@@ -678,11 +731,20 @@ export default function App() {
         if (mode === "ic_lora") {
           const hdrId = config?.ic_lora_preset_id ?? "ic_lora_hdr";
           const motionId = config?.ic_lora_motion_preset_id ?? "ic_lora_union_motion";
-          if (presetId === hdrId && checked) {
-            next = next.filter((id) => id !== motionId);
-          } else if (presetId === motionId && checked) {
-            next = next.filter((id) => id !== hdrId);
+          const isBuiltin = presetId === hdrId || presetId === motionId;
+          if (checked && isBuiltin) {
+            // One IC-LoRA primary: HDR or Union alone (no stacked community adapters).
+            next = [presetId];
+          } else if (checked && !isBuiltin) {
+            // Custom IC-LoRA (CrossView, etc.) replaces HDR/Union as the primary.
+            next = next.filter((id) => id !== hdrId && id !== motionId);
           }
+        }
+        if (mode === "face_swap" && checked) {
+          next = [presetId];
+        }
+        if (mode === "lipdub" && checked) {
+          next = [presetId];
         }
         void persistLoraSelection(next);
         void ensureLoraPresets(next, undefined, { interactive: true });
@@ -692,18 +754,54 @@ export default function App() {
     [config?.ic_lora_motion_preset_id, config?.ic_lora_preset_id, ensureLoraPresets, loraBusy, mode, persistLoraSelection],
   );
 
+  const updateLoraPresetScale = useCallback(
+    (presetId: string, scale: number) => {
+      const nextScale = Math.min(2, Math.max(0, scale));
+      const preset =
+        loraPresetsRef.current.find((p) => p.id === presetId) ??
+        config?.lora_presets?.find((p) => p.id === presetId);
+      setConfig((c) => {
+        if (!c?.lora_presets) return c;
+        const nextPresets = c.lora_presets.map((p) =>
+          p.id === presetId ? { ...p, scale: nextScale } : p,
+        );
+        loraPresetsRef.current = nextPresets;
+        return { ...c, lora_presets: nextPresets };
+      });
+      if (preset?.custom && preset.spec) {
+        void fetch(`${API}/api/loras/custom`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            spec: preset.spec,
+            label: preset.label,
+            scale: nextScale,
+          }),
+        }).catch((err) => console.warn("Could not persist LoRA strength", err));
+      }
+    },
+    [config?.lora_presets],
+  );
+
   async function addCustomLora() {
     const spec = customLoraUrl.trim();
     if (!spec || addingCustomLora) return;
     setAddingCustomLora(true);
     try {
+      const lower = spec.toLowerCase();
+      const isCrossView = lower.includes("crossview") || lower.includes("cross-view");
+      let scale = parseFloat(customLoraScale) || 1.0;
+      if (isCrossView && scale < 1.2) {
+        scale = 1.25;
+        setCustomLoraScale("1.25");
+      }
       const r = await fetch(`${API}/api/loras/custom`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           spec,
           label: customLoraLabel.trim() || undefined,
-          scale: parseFloat(customLoraScale) || 1.0,
+          scale,
         }),
       });
       if (!r.ok) {
@@ -711,7 +809,14 @@ export default function App() {
         throw new Error(err.detail || "Could not add custom LoRA");
       }
       const data = await r.json();
-      const nextPresets = data.lora_presets ?? [];
+      const nextPresets: LoraPreset[] = data.lora_presets ?? [];
+      const newId = typeof data.id === "string" ? data.id : "";
+      const added: LoraPreset | undefined =
+        (data.preset as LoraPreset | undefined) ??
+        nextPresets.find((p) => p.id === newId);
+      if (!newId || !added) {
+        throw new Error("Custom LoRA saved but missing from the LoRA menu catalog");
+      }
       loraPresetsRef.current = nextPresets;
       setConfig((c) =>
         c
@@ -723,14 +828,31 @@ export default function App() {
             }
           : c,
       );
-      const ids: string[] = data.preferred_lora_preset_ids ?? [];
-      setLoraPresetIds(ids);
+      // Select the new adapter so it shows checked in the menu and is used on generate.
+      setLoraPresetIds((prev) => {
+        let nextIds: string[];
+        if (mode === "ic_lora" || mode === "lipdub" || mode === "face_swap") {
+          nextIds = [newId];
+        } else if (mode === "v2v") {
+          // V2V allows stacking multiple community LoRAs.
+          nextIds = [...prev.filter((id) => id !== newId), newId];
+        } else {
+          nextIds = prev.filter((id) => id !== newId);
+          nextIds.push(newId);
+        }
+        void persistLoraSelection(nextIds);
+        return nextIds;
+      });
       setCustomLoraUrl("");
       setCustomLoraLabel("");
-      setCustomLoraScale("1.0");
-      if (data.id) {
-        await ensureLoraPresets([data.id], nextPresets, { interactive: true });
-      }
+      setCustomLoraScale(isCrossView ? "1.25" : "1.0");
+      await ensureLoraPresets([newId], nextPresets, { interactive: true });
+      setLoraActivity({
+        phase: "ready",
+        message: data.reused
+          ? `LoRA updated & selected: ${added.label}`
+          : `LoRA ready & selected: ${added.label}`,
+      });
     } catch (e) {
       setLoraActivity({ phase: "error", message: String(e) });
     } finally {
@@ -994,11 +1116,13 @@ export default function App() {
     setEndImageName(null);
     resetAudioSelection();
     setVideoPath(null);
+    setVideoName(null);
     setSourceClipId(null);
     setConditioningVideoPath(null);
     setConditioningVideoName(null);
     setConditioningClipId(null);
     setConditioningVideoScale(1.0);
+    setReferenceStrength(1.0);
     if (imageRef.current) imageRef.current.value = "";
     if (endImageRef.current) endImageRef.current.value = "";
     if (videoRef.current) videoRef.current.value = "";
@@ -1006,7 +1130,7 @@ export default function App() {
   }
 
   function clearMediaForMode(nextMode: string) {
-    if (!["i2v", "generate", "a2v", "keyframe", "ic_lora"].includes(nextMode)) {
+    if (!["i2v", "generate", "a2v", "keyframe", "ic_lora", "v2v", "lipdub", "face_swap"].includes(nextMode)) {
       setImagePath(null);
       setImageName(null);
       if (imageRef.current) imageRef.current.value = "";
@@ -1020,22 +1144,24 @@ export default function App() {
       resetAudioSelection();
       setAudiocontinue(false);
     }
-    if (!["retake", "extend", "lipdub"].includes(nextMode)) {
+    if (!["retake", "extend", "lipdub", "face_swap"].includes(nextMode)) {
       setVideoPath(null);
+      setVideoName(null);
       setSourceClipId(null);
       if (videoRef.current) videoRef.current.value = "";
     }
-    if (nextMode !== "ic_lora") {
+    if (nextMode !== "ic_lora" && nextMode !== "v2v") {
       setConditioningVideoPath(null);
       setConditioningVideoName(null);
       setConditioningClipId(null);
       setConditioningVideoScale(1.0);
+      setReferenceStrength(1.0);
       if (conditioningVideoRef.current) conditioningVideoRef.current.value = "";
     }
     if (nextMode === "a2v") {
       setChainMethod("autocontinue");
     }
-    if (nextMode === "ic_lora") {
+    if (nextMode === "ic_lora" || nextMode === "v2v" || nextMode === "face_swap" || nextMode === "lipdub") {
       setClipMultiplier(1);
       setAutocontinue(false);
       setAutoconcat(false);
@@ -1072,13 +1198,16 @@ export default function App() {
 
   const needsImageUpload = mode === "i2v" || mode === "keyframe";
   const isA2v = mode === "a2v";
+  const isV2v = mode === "v2v";
   const isIcLora = mode === "ic_lora";
+  const isFaceSwap = mode === "face_swap";
+  const isLipDub = mode === "lipdub";
   const pyavAvailable =
     config?.pyav_available ?? config?.audio_trim_available ?? false;
   const audioTrimAvailable = pyavAvailable;
   const needsEndImageUpload = mode === "keyframe";
-  const needsVideoUpload = mode === "retake" || mode === "extend" || mode === "lipdub";
-  const showStartImageOptional = mode === "generate";
+  const needsVideoUpload =
+    mode === "retake" || mode === "extend" || mode === "lipdub";
   const isT2vLike = mode === "generate" || mode === "i2v";
   const showChainMethodChoice =
     isT2vLike && !audiocontinue && isMultiClip;
@@ -1443,6 +1572,10 @@ export default function App() {
       chain_id: isChainEdit ? chainId : undefined,
       continue_from: isChainEdit ? activeClip?.id : undefined,
     };
+    const neg = negativePrompt.trim();
+    if (neg) {
+      body.negative_prompt = neg;
+    }
     if (mode === "retake") {
       body.retake_start = retakeStart;
       body.retake_end = retakeEnd;
@@ -1452,7 +1585,7 @@ export default function App() {
       body.extend_direction = extendDirection;
     }
     if (
-      (mode === "i2v" || mode === "generate" || mode === "a2v" || mode === "keyframe" || mode === "ic_lora") &&
+      (mode === "i2v" || mode === "generate" || mode === "a2v" || mode === "keyframe" || mode === "ic_lora" || mode === "v2v" || mode === "lipdub" || mode === "face_swap") &&
       imagePath
     ) {
       body.image_path = imagePath;
@@ -1465,7 +1598,7 @@ export default function App() {
       resolvedAudioPath = await uploadFile(audioFile, "audio");
       setAudioPath(resolvedAudioPath);
     }
-    if ((mode === "a2v" || mode === "lipdub") && resolvedAudioPath) {
+    if (mode === "a2v" && resolvedAudioPath) {
       body.audio_path = resolvedAudioPath;
       if (mode === "a2v" && audioStartSeconds > 0) {
         body.audio_start_seconds = audioStartSeconds;
@@ -1474,7 +1607,10 @@ export default function App() {
         }
       }
     }
-    if (mode === "ic_lora") {
+    if (mode === "lipdub" && resolvedAudioPath) {
+      body.audio_path = resolvedAudioPath;
+    }
+    if (mode === "ic_lora" || mode === "v2v") {
       if (conditioningVideoPath) {
         body.conditioning_video_path = conditioningVideoPath;
         body.conditioning_video_scale = conditioningVideoScale;
@@ -1482,10 +1618,11 @@ export default function App() {
         body.conditioning_clip_id = conditioningClipId;
         body.conditioning_video_scale = conditioningVideoScale;
       }
+      body.reference_strength = referenceStrength;
     }
-    if ((mode === "retake" || mode === "extend" || mode === "lipdub") && sourceClipId) {
+    if ((mode === "retake" || mode === "extend" || mode === "lipdub" || mode === "face_swap") && sourceClipId) {
       body.source_clip_id = sourceClipId;
-    } else if ((mode === "retake" || mode === "extend" || mode === "lipdub") && videoPath) {
+    } else if ((mode === "retake" || mode === "extend" || mode === "lipdub" || mode === "face_swap") && videoPath) {
       body.video_path = videoPath;
     }
     if (seed.trim()) {
@@ -1498,7 +1635,13 @@ export default function App() {
       (p) => loraPresetIds.includes(p.id) && p.spec,
     );
     if (mode === "lipdub" && selectedLoras.length !== 1) {
-      setError("LipDub requires exactly one LoRA — select a single preset.");
+      setError("LipDub requires exactly one LoRA — use the LipDub IC-LoRA preset.");
+      setBusy(false);
+      setProgress(null);
+      return;
+    }
+    if (mode === "face_swap" && selectedLoras.length !== 1) {
+      setError("Face swap requires exactly one LoRA — use the head-swap preset.");
       setBusy(false);
       setProgress(null);
       return;
@@ -1552,13 +1695,24 @@ export default function App() {
 
   const canSubmit = useMemo(() => {
     if (!prompt.trim() || busy || !serverOk) return false;
-    if (mode === "ic_lora" && loraBusy) return false;
+    if ((isV2v || isIcLora) && loraBusy) return false;
+    // V2V: reference video required; LoRA optional (pure motion transfer OK).
+    if (isV2v && !hasConditioningVideo) return false;
+    // IC-LoRA HDR/Union: need a selected LoRA (server may also inject defaults).
+    if (isIcLora && loraPresetIds.length === 0) return false;
+    // Union / motion transfer needs a reference clip when a character image is set.
+    // HDR text-to-video may omit the reference (matches upstream hdr-ic-lora).
+    if (isIcLora && Boolean(imagePath) && !hasConditioningVideo) return false;
+    if (mode === "lipdub" && loraBusy) return false;
+    if (mode === "face_swap" && loraBusy) return false;
+    if (mode === "face_swap" && loraPresetIds.length !== 1) return false;
     const continuing = willContinueChain;
     if (mode === "i2v" && !imagePath && !continuing) return false;
+    if (mode === "face_swap" && !imagePath) return false;
     if (mode === "a2v" && !audioPath && !audioFile) return false;
     if (mode === "a2v" && audioStartSeconds > 0 && !audioTrimAvailable) return false;
     if (audiocontinue && !pyavAvailable) return false;
-    if ((mode === "retake" || mode === "extend" || mode === "lipdub") && !hasVideoSource) {
+    if ((mode === "retake" || mode === "extend" || mode === "lipdub" || mode === "face_swap") && !hasVideoSource) {
       return false;
     }
     return true;
@@ -1567,6 +1721,8 @@ export default function App() {
     busy,
     serverOk,
     mode,
+    isV2v,
+    isIcLora,
     imagePath,
     audioPath,
     audioFile,
@@ -1577,10 +1733,14 @@ export default function App() {
     videoPath,
     sourceClipId,
     hasVideoSource,
+    hasConditioningVideo,
+    loraPresetIds,
     autocontinue,
     activeClip,
     chainId,
     loraBusy,
+    willContinueChain,
+    audioStartSeconds,
   ]);
 
   const fitPromptHeight = useCallback(() => {
@@ -1772,15 +1932,56 @@ export default function App() {
                 }}
                 disabled={busy}
               />
-              <button
-                type="button"
-                className="btn-prompt-clear"
-                onClick={() => setPrompt("")}
-                disabled={busy || !prompt}
-                aria-label="Clear prompt"
-              >
-                CLEAR
-              </button>
+              {(showNegativePrompt || !!negativePrompt.trim()) && (
+                <input
+                  type="text"
+                  className="negative-prompt-input"
+                  placeholder="Negative prompt (optional)"
+                  value={negativePrompt}
+                  onChange={(e) => setNegativePrompt(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      void handleGenerate();
+                    }
+                  }}
+                  disabled={busy}
+                  aria-label="Negative prompt"
+                />
+              )}
+              <div className="prompt-field-actions">
+                <button
+                  type="button"
+                  className={`btn-prompt-action${showNegativePrompt || negativePrompt.trim() ? " is-active" : ""}`}
+                  onClick={() => {
+                    setShowNegativePrompt((v) => {
+                      const next = !v;
+                      if (!next) setNegativePrompt("");
+                      return next;
+                    });
+                  }}
+                  disabled={busy}
+                  aria-pressed={showNegativePrompt || !!negativePrompt.trim()}
+                  aria-label={
+                    showNegativePrompt || negativePrompt.trim()
+                      ? "Hide negative prompt"
+                      : "Show negative prompt"
+                  }
+                  title="Show or hide negative prompt"
+                >
+                  Negative
+                </button>
+                <button
+                  type="button"
+                  className="btn-prompt-action"
+                  onClick={() => setPrompt("")}
+                  disabled={busy || !prompt}
+                  aria-label="Clear prompt"
+                  title="Clear prompt"
+                >
+                  Clear
+                </button>
+              </div>
             </div>
             <button
               type="button"
@@ -1874,7 +2075,7 @@ export default function App() {
                   Clips
                   <select
                     value={clipMultiplier}
-                    disabled={isIcLora}
+                    disabled={isV2v || isIcLora || isFaceSwap || isLipDub}
                     onChange={(e) => setClipMultiplier(Number(e.target.value))}
                   >
                     {Array.from(
@@ -1936,16 +2137,16 @@ export default function App() {
               )}
 
               <div className="lora-row">
-                <label className="lora-row-select">
-                  LoRA
+                <div className="lora-row-select">
+                  <span className="lora-field-label">LoRA</span>
                   <LoraMultiSelect
                     presets={(config.lora_presets ?? []).filter((p) => p.id !== "none")}
                     selectedIds={loraPresetIds}
-                    disabled={loraBusy || addingCustomLora}
+                    disabled={loraBusy || addingCustomLora || isFaceSwap || isLipDub}
                     onToggle={(id, checked) => toggleLoraPreset(id, checked)}
                     onRemovePreset={(preset) => void removeLoraPreset(preset)}
                   />
-                </label>
+                </div>
                 <div className="lora-row-add">
                   <input
                     type="text"
@@ -2031,7 +2232,7 @@ export default function App() {
                   />
                   Enhance prompt
                 </label>
-                {!isMultiClip && !audiocontinue && !isIcLora && (
+                {!isMultiClip && !audiocontinue && !isV2v && !isIcLora && !isFaceSwap && !isLipDub && (
                   <label className="check">
                     <input
                       type="checkbox"
@@ -2046,7 +2247,7 @@ export default function App() {
                     type="checkbox"
                     checked={autoconcat}
                     onChange={(e) => setAutoconcat(e.target.checked)}
-                    disabled={isMultiClip || audiocontinue || isIcLora}
+                    disabled={isMultiClip || audiocontinue || isV2v || isIcLora || isFaceSwap || isLipDub}
                   />
                   Autoconcat
                 </label>
@@ -2092,8 +2293,339 @@ export default function App() {
                 </div>
               )}
 
-              {(isA2v || isIcLora || needsImageUpload || showStartImageOptional || needsVideoUpload || needsEndImageUpload) && (
+              {(isA2v || isV2v || isIcLora || isFaceSwap || isLipDub || needsImageUpload || needsVideoUpload || needsEndImageUpload) && (
                 <div className="media-panel">
+                  {isLipDub && (
+                    <>
+                      <span className="media-panel-title">LipDub inputs</span>
+                      <p className="hint hint-inline">
+                        Lip-sync / dub a reference clip: visual motion from the video,
+                        voice tone from uploaded audio (or the video&apos;s audio track),
+                        and new dialogue in your prompt. Frame count follows the reference
+                        video. Requires the LipDub IC-LoRA.
+                      </p>
+                      {!config?.lipdub_default_spec?.includes("buckets/audiohacking") && (
+                        <p className="hint hint-inline">
+                          LipDub weights are gated on Hugging Face — accept access at{" "}
+                          <a
+                            href={
+                              config?.lipdub_official_hf_url ??
+                              "https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-LipDub"
+                            }
+                            target="_blank"
+                            rel="noreferrer"
+                          >
+                            Lightricks/LTX-2.3-22b-IC-LoRA-LipDub
+                          </a>
+                          , set <code>HF_TOKEN</code> (or <code>huggingface-cli login</code>
+                          ), then add a <strong>custom LoRA</strong> with the official resolve
+                          URL or set <code>{config?.lipdub_env_var ?? "LTX_WS_LIPDUB_LORA"}</code>{" "}
+                          to a local <code>.safetensors</code> path on the server.
+                        </p>
+                      )}
+                      <label className="media-upload">
+                        <span className="media-upload-label">
+                          Voice tone audio (optional if video has audio)
+                        </span>
+                        <input
+                          ref={audioRef}
+                          type="file"
+                          accept="audio/*"
+                          onChange={(e) => {
+                            const f = e.target.files?.[0];
+                            if (f) handleAudioFileSelected(f);
+                          }}
+                        />
+                        <span className="media-upload-hint">
+                          {audioName ?? "Choose voice-tone audio…"}
+                        </span>
+                      </label>
+                      <label className="media-upload">
+                        <span className="media-upload-label">
+                          I2V anchor image (optional)
+                        </span>
+                        <input
+                          ref={imageRef}
+                          type="file"
+                          accept="image/*"
+                          onChange={async (e) => {
+                            const f = e.target.files?.[0];
+                            if (f) {
+                              setImagePath(await uploadFile(f, "image"));
+                              setImageName(f.name);
+                            }
+                          }}
+                        />
+                        <span className="media-upload-hint">
+                          {imageName ?? "Choose anchor image…"}
+                        </span>
+                      </label>
+                    </>
+                  )}
+                  {isFaceSwap && (
+                    <>
+                      <span className="media-panel-title">Face swap inputs</span>
+                      <p className="hint hint-inline">
+                        Face identity image + reference performance video. Uses the BFS V3
+                        composite guide (green side panel + face). Head-swap LoRA is locked
+                        above; audio from the reference clip is preserved when present.{" "}
+                        <a
+                          href="https://www.runcomfy.com/comfyui-workflows/ltx-2-3-video-face-swap-in-comfyui-realistic-face-replacement-workflow"
+                          target="_blank"
+                          rel="noreferrer"
+                        >
+                          LTX 2.3 face swap workflow
+                        </a>
+                        .
+                      </p>
+                      <label className="media-upload">
+                        <span className="media-upload-label">Face identity image (required)</span>
+                        <input
+                          ref={imageRef}
+                          type="file"
+                          accept="image/*"
+                          onChange={async (e) => {
+                            const f = e.target.files?.[0];
+                            if (f) {
+                              setImagePath(await uploadFile(f, "image"));
+                              setImageName(f.name);
+                            }
+                          }}
+                        />
+                        <span className="media-upload-hint">
+                          {imageName ?? "Choose face photo…"}
+                        </span>
+                      </label>
+                      <div className="media-upload-row">
+                        <label className="media-upload">
+                          <span className="media-upload-label">Reference video (required)</span>
+                          <input
+                            ref={videoRef}
+                            type="file"
+                            accept="video/*"
+                            onChange={async (e) => {
+                              const f = e.target.files?.[0];
+                              if (f) {
+                                setSourceClipId(null);
+                                setVideoPath(await uploadFile(f, "video"));
+                                setVideoName(f.name);
+                              }
+                            }}
+                          />
+                          <span className="media-upload-hint">
+                            {videoName ?? (videoPath ? "✓ file selected" : "Choose reference video…")}
+                          </span>
+                        </label>
+                      </div>
+                      {videoLibraryClips.length > 0 && (
+                        <label className="clip-source-picker">
+                          <span className="media-upload-label">Or from library</span>
+                          <select
+                            value={sourceClipId ?? ""}
+                            onChange={(e) => {
+                              const id = e.target.value || null;
+                              setSourceClipId(id);
+                              if (id) {
+                                setVideoPath(null);
+                                setVideoName(null);
+                                if (videoRef.current) videoRef.current.value = "";
+                              }
+                            }}
+                          >
+                            <option value="">Select a clip…</option>
+                            {videoLibraryClips.map((c) => {
+                              const label = clipDisplayPrompt(c.prompt);
+                              const meta = [
+                                c.label,
+                                c.width && c.height ? `${c.width}×${c.height}` : null,
+                              ]
+                                .filter(Boolean)
+                                .join(" · ");
+                              return (
+                                <option key={c.id} value={c.id}>
+                                  {meta ? `${label} (${meta})` : label}
+                                </option>
+                              );
+                            })}
+                          </select>
+                        </label>
+                      )}
+                      {hasVideoSource && (
+                        <p className="media-source-note">
+                          {sourceClipId
+                            ? "Using library clip as reference video (performance)."
+                            : "Using uploaded file as reference video (performance)."}
+                        </p>
+                      )}
+                      {(config?.lora_presets ?? [])
+                        .filter((p) => loraPresetIds.includes(p.id) && p.spec)
+                        .map((p) => (
+                          <label key={p.id} className="v2v-lora-strength-row">
+                            <span className="v2v-lora-strength-label" title={p.label}>
+                              Head-swap LoRA strength
+                            </span>
+                            <input
+                              type="number"
+                              min={0}
+                              max={2}
+                              step={0.01}
+                              value={p.scale}
+                              disabled={busy || loraBusy}
+                              title="Head-swap adapter strength (Comfy tip: ~0.98–1.0)"
+                              aria-label={`LoRA strength for ${p.label}`}
+                              onChange={(e) =>
+                                updateLoraPresetScale(p.id, Number(e.target.value) || 0)
+                              }
+                            />
+                          </label>
+                        ))}
+                    </>
+                  )}
+                  {isV2v && (
+                    <>
+                      <span className="media-panel-title">V2V inputs</span>
+                      <p className="hint hint-inline">
+                        Re-render from a reference clip. LoRA is optional: leave none
+                        selected for pure motion / structure transfer, or add a community
+                        IC-LoRA (e.g.{" "}
+                        <a
+                          href="https://huggingface.co/Cseti/LTX2.3-22B_IC-LoRA-CrossView-Prompt"
+                          target="_blank"
+                          rel="noreferrer"
+                        >
+                          CrossView Prompt
+                        </a>
+                        ). No HDR/Union defaults. CrossView strength{" "}
+                        <strong>1.2–1.5</strong> on distilled; prompts use the fixed
+                        vocabulary, e.g.{" "}
+                        <code>crossview. new camera angle: to the right, lower, closer.</code>
+                      </p>
+                      <div className="media-upload-row">
+                        <label className="media-upload">
+                          <span className="media-upload-label">Reference video (required)</span>
+                          <input
+                            ref={conditioningVideoRef}
+                            type="file"
+                            accept="video/*"
+                            onChange={async (e) => {
+                              const f = e.target.files?.[0];
+                              if (f) {
+                                setConditioningClipId(null);
+                                setConditioningVideoPath(await uploadFile(f, "video"));
+                                setConditioningVideoName(f.name);
+                              }
+                            }}
+                          />
+                          <span className="media-upload-hint">
+                            {conditioningVideoName ?? "Choose reference video…"}
+                          </span>
+                        </label>
+                      </div>
+                      {videoLibraryClips.length > 0 && (
+                        <label className="clip-source-picker">
+                          <span className="media-upload-label">Or reference from library</span>
+                          <select
+                            value={conditioningClipId ?? ""}
+                            onChange={(e) => {
+                              const id = e.target.value || null;
+                              setConditioningClipId(id);
+                              if (id) {
+                                setConditioningVideoPath(null);
+                                setConditioningVideoName(null);
+                                if (conditioningVideoRef.current) {
+                                  conditioningVideoRef.current.value = "";
+                                }
+                              }
+                            }}
+                          >
+                            <option value="">Select a clip…</option>
+                            {videoLibraryClips.map((c) => {
+                              const label = clipDisplayPrompt(c.prompt);
+                              const meta = [
+                                c.label,
+                                c.width && c.height ? `${c.width}×${c.height}` : null,
+                              ]
+                                .filter(Boolean)
+                                .join(" · ");
+                              return (
+                                <option key={c.id} value={c.id}>
+                                  {meta ? `${label} (${meta})` : label}
+                                </option>
+                              );
+                            })}
+                          </select>
+                        </label>
+                      )}
+                      <div className="v2v-lora-strengths">
+                        <span className="media-upload-label">LoRA strength</span>
+                        {loraPresetIds.length === 0 ? (
+                          <p className="media-source-note">
+                            No LoRA selected — pure reference-video conditioning. Add
+                            CrossView or another IC-LoRA above for adapter-driven V2V
+                            (CrossView tip: strength <strong>1.2–1.5</strong>).
+                          </p>
+                        ) : (
+                          (config?.lora_presets ?? [])
+                            .filter((p) => loraPresetIds.includes(p.id) && p.spec)
+                            .map((p) => (
+                              <label key={p.id} className="v2v-lora-strength-row">
+                                <span className="v2v-lora-strength-label" title={p.label}>
+                                  {p.label}
+                                </span>
+                                <input
+                                  type="number"
+                                  min={0}
+                                  max={2}
+                                  step={0.05}
+                                  value={p.scale}
+                                  disabled={busy || loraBusy}
+                                  title="LoRA adapter strength (0–2). CrossView tip: 1.2–1.5"
+                                  aria-label={`LoRA strength for ${p.label}`}
+                                  onChange={(e) =>
+                                    updateLoraPresetScale(
+                                      p.id,
+                                      Number(e.target.value) || 0,
+                                    )
+                                  }
+                                />
+                              </label>
+                            ))
+                        )}
+                      </div>
+                      <label className="ic-lora-scale">
+                        Reference attention strength
+                        <input
+                          type="number"
+                          min={0}
+                          max={1}
+                          step={0.05}
+                          value={referenceStrength}
+                          disabled={!hasConditioningVideo}
+                          title="How strongly the reference video guides the result (0–1). Separate from LoRA strength."
+                          onChange={(e) =>
+                            setReferenceStrength(
+                              Math.min(1, Math.max(0, Number(e.target.value) || 0)),
+                            )
+                          }
+                        />
+                      </label>
+                      <p className="hint hint-inline">
+                        LoRA strength is the adapter weight (often &gt;1). Reference attention
+                        (0–1) controls how tightly the model follows the reference clip.
+                      </p>
+                      {hasConditioningVideo ? (
+                        <p className="media-source-note">
+                          {conditioningClipId
+                            ? "Using library clip as V2V reference."
+                            : "Using uploaded file as V2V reference."}
+                        </p>
+                      ) : (
+                        <p className="media-source-note">
+                          Upload a reference video (or pick one from the library) to enable Generate.
+                        </p>
+                      )}
+                    </>
+                  )}
                   {isIcLora && (
                     <>
                       <span className="media-panel-title">IC-LoRA inputs</span>
@@ -2106,10 +2638,18 @@ export default function App() {
                           </>
                         )}
                       </p>
+                      <p className="hint hint-inline">
+                        Built-in HDR (video optional for pure T2V HDR) or Union Control
+                        (video + character image). For CrossView / other community adapters,
+                        use <strong>V2V</strong> instead.
+                      </p>
                       <div className="media-upload-row">
                         <label className="media-upload">
                           <span className="media-upload-label">
-                            Motion reference video (optional)
+                            Reference video
+                            {icLoraSubMode === "motion_transfer"
+                              ? " (required)"
+                              : " (optional for HDR T2V)"}
                           </span>
                           <input
                             ref={conditioningVideoRef}
@@ -2130,7 +2670,7 @@ export default function App() {
                         </label>
                         <label className="media-upload">
                           <span className="media-upload-label">
-                            Character reference image (optional)
+                            Character reference image (optional → Union Control)
                           </span>
                           <input
                             ref={imageRef}
@@ -2202,11 +2742,31 @@ export default function App() {
                           }
                         />
                       </label>
+                      <label className="ic-lora-scale">
+                        Reference attention strength
+                        <input
+                          type="number"
+                          min={0}
+                          max={1}
+                          step={0.05}
+                          value={referenceStrength}
+                          disabled={!hasConditioningVideo}
+                          title="IC-LoRA conditioning_attention_strength (0–1)"
+                          onChange={(e) =>
+                            setReferenceStrength(
+                              Math.min(1, Math.max(0, Number(e.target.value) || 0)),
+                            )
+                          }
+                        />
+                      </label>
                       {hasConditioningVideo && (
                         <p className="media-source-note">
                           {conditioningClipId
                             ? "Using library clip as motion reference."
                             : "Using uploaded file as motion reference."}
+                          {" "}
+                          Motion strength scales the reference clip weight; attention strength
+                          controls how tightly the model follows it (default 1.0).
                         </p>
                       )}
                     </>
@@ -2257,14 +2817,12 @@ export default function App() {
                       )}
                     </>
                   )}
-                  {!isA2v && (needsImageUpload || showStartImageOptional) && (
+                  {!isA2v && !isLipDub && needsImageUpload && (
                     <>
                       <span className="media-panel-title">Source media</span>
                       <label className="media-upload">
                       <span className="media-upload-label">
-                        {needsImageUpload
-                          ? "Source image (required)"
-                          : "Start image (optional)"}
+                        Source image (required)
                       </span>
                       <input
                         ref={imageRef}
@@ -2307,7 +2865,11 @@ export default function App() {
                   {needsVideoUpload && (
                     <>
                       {!isA2v && (
-                        <span className="media-panel-title">Source video</span>
+                        <span className="media-panel-title">
+                          {isLipDub
+                            ? "Reference video (required, visual motion)"
+                            : "Source video"}
+                        </span>
                       )}
                       <label className="media-upload">
                         <span className="media-upload-label">Upload from disk</span>
@@ -2320,11 +2882,12 @@ export default function App() {
                             if (f) {
                               setSourceClipId(null);
                               setVideoPath(await uploadFile(f, "video"));
+                              setVideoName(f.name);
                             }
                           }}
                         />
                         <span className="media-upload-hint">
-                          {videoPath ? "✓ file selected" : "Choose video file…"}
+                          {videoName ?? (videoPath ? "✓ file selected" : "Choose video file…")}
                         </span>
                       </label>
                       {videoLibraryClips.length > 0 && (
@@ -2337,6 +2900,7 @@ export default function App() {
                               setSourceClipId(id);
                               if (id) {
                                 setVideoPath(null);
+                                setVideoName(null);
                                 if (videoRef.current) videoRef.current.value = "";
                               }
                             }}
@@ -2361,7 +2925,11 @@ export default function App() {
                       )}
                       {hasVideoSource && (
                         <p className="media-source-note">
-                          {sourceClipId ? "Using library clip as source video." : "Using uploaded file as source video."}
+                          {sourceClipId
+                            ? "Using library clip as reference video."
+                            : isLipDub
+                              ? "Using uploaded reference video. Add voice-tone audio above if the clip has no audio track."
+                              : "Using uploaded file as source video."}
                         </p>
                       )}
                     </>

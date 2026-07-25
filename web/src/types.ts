@@ -51,6 +51,13 @@ export interface Config {
   ic_lora_motion_preset_id?: string;
   ic_lora_default_spec?: string;
   ic_lora_union_motion_spec?: string;
+  face_swap_preset_id?: string;
+  face_swap_default_spec?: string;
+  lipdub_preset_id?: string;
+  lipdub_default_spec?: string;
+  lipdub_official_gated_spec?: string;
+  lipdub_official_hf_url?: string;
+  lipdub_env_var?: string;
   pose_control_available?: boolean;
   pyav_available?: boolean;
   audio_trim_available?: boolean;

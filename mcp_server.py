@@ -55,7 +55,7 @@ def _new_output_path(prompt: str, output_dir: Path, prefix: str) -> Path:
 
 def _normalize_mode(mode: str) -> str:
     val = (mode or "generate").strip().lower()
-    allowed = {"generate", "a2v", "retake", "extend", "ic_lora", "keyframe", "lipdub"}
+    allowed = {"generate", "a2v", "retake", "extend", "ic_lora", "keyframe", "lipdub", "face_swap"}
     if val not in allowed:
         raise ValueError(f"Unsupported mode {mode!r}; expected one of {sorted(allowed)}")
     return val
@@ -281,6 +281,13 @@ async def ltx_generate_video(
             raise ValueError("mode=lipdub requires video (reference video)")
         if not lora_specs or len(lora_specs) != 1:
             raise ValueError("mode=lipdub requires exactly one lora_specs entry")
+    if mode == "face_swap":
+        if not video:
+            raise ValueError("mode=face_swap requires video (reference video)")
+        if not image:
+            raise ValueError("mode=face_swap requires image (face identity)")
+        if not lora_specs or len(lora_specs) != 1:
+            raise ValueError("mode=face_swap requires exactly one lora_specs entry (head swap LoRA)")
 
     params = _build_params(
         prompt=prompt,

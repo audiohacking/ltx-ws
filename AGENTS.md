@@ -146,7 +146,7 @@ If `ok=false`, tell the user to start `python server.py` or fix `--server-url`.
 | Parameter | Type | Notes |
 |-----------|------|--------|
 | `prompt` | string | **Required.** Model-ready visual description. |
-| `mode` | string | `generate` (default), `a2v`, `retake`, `extend`, `ic_lora`, `keyframe`, `lipdub` |
+| `mode` | string | `generate` (default), `a2v`, `retake`, `extend`, `ic_lora`, `keyframe`, `lipdub`, `face_swap` |
 | `image` | string? | Path or URL — image-to-video / keyframe start |
 | `end_image` | string? | Keyframe end frame |
 | `audio` | string? | Required for `a2v` |
@@ -306,6 +306,20 @@ Structure prompts as a **timeline**, not duplicate full scene descriptions.
 | `retake` | Replace a segment of source video | `prompt`, `video`, `retake_start`, `retake_end` |
 | `extend` | Add frames before/after source | `prompt`, `video`, `extend_frames`, `extend_direction` |
 | `ic_lora` | Reference-video conditioning + LoRA | `prompt`, `lora_specs`, `video_conditioning` |
+| `face_swap` | BFS V3 head swap (identity image + reference video) | `prompt`, `image` (face), `video`, exactly one head-swap `lora_specs` |
+
+**Face swap (`mode: face_swap`)** — Comfy-aligned BFS V3 on MLX (`ltx_ltxv_add_guide` + `FaceSwapPipeline`):
+
+1. Builds composite guide (green side strip + identity face every frame + performance video).
+2. `LTXVPreprocess` (CRF 33) + `LTXVAddGuide` full-video append + `LTXVCropGuides`.
+3. **Dev** DiT + Comfy V3 LoRA stack fused in one pass (never washed by Stage 2):
+   - `ltx-2.3-22b-distilled-lora-dynamic_fro09…` @ 1.0 (auto from Kijai / local cache)
+   - head-swap LoRA @ ~0.98
+4. Distilled 8-step sigma table, CFG≈1.0 (Comfy V3); output cropped to main panel; reference audio muxed when present.
+
+LoRA preset: `Alissonerdx/BFS-Best-Face-Swap-Video` → `head_swap_v3_rank_adaptive_fro_098.safetensors` @ 0.98.  
+Prompt trigger: `head_swap:` with `FACE:` / `ACTION:` sections (identity from image, not face description in text).  
+Requires **dev** MLX weights (`dgrauet/ltx-2.3-mlx` or q8). Skip distilled-dynamic with `LTX_WS_FACE_SWAP_NO_DISTILLED_LORA=1`.
 
 For most **director narrative** work, stay on `mode: generate` with **autocontinue sequences**.
 

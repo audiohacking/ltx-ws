@@ -61,6 +61,17 @@ def test_load_video_frames_normalized_pyav(tmp_path: Path):
     assert tuple(tensor.shape) == (1, 3, 9, 48, 64)
 
 
+def test_load_video_frames_normalized_is_float32(tmp_path: Path):
+    pytest.importorskip("ltx_core_mlx")
+    import mlx.core as mx
+    import ltx_media
+
+    video = tmp_path / "ref.mp4"
+    _write_h264_mp4(video, frames=5, fps=24.0)
+    tensor = ltx_media.load_video_frames_normalized(str(video), 48, 64, max_frames=5)
+    assert tensor.dtype == mx.float32
+
+
 def test_video_io_patch_replaces_ffmpeg_helpers():
     pytest.importorskip("ltx_pipelines_mlx")
     from ltx_core_mlx.utils import ffmpeg as ffmpeg_mod
@@ -73,7 +84,7 @@ def test_video_io_patch_replaces_ffmpeg_helpers():
     assert video_mod.load_video_frames_normalized is ltx_media.load_video_frames_normalized
 
 
-def test_iclora_utils_uses_pyav_probe(tmp_path: Path):
+def test_iclora_utils_uses_pyav_probe():
     pytest.importorskip("ltx_pipelines_mlx")
     from ltx_mlx_backend import _apply_ltx_mlx_patches
     import ltx_media
@@ -82,3 +93,13 @@ def test_iclora_utils_uses_pyav_probe(tmp_path: Path):
     _apply_ltx_mlx_patches(default_fps=24.0)
     assert iclora_utils.probe_video_info is ltx_media.probe_video_info
     assert iclora_utils.load_video_frames_normalized is ltx_media.load_video_frames_normalized
+
+
+def test_lipdub_uses_pyav_probe():
+    pytest.importorskip("ltx_pipelines_mlx")
+    from ltx_mlx_backend import _apply_ltx_mlx_patches
+    import ltx_media
+    from ltx_pipelines_mlx import lipdub
+
+    _apply_ltx_mlx_patches(default_fps=24.0)
+    assert lipdub.probe_video_info is ltx_media.probe_video_info

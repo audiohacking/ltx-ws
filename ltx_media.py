@@ -187,7 +187,7 @@ def load_video_frames_normalized(
     stacked = np.stack(frames_list, axis=0)
     tensor = mx.array(stacked).transpose(0, 3, 1, 2)
     tensor = tensor.transpose(1, 0, 2, 3)[None, ...]
-    return tensor.astype(mx.bfloat16)
+    return tensor.astype(mx.float32)
 
 
 def probe_audio_duration(path: Path | str) -> float | None:
@@ -581,6 +581,81 @@ def mux_audio_into_video(
     return output_path
 
 
+def extract_audio_from_video(
+    video_path: Path | str,
+    output_path: Path | str,
+    *,
+    duration_s: float | None = None,
+) -> bool:
+    """Extract the audio track from ``video_path`` to AAC in ``output_path``.
+
+    Returns ``False`` when the source has no audio stream.
+    """
+    require_media()
+    video_path = Path(video_path)
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with av.open(str(video_path)) as vin:
+        if not vin.streams.audio:
+            return False
+        a_in = vin.streams.audio[0]
+
+        with av.open(str(output_path), "w") as out:
+            a_out = out.add_stream("aac", rate=AUDIO_OUTPUT_RATE, layout=AUDIO_OUTPUT_LAYOUT)
+            resampler = AudioResampler(
+                format="fltp",
+                layout=AUDIO_OUTPUT_LAYOUT,
+                rate=AUDIO_OUTPUT_RATE,
+            )
+            for frame in vin.decode(a_in):
+                frame_time = _media_time_seconds(frame, a_in)
+                if duration_s is not None and frame_time is not None and frame_time > duration_s:
+                    break
+                for resampled in resampler.resample(frame):
+                    for packet in a_out.encode(resampled):
+                        out.mux(packet)
+            for packet in a_out.encode(None):
+                out.mux(packet)
+
+    if not output_path.is_file() or output_path.stat().st_size == 0:
+        return False
+    return True
+
+
+def replace_output_audio_from_source(
+    generated_video: Path | str,
+    audio_source_video: Path | str,
+    output_path: Path | str | None = None,
+) -> Path:
+    """Keep generated visuals; replace audio with the source clip's audio track."""
+    generated_video = Path(generated_video)
+    audio_source_video = Path(audio_source_video)
+    if output_path is None:
+        output_path = generated_video
+    else:
+        output_path = Path(output_path)
+
+    info = probe_video_info(generated_video)
+    duration_s = max(0.1, float(info.duration or 0.0))
+    if duration_s <= 0.1 and info.num_frames > 0 and info.fps > 0:
+        duration_s = max(0.1, (info.num_frames - 1) / info.fps)
+
+    tmp_audio = output_path.with_suffix(".source_audio.m4a")
+    try:
+        if not extract_audio_from_video(audio_source_video, tmp_audio, duration_s=duration_s):
+            if output_path != generated_video:
+                shutil.copy2(generated_video, output_path)
+            return Path(output_path)
+        tmp_out = output_path.with_suffix(".remux.mp4") if output_path == generated_video else output_path
+        mux_audio_into_video(generated_video, tmp_audio, tmp_out, duration_s=duration_s)
+        if tmp_out != output_path:
+            tmp_out.replace(output_path)
+        return Path(output_path)
+    finally:
+        tmp_audio.unlink(missing_ok=True)
+
+
 def stream_decoder_latent_to_mp4(
     decoder: Any,
     latent: Any,
@@ -728,6 +803,343 @@ def encode_image_hold_video(
     if not output_path.is_file() or output_path.stat().st_size == 0:
         raise RuntimeError(f"Image hold video encode produced empty output: {output_path}")
     return output_path
+
+
+def snap_multiple_of_32(value: int, *, minimum: int = 32) -> int:
+    """Round to nearest multiple of 32 (LTX VAE requirement)."""
+    value = max(minimum, int(value))
+    return int(round(value / 32)) * 32
+
+
+def canvas_from_video_aspect(
+    src_width: int,
+    src_height: int,
+    longer_edge: int,
+) -> tuple[int, int]:
+    """Resize target preserving aspect with longer side = ``longer_edge`` (Comfy longer-edge)."""
+    src_width = max(1, int(src_width))
+    src_height = max(1, int(src_height))
+    longer_edge = snap_multiple_of_32(int(longer_edge))
+    if src_width >= src_height:
+        out_w = longer_edge
+        out_h = snap_multiple_of_32(int(round(longer_edge * src_height / src_width)))
+    else:
+        out_h = longer_edge
+        out_w = snap_multiple_of_32(int(round(longer_edge * src_width / src_height)))
+    return out_w, out_h
+
+
+def dimensions_fit_inside(src_w: int, src_h: int, max_w: int, max_h: int) -> tuple[int, int]:
+    """Scale ``src`` dimensions to fit inside ``max`` box, preserving aspect."""
+    if src_w <= 0 or src_h <= 0:
+        return max(1, max_w), max(1, max_h)
+    scale = min(max_w / src_w, max_h / src_h)
+    return max(1, int(round(src_w * scale))), max(1, int(round(src_h * scale)))
+
+
+def trim_video_fit_aspect(
+    src: str | Path,
+    dst: str | Path,
+    *,
+    num_frames: int,
+    max_width: int,
+    max_height: int,
+    fps: float,
+    start_seconds: float = 0.0,
+) -> tuple[Path, int, int]:
+    """Trim/re-encode with aspect preserved (Comfy ``ResizeImagesByLongerEdge`` + fit).
+
+    Output frame size is the largest fit inside ``max_width``×``max_height`` without
+    stretching. Returns ``(path, out_width, out_height)``.
+    """
+    import numpy as np
+    from PIL import Image
+
+    require_media()
+    src = Path(src)
+    dst = Path(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    num_frames = max(1, int(num_frames))
+    max_width = max(1, int(max_width))
+    max_height = max(1, int(max_height))
+    fps_frac = _pyav_frame_rate(fps)
+    start_seconds = max(0.0, float(start_seconds))
+
+    frames_written = 0
+    next_pick = 0.0
+    decoded_index = 0
+    started = start_seconds <= 0.0
+    last_arr: Any | None = None
+    out_w = out_h = 0
+    pad_w = pad_h = 0
+
+    with av.open(str(src)) as vin, av.open(str(dst), "w") as out:
+        if not vin.streams.video:
+            raise RuntimeError(f"No video stream in {src}")
+        in_stream = vin.streams.video[0]
+        source_fps = float(in_stream.average_rate or in_stream.base_rate or fps)
+
+        out_stream = None
+
+        for frame in vin.decode(in_stream):
+            if frames_written >= num_frames:
+                break
+
+            frame_time = _media_time_seconds(frame, in_stream)
+            if not started:
+                if frame_time is not None and frame_time < start_seconds:
+                    decoded_index += 1
+                    continue
+                started = True
+
+            take = True
+            if source_fps > 0 and abs(source_fps - fps) > 0.01:
+                take = decoded_index >= next_pick
+                if take:
+                    next_pick += source_fps / fps
+
+            if not take:
+                decoded_index += 1
+                continue
+
+            rgb = frame.reformat(format="rgb24")
+            src_arr = np.asarray(rgb.to_ndarray(), dtype=np.uint8)
+            src_h, src_w = src_arr.shape[:2]
+            if out_w == 0:
+                out_w, out_h = dimensions_fit_inside(src_w, src_h, max_width, max_height)
+                pad_w = out_w + (out_w & 1)
+                pad_h = out_h + (out_h & 1)
+                out_stream = out.add_stream(
+                    "libx264", rate=fps_frac, width=pad_w, height=pad_h
+                )
+                out_stream.pix_fmt = "yuv420p"
+                out_stream.options = {"crf": "18", "preset": "veryfast"}
+                out_stream.time_base = Fraction(fps_frac.denominator, fps_frac.numerator)
+
+            if src_arr.shape[1] != out_w or src_arr.shape[0] != out_h:
+                src_arr = np.asarray(
+                    Image.fromarray(src_arr, mode="RGB").resize(
+                        (out_w, out_h),
+                        Image.Resampling.LANCZOS,
+                    ),
+                    dtype=np.uint8,
+                )
+            arr = src_arr
+            if pad_w != out_w or pad_h != out_h:
+                padded = np.zeros((pad_h, pad_w, 3), dtype=np.uint8)
+                padded[:out_h, :out_w, :] = arr
+                arr = padded
+            last_arr = arr
+            out_frame = av.VideoFrame.from_ndarray(arr, format="rgb24")
+            out_frame = out_frame.reformat(format="yuv420p")
+            out_frame.pts = frames_written
+            for packet in out_stream.encode(out_frame):
+                out.mux(packet)
+            frames_written += 1
+            decoded_index += 1
+
+        if frames_written == 0 or out_stream is None:
+            raise RuntimeError(f"No frames written trimming {src}")
+
+        while frames_written < num_frames and last_arr is not None:
+            out_frame = av.VideoFrame.from_ndarray(last_arr, format="rgb24")
+            out_frame = out_frame.reformat(format="yuv420p")
+            out_frame.pts = frames_written
+            for packet in out_stream.encode(out_frame):
+                out.mux(packet)
+            frames_written += 1
+
+        for packet in out_stream.encode(None):
+            out.mux(packet)
+
+    return dst, out_w, out_h
+
+
+def trim_video_to_spec(
+    src: str | Path,
+    dst: str | Path,
+    *,
+    num_frames: int,
+    width: int,
+    height: int,
+    fps: float,
+    start_seconds: float = 0.0,
+) -> Path:
+    """Re-encode up to ``num_frames`` from ``src`` at the target resolution and fps."""
+    import numpy as np
+
+    require_media()
+    src = Path(src)
+    dst = Path(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    num_frames = max(1, int(num_frames))
+    width = int(width)
+    height = int(height)
+    pad_w = width + (width & 1)
+    pad_h = height + (height & 1)
+    fps_frac = _pyav_frame_rate(fps)
+    start_seconds = max(0.0, float(start_seconds))
+
+    frames_written = 0
+    next_pick = 0.0
+    decoded_index = 0
+    started = start_seconds <= 0.0
+    last_arr: Any | None = None
+
+    with av.open(str(src)) as vin, av.open(str(dst), "w") as out:
+        if not vin.streams.video:
+            raise RuntimeError(f"No video stream in {src}")
+        in_stream = vin.streams.video[0]
+        source_fps = float(in_stream.average_rate or in_stream.base_rate or fps)
+
+        out_stream = out.add_stream(
+            "libx264", rate=fps_frac, width=pad_w, height=pad_h
+        )
+        out_stream.pix_fmt = "yuv420p"
+        out_stream.options = {"crf": "18", "preset": "veryfast"}
+        out_stream.time_base = Fraction(fps_frac.denominator, fps_frac.numerator)
+
+        for frame in vin.decode(in_stream):
+            if frames_written >= num_frames:
+                break
+
+            frame_time = _media_time_seconds(frame, in_stream)
+            if not started:
+                if frame_time is not None and frame_time < start_seconds:
+                    decoded_index += 1
+                    continue
+                started = True
+
+            take = True
+            if source_fps > 0 and abs(source_fps - fps) > 0.01:
+                take = decoded_index >= next_pick
+                if take:
+                    next_pick += source_fps / fps
+
+            if not take:
+                decoded_index += 1
+                continue
+
+            rgb = frame.reformat(width=pad_w, height=pad_h, format="rgb24")
+            arr = np.asarray(rgb.to_ndarray(), dtype=np.uint8)
+            last_arr = arr
+            out_frame = av.VideoFrame.from_ndarray(arr, format="rgb24")
+            out_frame = out_frame.reformat(format="yuv420p")
+            out_frame.pts = frames_written
+            for packet in out_stream.encode(out_frame):
+                out.mux(packet)
+            frames_written += 1
+            decoded_index += 1
+
+        if frames_written == 0:
+            raise RuntimeError(f"No frames written trimming {src}")
+
+        while frames_written < num_frames and last_arr is not None:
+            out_frame = av.VideoFrame.from_ndarray(last_arr, format="rgb24")
+            out_frame = out_frame.reformat(format="yuv420p")
+            out_frame.pts = frames_written
+            for packet in out_stream.encode(out_frame):
+                out.mux(packet)
+            frames_written += 1
+
+        for packet in out_stream.encode(None):
+            out.mux(packet)
+
+    if not dst.is_file() or dst.stat().st_size == 0:
+        raise RuntimeError(f"Video trim produced empty output: {dst}")
+    return dst
+
+
+def count_video_frames(path: str | Path) -> int:
+    """Count decoded video frames (more reliable than container metadata alone)."""
+    require_media()
+    path = Path(path)
+    with av.open(str(path)) as container:
+        if not container.streams.video:
+            raise RuntimeError(f"No video stream in {path}")
+        stream = container.streams.video[0]
+        if stream.frames:
+            return int(stream.frames)
+        return sum(1 for _ in container.decode(stream))
+
+
+def ic_lora_vae_compatible_frame_count(
+    num_frames: int,
+    *,
+    source_num_frames: int | None = None,
+) -> int:
+    """Match ``ltx_pipelines_mlx.iclora_utils.append_ic_lora_reference_video_conditionings``."""
+    max_frames = max(1, int(num_frames))
+    if source_num_frames is not None:
+        max_frames = min(max_frames, max(1, int(source_num_frames)))
+    k = max(1, (max_frames - 1) // 8)
+    return 1 + k * 8
+
+
+def normalize_video_for_ic_lora_reference(
+    src: str | Path,
+    dst: str | Path,
+    *,
+    num_frames: int,
+    width: int,
+    height: int,
+    fps: float,
+) -> int:
+    """Re-encode ``src`` to exactly ``vae_frames`` (1+8k), padding with the last frame."""
+    import numpy as np
+
+    require_media()
+    src = Path(src)
+    dst = Path(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    width = int(width)
+    height = int(height)
+    pad_w = width + (width & 1)
+    pad_h = height + (height & 1)
+    fps_frac = _pyav_frame_rate(fps)
+    target_frames = max(1, int(num_frames))
+    decoded: list[Any] = []
+
+    with av.open(str(src)) as vin:
+        if not vin.streams.video:
+            raise RuntimeError(f"No video stream in {src}")
+        stream = vin.streams.video[0]
+        for frame in vin.decode(stream):
+            if len(decoded) >= target_frames:
+                break
+            rgb = frame.reformat(width=pad_w, height=pad_h, format="rgb24")
+            decoded.append(np.asarray(rgb.to_ndarray(), dtype=np.uint8))
+
+    if not decoded:
+        raise RuntimeError(f"No frames decoded from {src}")
+
+    source_count = len(decoded)
+    vae_frames = ic_lora_vae_compatible_frame_count(
+        target_frames,
+        source_num_frames=source_count,
+    )
+    while len(decoded) < vae_frames:
+        decoded.append(decoded[-1].copy())
+
+    with av.open(str(dst), "w") as out:
+        out_stream = out.add_stream(
+            "libx264", rate=fps_frac, width=pad_w, height=pad_h
+        )
+        out_stream.pix_fmt = "yuv420p"
+        out_stream.options = {"crf": "18", "preset": "veryfast"}
+        out_stream.time_base = Fraction(fps_frac.denominator, fps_frac.numerator)
+        for idx, arr in enumerate(decoded[:vae_frames]):
+            out_frame = av.VideoFrame.from_ndarray(arr, format="rgb24")
+            out_frame = out_frame.reformat(format="yuv420p")
+            out_frame.pts = idx
+            for packet in out_stream.encode(out_frame):
+                out.mux(packet)
+        for packet in out_stream.encode(None):
+            out.mux(packet)
+
+    if not dst.is_file() or dst.stat().st_size == 0:
+        raise RuntimeError(f"IC-LoRA reference normalize produced empty output: {dst}")
+    return vae_frames
 
 
 def encode_single_frame(

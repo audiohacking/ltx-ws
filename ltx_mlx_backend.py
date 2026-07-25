@@ -33,7 +33,7 @@ log = logging.getLogger("fvserver")
 
 LTX2_SPATIAL_ALIGN = 32
 IC_LORA_IMAGE_CRF = 33  # ltx_pipelines_mlx.utils.media_io.DEFAULT_IMAGE_CRF
-LTX2_MLX_GIT_TAG = "v0.14.15"
+LTX2_MLX_GIT_TAG = "v0.14.19"
 
 CHAIN_METHOD_AUTOCONTINUE = "autocontinue"
 CHAIN_METHOD_NATIVE_EXTEND = "native_extend"
@@ -115,6 +115,7 @@ _LOAD_AUDIO_STALE_IMPORTERS = (
 _VIDEO_IO_STALE_IMPORTERS = (
     "ltx_pipelines_mlx.iclora_utils",
     "ltx_pipelines_mlx.ic_lora",
+    "ltx_pipelines_mlx.lipdub",
 )
 
 
@@ -325,6 +326,65 @@ def _patch_video_io_pyav_only() -> None:
         log.debug("PyAV video_io patch applied (IC-LoRA reference video probe/decode)")
 
 
+def _patch_iclora_stage2_x0_model() -> None:
+    """Recreate X0Model after Stage 2 clean transformer reload.
+
+    Upstream ``ICLoraPipeline.generate`` builds ``x0_model = X0Model(self.dit)``
+    before Stage 1, then reloads a clean DiT for Stage 2 but keeps denoising
+    with the old (LoRA-fused) ``x0_model``. Rebuild the wrapper so Stage 2
+    matches the documented clean-distilled refine.
+    """
+    try:
+        from ltx_pipelines_mlx.ic_lora import ICLoraPipeline
+        from ltx_core_mlx.model.transformer.model import X0Model
+    except ImportError:
+        return
+    if getattr(ICLoraPipeline, "_ltx_ws_stage2_x0_patched", False):
+        return
+
+    original = ICLoraPipeline._reload_clean_transformer
+
+    def _reload_and_flag(self: Any) -> None:
+        original(self)
+        # Stash flag so generate can rebuild x0_model; generate itself is long
+        # so we patch denoise by wrapping generate instead when possible.
+        self._ltx_ws_need_stage2_x0_refresh = True
+
+    ICLoraPipeline._reload_clean_transformer = _reload_and_flag  # type: ignore[method-assign]
+
+    original_generate = ICLoraPipeline.generate
+
+    def _generate_with_stage2_x0(self: Any, *args: Any, **kwargs: Any) -> Any:
+        # Wrap denoise_loop usage by monkeypatching X0Model construction mid-generate
+        # is fragile; instead post-process: if generate returns after stage2 with
+        # stale x0, we patch at the call site inside generate via local rewrite.
+        # Practical approach: wrap denoise_loop for this call.
+        import ltx_pipelines_mlx.ic_lora as ic_mod
+
+        self._ltx_ws_need_stage2_x0_refresh = False
+        real_denoise = ic_mod.denoise_loop
+        x0_holder: dict[str, Any] = {"model": None}
+
+        def denoise_loop(*, model, **kw):  # type: ignore[no-untyped-def]
+            if getattr(self, "_ltx_ws_need_stage2_x0_refresh", False):
+                # Stage 2: rebuild X0 around the clean reloaded dit.
+                model = X0Model(self.dit)
+                self._ltx_ws_need_stage2_x0_refresh = False
+                log.info("IC-LoRA Stage 2: rebuilt X0Model on clean transformer")
+            x0_holder["model"] = model
+            return real_denoise(model=model, **kw)
+
+        ic_mod.denoise_loop = denoise_loop  # type: ignore[assignment]
+        try:
+            return original_generate(self, *args, **kwargs)
+        finally:
+            ic_mod.denoise_loop = real_denoise  # type: ignore[assignment]
+
+    ICLoraPipeline.generate = _generate_with_stage2_x0  # type: ignore[method-assign]
+    ICLoraPipeline._ltx_ws_stage2_x0_patched = True
+    log.info("Patched ICLoraPipeline Stage 2 to use clean X0Model after LoRA reload")
+
+
 def _apply_ltx_mlx_patches(*, default_fps: float = 24.0) -> None:
     """Apply all ltx-ws runtime patches (PyAV-only media, pipeline compat)."""
     _patch_media_io_pyav_only()
@@ -332,6 +392,7 @@ def _apply_ltx_mlx_patches(*, default_fps: float = 24.0) -> None:
     _patch_video_io_pyav_only()
     _patch_ltx_pipelines_compat(default_fps=default_fps)
     _patch_video_decode_pyav_only()
+    _patch_iclora_stage2_x0_model()
 
 
 def looks_like_hf_repo_id(model: str) -> bool:
@@ -610,9 +671,27 @@ def _local_lora_cache_dir() -> Path:
 
 
 def _normalize_lora_spec(spec: str) -> str:
-    """Normalize common Hugging Face URL variants to resolve/download form."""
+    """Normalize LoRA specs: HF URL variants, and repair Path()-mangled URLs.
+
+    On macOS/Linux, ``Path("https://…").resolve()`` collapses ``://`` to ``:/`` and
+    may prefix the cwd (e.g. ``/repo/https:/huggingface.co/…``). Recover those.
+    """
     raw = (spec or "").strip()
-    if not raw or not raw.startswith(("http://", "https://")):
+    if not raw:
+        return raw
+
+    # Recover cwd-prefixed / Path-collapsed URLs before any Path() usage.
+    for marker in ("https://", "http://", "https:/", "http:/"):
+        idx = raw.find(marker)
+        if idx > 0 and ("huggingface.co" in raw or "hf.co" in raw):
+            raw = raw[idx:]
+            break
+    if raw.startswith("https:/") and not raw.startswith("https://"):
+        raw = "https://" + raw[len("https:/") :]
+    elif raw.startswith("http:/") and not raw.startswith("http://"):
+        raw = "http://" + raw[len("http:/") :]
+
+    if not raw.startswith(("http://", "https://")):
         return raw
     parsed = urlparse(raw)
     host = parsed.netloc.lower()
@@ -623,6 +702,10 @@ def _normalize_lora_spec(spec: str) -> str:
     if "huggingface.co" in raw and "/blob/" in raw:
         raw = raw.replace("/blob/", "/resolve/", 1)
     return raw
+
+
+def _is_http_url(value: str) -> bool:
+    return value.startswith(("http://", "https://"))
 
 
 def _pick_safetensors_file(root: Path) -> Path | None:
@@ -678,11 +761,144 @@ def _hf_lora_cache_file(resolved: _HfLoraResolve) -> Path:
     return (_local_lora_cache_dir() / resolved.cache_dir_name / resolved.filename).resolve()
 
 
+def _is_usable_lora_file(path: Path | None) -> bool:
+    """True when path is a non-empty .safetensors (or any) weight file on disk."""
+    if path is None:
+        return False
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _materialize_lora_cache(src: Path, dest: Path) -> Path:
+    """Place src at the canonical cache path (hardlink, then copy)."""
+    src = src.resolve()
+    dest = dest.resolve()
+    if src == dest and _is_usable_lora_file(dest):
+        return dest
+    if _is_usable_lora_file(dest):
+        return dest
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        dest.unlink()
+    try:
+        os.link(src, dest)
+    except OSError:
+        import shutil
+
+        shutil.copy2(src, dest)
+    return dest
+
+
+def _find_lora_by_basename(filename: str) -> Path | None:
+    """Search the persistent LoRA cache for an existing file by basename."""
+    name = Path(filename).name
+    if not name:
+        return None
+    root = _local_lora_cache_dir()
+    if not root.is_dir():
+        return None
+    # Prefer exact relative layout when present (e.g. loras/foo.safetensors).
+    exact = (root / filename).resolve()
+    if _is_usable_lora_file(exact):
+        return exact
+    matches: list[Path] = []
+    for match in root.rglob(name):
+        if not _is_usable_lora_file(match):
+            continue
+        # Skip HF download metadata / incomplete sidecars mistaken as weights.
+        if match.suffix.lower() != ".safetensors" and not name.endswith(match.suffix):
+            continue
+        if ".cache" in match.parts:
+            continue
+        matches.append(match.resolve())
+    if not matches:
+        return None
+    # Prefer paths under a repo-named cache dir that include the relative filename.
+    for m in matches:
+        if filename in str(m).replace("\\", "/"):
+            return m
+    return matches[0]
+
+
+def _find_lora_in_hf_hub_cache(resolved: _HfLoraResolve) -> Path | None:
+    """Return a hub-cache hit without network when repo_id is known."""
+    if not resolved.repo_id:
+        return None
+    try:
+        from huggingface_hub import try_to_load_from_cache
+    except ImportError:
+        return None
+    try:
+        cached = try_to_load_from_cache(
+            repo_id=resolved.repo_id,
+            filename=resolved.filename,
+            revision=resolved.revision,
+        )
+    except Exception:
+        return None
+    if cached is None or cached is False:
+        return None
+    path = Path(str(cached))
+    return path if _is_usable_lora_file(path) else None
+
+
+def _resolve_existing_hf_lora(resolved: _HfLoraResolve) -> Path | None:
+    """Locate an already-downloaded LoRA and promote it to the canonical cache path."""
+    dest = _hf_lora_cache_file(resolved)
+    if _is_usable_lora_file(dest):
+        return dest
+
+    # Same repo cache dir, possibly nested (hf_hub_download local_dir layouts).
+    cache_dir = (_local_lora_cache_dir() / resolved.cache_dir_name).resolve()
+    if cache_dir.is_dir():
+        for match in cache_dir.rglob(Path(resolved.filename).name):
+            if ".cache" in match.parts:
+                continue
+            if _is_usable_lora_file(match):
+                return _materialize_lora_cache(match, dest)
+
+    # Any prior download under ./loras (or VIDEOFENTANYL_LORA_DIR) by basename.
+    found = _find_lora_by_basename(resolved.filename)
+    if found is not None:
+        log.info("Reusing cached LoRA %s → %s", found, dest)
+        return _materialize_lora_cache(found, dest)
+
+    # Hugging Face hub cache from a previous hf_hub_download / CLI pull.
+    hub_hit = _find_lora_in_hf_hub_cache(resolved)
+    if hub_hit is not None:
+        log.info("Reusing Hugging Face hub LoRA cache %s → %s", hub_hit, dest)
+        return _materialize_lora_cache(hub_hit, dest)
+
+    # Offline hub probe: may resolve snapshot paths try_to_load_from_cache misses.
+    if resolved.repo_id and resolved.revision:
+        try:
+            from huggingface_hub import hf_hub_download
+        except ImportError:
+            return None
+        try:
+            local = hf_hub_download(
+                repo_id=resolved.repo_id,
+                filename=resolved.filename,
+                revision=resolved.revision,
+                local_files_only=True,
+            )
+        except Exception:
+            return None
+        path = Path(local)
+        if _is_usable_lora_file(path):
+            log.info("Reusing local-only hub LoRA %s → %s", path, dest)
+            return _materialize_lora_cache(path, dest)
+    return None
+
+
 def _download_hf_lora_resolve(resolved: _HfLoraResolve) -> Path:
     """Download a Hugging Face resolve URL into the persistent LoRA cache."""
+    existing = _resolve_existing_hf_lora(resolved)
+    if existing is not None:
+        return existing
     dest = _hf_lora_cache_file(resolved)
-    if dest.is_file():
-        return dest
     dest.parent.mkdir(parents=True, exist_ok=True)
     if resolved.repo_id and resolved.revision:
         try:
@@ -721,30 +937,54 @@ def _lora_cached_path(spec: str) -> Path | None:
     if not raw:
         return None
 
-    p = Path(raw).expanduser()
-    if p.is_file():
-        return p.resolve()
-
-    if raw.startswith(("http://", "https://")):
+    # URLs must not go through pathlib — Path("https://…") collapses :// → :/ .
+    if _is_http_url(raw):
         resolved = _parse_hf_lora_resolve_url(raw)
         if resolved is not None:
-            candidate = _hf_lora_cache_file(resolved)
-            if candidate.is_file():
-                return candidate
-            cache_dir = candidate.parent
-            if cache_dir.is_dir():
-                for match in cache_dir.rglob(Path(resolved.filename).name):
-                    if match.is_file():
-                        return match.resolve()
+            return _resolve_existing_hf_lora(resolved)
+        # Non-HF URL: still reuse a prior basename hit under the LoRA cache.
+        name = Path(urlparse(raw).path).name
+        if name.endswith(".safetensors"):
+            return _find_lora_by_basename(name)
+        return None
+
+    p = Path(raw).expanduser()
+    if _is_usable_lora_file(p):
+        return p.resolve()
 
     if looks_like_hf_repo_id(raw):
         dest = (_local_lora_cache_dir() / raw.replace("/", "__")).resolve()
         if dest.is_dir():
             picked = _pick_safetensors_file(dest)
-            if picked is not None:
+            if picked is not None and _is_usable_lora_file(picked):
                 return picked.resolve()
+        # Basename fallback when a resolve-URL download already placed the weights.
+        found = _find_lora_by_basename(raw.rsplit("/", 1)[-1])
+        if found is not None:
+            return found
 
     return None
+
+
+def format_lora_download_error(exc: BaseException, spec: str = "") -> str:
+    """User-facing LoRA download failure (gated Hugging Face repos, etc.)."""
+    msg = str(exc)
+    lower = msg.lower()
+    gated = (
+        "403" in msg
+        or "gated" in lower
+        or "authorized list" in lower
+        or "cannot access gated repo" in lower
+    )
+    if gated or "LTX-2.3-22b-IC-LoRA-LipDub" in (spec or msg):
+        return (
+            "LipDub LoRA is gated on Hugging Face. Accept access at "
+            "https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-LipDub, "
+            "set HF_TOKEN (or run huggingface-cli login), then add a custom LoRA "
+            "with the official resolve URL or set LTX_WS_LIPDUB_LORA to a local "
+            ".safetensors path."
+        )
+    return f"LoRA download failed: {exc}"
 
 
 def _resolve_lora_path(spec: str) -> tuple[str, str | None]:
@@ -761,10 +1001,7 @@ def _resolve_lora_path(spec: str) -> tuple[str, str | None]:
         log.debug("Using cached LoRA at %s", cached)
         return str(cached), None
 
-    p = Path(raw).expanduser()
-    if p.is_file():
-        return str(p.resolve()), None
-    if raw.startswith(("http://", "https://")):
+    if _is_http_url(raw):
         resolved = _parse_hf_lora_resolve_url(raw)
         if resolved is not None:
             return str(_download_hf_lora_resolve(resolved)), None
@@ -777,6 +1014,10 @@ def _resolve_lora_path(spec: str) -> tuple[str, str | None]:
             max_bytes=None,
         )
         return tmp, tmp
+
+    p = Path(raw).expanduser()
+    if p.is_file():
+        return str(p.resolve()), None
 
     if looks_like_hf_repo_id(raw):
         try:
@@ -885,8 +1126,89 @@ def _decode_weighted_media_inputs(
 
 
 def _apply_pending_loras(pipe: Any, lora_paths: list[tuple[str, float]] | None) -> None:
-    if hasattr(pipe, "_pending_loras"):
-        pipe._pending_loras = list(lora_paths or [])
+    """Attach request LoRAs so the next transformer load fuses them.
+
+    ``ltx_pipelines_mlx`` only fuses ``_pending_loras`` inside
+    ``BasePipeline._load_transformer_with_optional_streaming``. The attribute is
+    optional (the CLI assigns it directly). We must always set it — a previous
+    ``hasattr`` guard silently dropped Web UI / MCP LoRAs because Distilled /
+    T2V pipes never pre-declare the attribute.
+
+    IC-LoRA / HDR / LipDub pipelines fuse via constructor ``_lora_paths`` inside
+    ``generate()``; leave those alone.
+
+    When the DiT is already loaded under a different LoRA set (typical: ``load()``
+    during ``_get_pipe`` with no LoRAs, then request LoRAs arrive here), reload so
+    fusion actually happens.
+    """
+    # IC / FaceSwap own fusion via constructor LoRAs — never reload a clean DiT
+    # here or the adapter is silently washed out (CrossView Stage-2 lesson).
+    owned = getattr(pipe, "_lora_paths", None) or getattr(pipe, "_head_swap_lora", None)
+    if owned:
+        return
+
+    desired = [(str(p), float(s)) for p, s in (lora_paths or [])]
+    previous = [(str(p), float(s)) for p, s in (getattr(pipe, "_pending_loras", None) or [])]
+    pipe._pending_loras = desired
+
+    dit_loaded = getattr(pipe, "dit", None) is not None
+    if not dit_loaded:
+        if desired:
+            log.info("Queued %d LoRA(s) for next transformer load", len(desired))
+        return
+    if desired == previous:
+        return
+
+    log.info(
+        "Reloading transformer to apply %d LoRA(s) (previously %d)",
+        len(desired),
+        len(previous),
+    )
+    pipe.dit = None
+    if hasattr(pipe, "_loaded"):
+        pipe._loaded = False
+    load_fn = getattr(pipe, "load", None)
+    if callable(load_fn):
+        load_fn()
+
+
+def _is_crossview_lora_path(path: str) -> bool:
+    lowered = (path or "").lower()
+    return "crossview" in lowered or "cross-view" in lowered
+
+
+def _tune_ic_lora_strengths(
+    resolved_loras: list[tuple[str, float]],
+) -> list[tuple[str, float]]:
+    """Raise CrossView LoRA strength on distilled workflows (author tip: 1.2–1.5)."""
+    tuned: list[tuple[str, float]] = []
+    for path, scale in resolved_loras:
+        s = float(scale)
+        if _is_crossview_lora_path(path) and s < 1.2:
+            log.warning(
+                "CrossView IC-LoRA on distilled is weak below 1.2 — raising strength "
+                "%.2f → 1.25 (author tip: 1.2–1.5). Set scale explicitly to override.",
+                s,
+            )
+            s = 1.25
+        tuned.append((path, s))
+    return tuned
+
+
+def _clamp_conditioning_attention_strength(value: float | None) -> float | None:
+    """ICLoraPipeline requires conditioning_attention_strength in [0, 1]."""
+    if value is None:
+        return None
+    v = float(value)
+    if v < 0.0 or v > 1.0:
+        clamped = max(0.0, min(1.0, v))
+        log.warning(
+            "conditioning_attention_strength %.3f out of [0,1] — clamping to %.3f",
+            v,
+            clamped,
+        )
+        return clamped
+    return v
 
 
 def _pipeline_load_state_inconsistent(pipe: Any) -> bool:
@@ -1023,6 +1345,9 @@ def _apply_optional_generate_kwargs(call_kwargs: dict[str, Any], req: Generation
         call_kwargs["reference_strength"] = float(req.reference_strength)
     if req.audio_start_seconds is not None and float(req.audio_start_seconds) > 0:
         call_kwargs["audio_start_time"] = float(req.audio_start_seconds)
+    neg = (req.negative_prompt or "").strip()
+    if neg:
+        call_kwargs["negative_prompt"] = neg
 
 
 def _frame_rate_from_kwargs(kwargs: dict[str, Any], default: float) -> float:
@@ -1126,7 +1451,7 @@ def _invoke_generate_and_save(pipe: Any, **kwargs: Any) -> None:
 
     if "num_steps" in call_kwargs:
         steps = call_kwargs["num_steps"]
-        if "stage1_steps" in accepted and "stage1_steps" not in call_kwargs:
+        if "stage1_steps" in accepted and "stage1_steps" not in call_kwargs and "num_steps" not in accepted:
             call_kwargs["stage1_steps"] = steps
         if "num_steps" not in accepted and "steps" in accepted:
             call_kwargs["steps"] = call_kwargs.pop("num_steps")
@@ -1346,6 +1671,546 @@ def _prepare_ic_lora_video_conditioning(
         num_frames,
     )
     return [(pose_path, motion_scale)], cleanup
+
+
+def _maybe_preserve_reference_audio(
+    output_path: str,
+    reference_video_paths: list[str],
+    *,
+    job_id: str | None = None,
+) -> None:
+    """Replace generated audio with the first reference clip that has an audio track."""
+    from ltx_media import media_available, probe_video_info, replace_output_audio_from_source
+
+    if not media_available():
+        return
+    for ref in reference_video_paths:
+        if not ref or not os.path.isfile(ref):
+            continue
+        try:
+            info = probe_video_info(ref)
+        except Exception:
+            continue
+        if not info.has_audio:
+            continue
+        try:
+            replace_output_audio_from_source(output_path, ref)
+            log.info(
+                "Preserved reference audio from %s (job=%s)",
+                ref,
+                (job_id or "?")[:8],
+            )
+            return
+        except Exception as exc:
+            log.warning("Could not preserve reference audio from %s: %s", ref, exc)
+
+
+def _prepare_lipdub_reference_video(
+    reference_video: str,
+    voice_audio: str | None,
+    *,
+    tmpdir: str,
+) -> tuple[str, list[str]]:
+    """Build the LipDub reference clip with voice-tone audio for VAE reference tokens.
+
+    LipDubPipeline reads audio from ``reference_video_path`` only. When the user
+    supplies a separate voice-tone track, mux it onto a temp copy of the reference
+    video (Comfy-style Load Audio). Otherwise use embedded video audio.
+    """
+    from ltx_media import media_available, mux_audio_into_video, probe_video_info
+
+    cleanup: list[str] = []
+    if not media_available():
+        if voice_audio:
+            raise RuntimeError("lipdub voice-tone audio mux requires PyAV (pip install av)")
+        return reference_video, cleanup
+
+    info = probe_video_info(reference_video)
+    duration_s = float(info.duration or 0.0)
+    if duration_s <= 0 and info.num_frames > 0 and info.fps > 0:
+        duration_s = float(info.num_frames) / float(info.fps)
+    duration_s = max(0.1, duration_s)
+
+    if voice_audio:
+        out = os.path.join(tmpdir, "lipdub_ref_with_voice_audio.mp4")
+        mux_audio_into_video(reference_video, voice_audio, out, duration_s=duration_s)
+        cleanup.append(out)
+        log.info("LipDub: muxed voice-tone audio onto reference video (%s)", out)
+        return out, cleanup
+
+    if not info.has_audio:
+        raise RuntimeError(
+            "lipdub requires voice-tone audio: upload an audio file or use a reference "
+            "video with an audio track"
+        )
+    return reference_video, cleanup
+
+
+def _invoke_lipdub_style(
+    pipe: Any,
+    *,
+    common_gen_kwargs: dict[str, Any],
+    reference_video: str,
+    tmp_image: str | None,
+    num_frames: int,
+    req: GenerationRequest,
+) -> None:
+    """LipDub: reference video (visual IC-LoRA + voice-tone audio) + optional I2V anchor."""
+    _apply_ltx_mlx_patches(default_fps=float(common_gen_kwargs.get("frame_rate") or 24.0))
+    lip_kwargs = dict(common_gen_kwargs)
+    lip_kwargs["reference_video_path"] = reference_video
+    if tmp_image:
+        lip_kwargs["images"] = _build_ic_lora_image_conditionings(tmp_image, num_frames)
+    if req.reference_strength is not None:
+        lip_kwargs["reference_strength"] = float(req.reference_strength)
+    _apply_optional_generate_kwargs(lip_kwargs, req)
+    _invoke_generate_and_save(pipe, **lip_kwargs)
+
+
+def _prepare_face_swap_guide_video(
+    reference_path: str,
+    identity_image: str,
+    *,
+    tmpdir: str,
+    num_frames: int,
+    width: int,
+    height: int,
+    fps: float,
+) -> tuple[str, Any, int, int, int]:
+    """Trim reference footage and build the BFS V3 composite guide clip.
+
+    Returns ``(guide_path, layout, num_frames, canvas_width, canvas_height)``.
+    Canvas size preserves source aspect (longer-edge resize); it is **not** stretched
+    to the UI preset box.
+    """
+    from ltx_face_swap_compose import (
+        FaceSwapGuideLayout,
+        compose_bfs_v3_guide_video,
+        compute_bfs_guide_layout,
+        resolve_face_swap_canvas_size,
+    )
+    from ltx_ltxv_add_guide import vae_compatible_frame_count
+    from ltx_media import (
+        media_available,
+        probe_video_info,
+        trim_video_fit_aspect,
+    )
+
+    if not media_available():
+        raise RuntimeError("face_swap requires PyAV to prepare guide video (pip install av)")
+
+    info = probe_video_info(reference_path)
+    canvas_w, canvas_h = resolve_face_swap_canvas_size(
+        info.width,
+        info.height,
+        request_width=width,
+        request_height=height,
+    )
+    if (canvas_w, canvas_h) != (width, height):
+        log.info(
+            "Face swap: canvas %dx%d from source %dx%d (aspect preserved; UI preset was %dx%d)",
+            canvas_w,
+            canvas_h,
+            info.width,
+            info.height,
+            width,
+            height,
+        )
+    vae_frames = vae_compatible_frame_count(num_frames, info.num_frames)
+    if vae_frames != num_frames:
+        log.info(
+            "Face swap: adjusting target frames %d -> %d for LTX VAE (8k+1)",
+            num_frames,
+            vae_frames,
+        )
+    trimmed_path = os.path.join(tmpdir, "face_swap_ref_trimmed.mp4")
+    guide_layout = compute_bfs_guide_layout(
+        canvas_w,
+        canvas_h,
+        src_width=info.width,
+        src_height=info.height,
+        region_size_px=256,
+    )
+    if info.num_frames > vae_frames or abs(info.fps - fps) > 0.05:
+        log.info(
+            "Face swap: trimming reference video %d frames at %.1f fps -> %d frames at %.1f fps "
+            "(main panel %dx%d, aspect preserved)",
+            info.num_frames,
+            info.fps,
+            vae_frames,
+            fps,
+            guide_layout.video_w,
+            guide_layout.video_h,
+        )
+    trim_video_fit_aspect(
+        reference_path,
+        trimmed_path,
+        num_frames=vae_frames,
+        max_width=guide_layout.video_w,
+        max_height=guide_layout.video_h,
+        fps=fps,
+    )
+    guide_path = os.path.join(tmpdir, "face_swap_bfs_v3_guide.mp4")
+    layout = compose_bfs_v3_guide_video(
+        trimmed_path,
+        identity_image,
+        guide_path,
+        width=canvas_w,
+        height=canvas_h,
+        num_frames=vae_frames,
+        fps=fps,
+        region_size_px=256,
+        layout=guide_layout,
+    )
+    return guide_path, layout, vae_frames, canvas_w, canvas_h
+
+
+def _iclora_supports_control_aware_refine() -> bool:
+    """True when installed ltx-2-mlx has ``upsample_only`` / ``refine_steps`` (0.14.17+)."""
+    try:
+        from ltx_pipelines_mlx.ic_lora import ICLoraPipeline
+    except ImportError:
+        return False
+    try:
+        params = inspect.signature(ICLoraPipeline.generate_and_save).parameters
+    except (TypeError, ValueError):
+        return False
+    return "upsample_only" in params and "refine_steps" in params
+
+
+def _should_use_control_aware_refine(resolved_loras: list[tuple[str, float]]) -> bool:
+    """Use upsample-only + control-aware refine for raw-RGB V2V.
+
+    Empty LoRAs (pure reference conditioning) and community raw-RGB IC-LoRAs
+    (ref_downscale=1, e.g. CrossView) use upstream 0.14.17+ ``upsample_only`` +
+    ``refine_steps`` so Stage 2 does not wipe control / adapter effect.
+
+    HDR and Union Control keep the legacy clean Stage 2 path.
+    """
+    if not resolved_loras:
+        # Pure V2V / motion transfer without an adapter — still benefit from
+        # full-res control re-append during refine.
+        return True
+    if _ic_lora_uses_hdr_pipeline(resolved_loras):
+        return False
+    primary = resolved_loras[0][0]
+    if _ic_lora_reference_downscale_factor(primary) != 1:
+        return False
+    return True
+
+
+def _run_ic_lora_generation(
+    gen: "LocalVideoGenerator",
+    *,
+    req: GenerationRequest,
+    prompt: str,
+    resolved_loras: list[tuple[str, float]],
+    vc_items: list[tuple[str, float]],
+    tmp_image: str | None,
+    tmpdir: str,
+    out_path: str,
+    width: int,
+    height: int,
+    nf: int,
+    seed: int,
+    steps: int,
+    tmp_video_conditioning_cleanup: list[str],
+    audio_reference_paths: list[str] | None = None,
+    guide_images: list[tuple[str, int, float, int]] | None = None,
+) -> Any:
+    """Shared IC-LoRA invoke path for ``ic_lora`` / V2V (and face_swap guides).
+
+    LoRAs are optional when a reference video is present (pure V2V). HDR LoRAs
+    may omit video conditioning (pure T2V HDR), matching upstream ``hdr-ic-lora``.
+    """
+    is_hdr = bool(resolved_loras) and _ic_lora_uses_hdr_pipeline(resolved_loras)
+    if not vc_items and not is_hdr:
+        raise RuntimeError(
+            "IC-LoRA / V2V requires a reference video "
+            "(or an HDR LoRA for pure text-to-HDR)"
+        )
+    if not resolved_loras and not vc_items:
+        raise RuntimeError("IC-LoRA / V2V requires a reference video and/or LoRA")
+
+    ic_pipe_key = "hdr_ic_lora" if is_hdr else "ic_lora"
+    # CrossView was trained on full LTX-2.3; strengthen on distilled few-step.
+    resolved_loras = _tune_ic_lora_strengths(resolved_loras)
+    primary_lora = _ic_lora_primary_lora(resolved_loras)
+    uses_pose = _needs_pose_control_preprocessing(resolved_loras, vc_items)
+    log.info(
+        "IC-LoRA invoke: pipe=%s primary=%s vcond_in=%d image=%s (%d) pose_preprocess=%s",
+        ic_pipe_key,
+        primary_lora[0] if primary_lora else "(none)",
+        len(vc_items),
+        "guide" if guide_images else ("i2v" if tmp_image else "no"),
+        len(guide_images) if guide_images else (1 if tmp_image else 0),
+        "yes" if uses_pose else "no",
+    )
+    pipe = gen._get_pipe(
+        ic_pipe_key,
+        pipe_kwargs={
+            "lora_paths": [(str(p), float(s)) for p, s in resolved_loras],
+        },
+    )
+    ic_vcond, ic_vcond_cleanup = _prepare_ic_lora_video_conditioning(
+        vc_items,
+        resolved_loras=resolved_loras,
+        width=width,
+        height=height,
+        num_frames=nf,
+        fps=float(gen.fps),
+        tmpdir=tmpdir,
+    )
+    tmp_video_conditioning_cleanup.extend(ic_vcond_cleanup)
+    attn = _clamp_conditioning_attention_strength(
+        float(req.reference_strength)
+        if req.reference_strength is not None
+        else 1.0
+    )
+    ic_kwargs: dict[str, Any] = {
+        "prompt": prompt,
+        "output_path": out_path,
+        "video_conditioning": ic_vcond,
+        "height": height,
+        "width": width,
+        "num_frames": nf,
+        "frame_rate": float(gen.fps),
+        "seed": seed,
+        "stage1_steps": int(steps),
+        "conditioning_attention_strength": 1.0 if attn is None else float(attn),
+    }
+    if guide_images:
+        ic_kwargs["images"] = guide_images
+    elif tmp_image:
+        ic_kwargs["images"] = _build_ic_lora_image_conditionings(tmp_image, nf)
+
+    # Control-aware refine needs a reference clip; never pass upsample_only to HDR.
+    use_control_aware = (
+        bool(vc_items)
+        and (not is_hdr)
+        and _should_use_control_aware_refine(resolved_loras)
+        and _iclora_supports_control_aware_refine()
+    )
+    if use_control_aware:
+        # Upstream 0.14.17+: re-append control at full res; keep LoRA fused when present.
+        refine_n = int(req.stage2_steps) if req.stage2_steps is not None else 3
+        refine_n = max(1, min(refine_n, 8))
+        ic_kwargs["upsample_only"] = True
+        ic_kwargs["refine_steps"] = refine_n
+        log.info(
+            "IC-LoRA control-aware refine: upsample_only=True refine_steps=%d "
+            "(ltx-2-mlx >= 0.14.17; LoRAs=%d)",
+            refine_n,
+            len(resolved_loras),
+        )
+    elif req.stage2_steps is not None:
+        ic_kwargs["stage2_steps"] = int(req.stage2_steps)
+    elif uses_pose and tmp_image:
+        ic_kwargs["stage2_steps"] = 1
+        log.info(
+            "IC-LoRA Union motion transfer: stage2_steps=1 "
+            "(override with stage2_steps in API)"
+        )
+    if primary_lora and _is_crossview_lora_path(primary_lora[0]):
+        log.info(
+            "CrossView V2V: prompt must use the fixed vocabulary "
+            "(e.g. 'crossview. new camera angle: to the right, lower, closer.'); "
+            "LoRA strength=%.2f attention=%.2f — see "
+            "https://huggingface.co/Cseti/LTX2.3-22B_IC-LoRA-CrossView-Prompt",
+            float(resolved_loras[0][1]),
+            float(ic_kwargs["conditioning_attention_strength"]),
+        )
+        if not use_control_aware:
+            log.warning(
+                "CrossView without control-aware refine (upgrade ltx-2-mlx to "
+                "%s+ for upsample_only/refine_steps). Legacy clean Stage 2 will "
+                "weaken the camera-angle effect on distilled.",
+                LTX2_MLX_GIT_TAG,
+            )
+    if not resolved_loras and vc_items:
+        log.info(
+            "V2V / IC-LoRA with no adapter LoRA — reference-video conditioning only "
+            "(pure motion / structure transfer)"
+        )
+    if ic_vcond_cleanup:
+        log.info(
+            "IC-LoRA pose control video: %s — verify colored "
+            "OpenPose skeletons before cleanup",
+            ic_vcond_cleanup[0],
+        )
+    _invoke_generate_and_save(pipe, **ic_kwargs)
+    if uses_pose and ic_vcond_cleanup and gen.spill_dir and req.job_id:
+        try:
+            gen.spill_dir.mkdir(parents=True, exist_ok=True)
+            slug = _spill_slug(req.prompt)
+            dest = gen.spill_dir / f"{req.job_id}_{slug}_pose_control.mp4"
+            shutil.copy2(ic_vcond_cleanup[0], dest)
+            log.info("IC-LoRA pose control saved → %s", dest)
+        except OSError as exc:
+            log.warning("Could not save pose control debug copy: %s", exc)
+    if audio_reference_paths:
+        _maybe_preserve_reference_audio(
+            out_path,
+            audio_reference_paths,
+            job_id=req.job_id,
+        )
+    return pipe
+
+
+# Comfy V3 Face Swap LoRA stack (see docs/FACESWAP_COMFY_GRAPH.md).
+FACE_SWAP_DISTILLED_DYNAMIC_SPEC = (
+    "https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/"
+    "loras/ltx-2.3-22b-distilled-lora-dynamic_fro09_avg_rank_105_bf16.safetensors"
+)
+FACE_SWAP_DISTILLED_DYNAMIC_SCALE = 1.0
+FACE_SWAP_DISTILLED_DYNAMIC_NAMES = (
+    "ltx-2.3-22b-distilled-lora-dynamic_fro09_avg_rank_105_bf16.safetensors",
+    "ltx-2.3-22b-distilled-lora-dynamic.safetensors",
+)
+ENV_FACE_SWAP_DISTILLED_LORA = "LTX_WS_FACE_SWAP_DISTILLED_LORA"
+ENV_FACE_SWAP_NO_DISTILLED_LORA = "LTX_WS_FACE_SWAP_NO_DISTILLED_LORA"
+
+
+def _find_local_face_swap_distilled_dynamic(model_dir: Path | None = None) -> Path | None:
+    """Prefer an already-downloaded distilled-dynamic LoRA over a fresh HF fetch."""
+    candidates: list[Path] = []
+    if model_dir is not None:
+        root = Path(model_dir)
+        for name in FACE_SWAP_DISTILLED_DYNAMIC_NAMES:
+            candidates.append(root / name)
+            candidates.append(root / "loras" / name)
+    cache = _local_lora_cache_dir()
+    for name in FACE_SWAP_DISTILLED_DYNAMIC_NAMES:
+        candidates.append(cache / name)
+        candidates.append(cache / "loras" / name)
+        candidates.append(cache / "Kijai__LTX2.3_comfy" / "loras" / name)
+        candidates.append(cache / "Kijai__LTX2.3_comfy" / name)
+    for hit in candidates:
+        if hit.is_file():
+            return hit.resolve()
+    return None
+
+
+def _build_face_swap_lora_stack(
+    head_swap_loras: list[tuple[str, float]],
+    *,
+    model_dir: Path | None = None,
+) -> list[tuple[str, float]]:
+    """Comfy V3 order: distilled-dynamic @1.0, then user head-swap LoRA(s).
+
+    Skip with ``LTX_WS_FACE_SWAP_NO_DISTILLED_LORA=1``. Override path/URL via
+    ``LTX_WS_FACE_SWAP_DISTILLED_LORA``.
+    """
+    if not head_swap_loras:
+        raise RuntimeError("Face swap requires exactly one head-swap LoRA")
+
+    stack: list[tuple[str, float]] = []
+    skip = os.environ.get(ENV_FACE_SWAP_NO_DISTILLED_LORA, "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if not skip:
+        override = os.environ.get(ENV_FACE_SWAP_DISTILLED_LORA, "").strip()
+        try:
+            if override:
+                path, _cleanup = _resolve_lora_path(override)
+                stack.append((path, FACE_SWAP_DISTILLED_DYNAMIC_SCALE))
+            else:
+                local = _find_local_face_swap_distilled_dynamic(model_dir)
+                if local is not None:
+                    stack.append((str(local), FACE_SWAP_DISTILLED_DYNAMIC_SCALE))
+                else:
+                    path, _cleanup = _resolve_lora_path(FACE_SWAP_DISTILLED_DYNAMIC_SPEC)
+                    stack.append((path, FACE_SWAP_DISTILLED_DYNAMIC_SCALE))
+            log.info(
+                "Face swap LoRA stack: distilled-dynamic @%.2f → %s",
+                stack[-1][1],
+                Path(stack[-1][0]).name,
+            )
+        except Exception as exc:
+            log.warning(
+                "Face swap: distilled-dynamic LoRA unavailable (%s: %s); "
+                "continuing with head-swap only (identity transfer may be weak)",
+                type(exc).__name__,
+                exc,
+            )
+    else:
+        log.info("Face swap: distilled-dynamic LoRA skipped (%s=1)", ENV_FACE_SWAP_NO_DISTILLED_LORA)
+
+    stack.extend((str(p), float(s)) for p, s in head_swap_loras)
+    return stack
+
+
+def _run_face_swap_generation(
+    gen: "LocalVideoGenerator",
+    *,
+    req: GenerationRequest,
+    prompt: str,
+    resolved_loras: list[tuple[str, float]],
+    guide_path: str,
+    tmpdir: str,
+    out_path: str,
+    width: int,
+    height: int,
+    nf: int,
+    seed: int,
+    steps: int,
+) -> Any:
+    """BFS V3 face swap via Comfy LTXVAddGuide + distilled-dynamic + head-swap LoRA."""
+    if len(resolved_loras) != 1:
+        raise RuntimeError("Face swap requires exactly one head-swap LoRA")
+
+    model_dir = Path(getattr(gen, "model_dir", "") or "")
+    lora_stack = _build_face_swap_lora_stack(
+        [(str(p), float(s)) for p, s in resolved_loras],
+        model_dir=model_dir if model_dir.is_dir() else None,
+    )
+    log.info(
+        "Face swap invoke: FaceSwapPipeline loras=%s guide=%s (%dx%d, %d frames) "
+        "add_guide=full_composite crop_guides=yes schedule=DISTILLED_SIGMAS",
+        [Path(p).name for p, _ in lora_stack],
+        guide_path,
+        width,
+        height,
+        nf,
+    )
+    pipe = gen._get_pipe(
+        "face_swap",
+        pipe_kwargs={"lora_paths": lora_stack},
+    )
+    from ltx_face_swap_pipeline import DEFAULT_FACE_SWAP_CFG, FaceSwapPipeline
+
+    if not isinstance(pipe, FaceSwapPipeline):
+        raise RuntimeError(
+            f"face_swap expected FaceSwapPipeline (dev+Comfy LoRA stack), got {type(pipe).__name__}; "
+            "update ltx-ws faceswap branch"
+        )
+    from ltx_ltxv_add_guide import DEFAULT_GUIDE_CRF
+
+    swap_kwargs: dict[str, Any] = {
+        "prompt": prompt,
+        "output_path": out_path,
+        "guide_video_path": guide_path,
+        "height": height,
+        "width": width,
+        "num_frames": nf,
+        "frame_rate": float(gen.fps),
+        "seed": seed,
+        "num_steps": int(steps),
+        "guide_crf": DEFAULT_GUIDE_CRF,
+        # Comfy V3 default; request override still wins below.
+        "cfg_scale": float(DEFAULT_FACE_SWAP_CFG),
+    }
+    if req.reference_strength is not None:
+        swap_kwargs["guide_strength"] = float(req.reference_strength)
+    if req.stage2_steps is not None:
+        log.info("Face swap: stage2_steps ignored (single-stage V3; keep LoRAs fused)")
+    if req.cfg_scale is not None:
+        swap_kwargs["cfg_scale"] = float(req.cfg_scale)
+    _apply_optional_generate_kwargs(swap_kwargs, req)
+    _invoke_generate_and_save(pipe, **swap_kwargs)
+    return pipe
 
 
 def _stage_from_tqdm_desc(desc: str) -> str:
@@ -1582,13 +2447,21 @@ class LocalVideoGenerator:
         for key, cls_name in (
             ("two_stage", "TI2VidTwoStagesPipeline"),
             ("hq", "TI2VidTwoStagesHQPipeline"),
-            ("keyframe", "KeyframePipeline"),
+            ("keyframe", "KeyframeInterpolationPipeline"),
             ("lipdub", "LipDubPipeline"),
         ):
             cls = getattr(lpm, cls_name, None)
             if cls is not None:
                 self._pipe_classes[key] = cls
                 log.info("Registered MLX pipeline %s (%s)", key, cls_name)
+
+        try:
+            from ltx_face_swap_pipeline import FaceSwapPipeline
+
+            self._pipe_classes["face_swap"] = FaceSwapPipeline
+            log.info("Registered MLX pipeline face_swap (FaceSwapPipeline)")
+        except ImportError as exc:
+            log.warning("FaceSwapPipeline unavailable: %s", exc)
 
         # Legacy standalone spatial upscaler classes (pre-v0.14 monolith pipelines).
         for cls_name in (
@@ -1886,7 +2759,6 @@ class LocalVideoGenerator:
             log.error("  ✗ spill salvage failed: %s", exc)
 
     def _generate_sync(self, req: GenerationRequest) -> str:
-        del req.negative_prompt  # reserved for future CFG-enabled variants
         self._check_cancel()
         self.load()
         self._check_cancel()
@@ -1991,6 +2863,13 @@ class LocalVideoGenerator:
                     media_cleanups.append(path)
             if self._resolved_default_loras is not None and not req.lora_specs:
                 resolved_loras = list(self._resolved_default_loras)
+            elif mode in ("face_swap", "face-swap", "lipdub", "lip_dub"):
+                # Exclusive single-adapter modes: never stack global OmniNFT defaults.
+                for lora_spec, lora_scale in (req.lora_specs or []):
+                    lora_path, lora_cleanup = _resolve_lora_path(str(lora_spec))
+                    resolved_loras.append((lora_path, float(lora_scale)))
+                    if lora_cleanup:
+                        tmp_lora_cleanup.append(lora_cleanup)
             else:
                 for lora_spec, lora_scale in effective_loras:
                     lora_path, lora_cleanup = _resolve_lora_path(str(lora_spec))
@@ -2251,97 +3130,123 @@ class LocalVideoGenerator:
                             },
                         )
                         last_pipe = pipe
-                        _invoke_generate_and_save(
-                            pipe,
-                            **common_gen_kwargs,
-                            video_path=tmp_video,
-                            reference_video=tmp_video,
-                        )
-                    elif mode == "ic_lora":
-                        if not resolved_loras:
-                            raise RuntimeError("ic_lora mode requires at least one LoRA spec")
-                        ic_pipe_key = (
-                            "hdr_ic_lora"
-                            if _ic_lora_uses_hdr_pipeline(resolved_loras)
-                            else "ic_lora"
-                        )
-                        primary_lora = _ic_lora_primary_lora(resolved_loras)
-                        log.info(
-                            "IC-LoRA invoke: pipe=%s primary=%s vcond_in=%d image=%s pose_preprocess=%s",
-                            ic_pipe_key,
-                            primary_lora[0] if primary_lora else "?",
-                            len(vc_items),
-                            "yes" if tmp_image else "no",
-                            "yes"
-                            if _needs_pose_control_preprocessing(resolved_loras, vc_items)
-                            else "no",
-                        )
-                        pipe = self._get_pipe(
-                            ic_pipe_key,
-                            pipe_kwargs={
-                                "lora_paths": [(str(p), float(s)) for p, s in resolved_loras],
-                            },
-                        )
-                        last_pipe = pipe
-                        ic_vcond, ic_vcond_cleanup = _prepare_ic_lora_video_conditioning(
-                            vc_items,
-                            resolved_loras=resolved_loras,
-                            width=width,
-                            height=height,
-                            num_frames=nf,
-                            fps=float(self.fps),
+                        lipdub_ref, lipdub_tmp = _prepare_lipdub_reference_video(
+                            tmp_video,
+                            tmp_audio,
                             tmpdir=tmpdir,
                         )
-                        tmp_video_conditioning_cleanup.extend(ic_vcond_cleanup)
-                        uses_pose = _needs_pose_control_preprocessing(resolved_loras, vc_items)
-                        ic_kwargs: dict[str, Any] = {
-                            "prompt": req.prompt,
-                            "output_path": out_path,
-                            "video_conditioning": ic_vcond,
-                            "height": height,
-                            "width": width,
-                            "num_frames": nf,
-                            "frame_rate": float(self.fps),
-                            "seed": seed,
-                            "stage1_steps": int(steps),
-                            "conditioning_attention_strength": 1.0,
-                        }
-                        if tmp_image:
-                            ic_kwargs["images"] = _build_ic_lora_image_conditionings(
-                                tmp_image, nf
+                        tmp_video_conditioning_cleanup.extend(lipdub_tmp)
+                        _invoke_lipdub_style(
+                            pipe,
+                            common_gen_kwargs=common_gen_kwargs,
+                            reference_video=lipdub_ref,
+                            tmp_image=tmp_image,
+                            num_frames=nf,
+                            req=req,
+                        )
+                    elif mode in ("face_swap", "face-swap"):
+                        if not tmp_video:
+                            raise RuntimeError("face_swap mode requires reference video")
+                        if not tmp_image:
+                            raise RuntimeError("face_swap mode requires face identity image")
+                        if len(resolved_loras) != 1:
+                            raise RuntimeError("face_swap mode requires exactly one LoRA spec")
+                        from ltx_face_swap_compose import (
+                            crop_face_swap_output_to_main_video,
+                            format_head_swap_prompt,
+                        )
+
+                        ref_path = tmp_video
+                        guide_path, guide_layout, face_swap_nf, canvas_w, canvas_h = (
+                            _prepare_face_swap_guide_video(
+                                str(ref_path),
+                                tmp_image,
+                                tmpdir=tmpdir,
+                                num_frames=nf,
+                                width=width,
+                                height=height,
+                                fps=float(self.fps),
                             )
-                        if req.reference_strength is not None:
-                            ic_kwargs["conditioning_attention_strength"] = float(
-                                req.reference_strength
-                            )
-                        if req.stage2_steps is not None:
-                            ic_kwargs["stage2_steps"] = int(req.stage2_steps)
-                        elif uses_pose and tmp_image:
-                            # Stage 2 drops video reference; lighter refine preserves motion.
-                            ic_kwargs["stage2_steps"] = 1
-                            log.info(
-                                "IC-LoRA Union motion transfer: stage2_steps=1 "
-                                "(override with stage2_steps in API)"
-                            )
-                        if ic_vcond_cleanup:
-                            log.info(
-                                "IC-LoRA pose control video: %s — verify colored "
-                                "OpenPose skeletons before cleanup",
-                                ic_vcond_cleanup[0],
-                            )
-                        _invoke_generate_and_save(pipe, **ic_kwargs)
-                        if uses_pose and ic_vcond_cleanup and self.spill_dir and req.job_id:
+                        )
+                        tmp_video_conditioning_cleanup.extend(
+                            [
+                                os.path.join(tmpdir, "face_swap_ref_trimmed.mp4"),
+                                os.path.join(tmpdir, "face_swap_bfs_v3_guide.mp4"),
+                                guide_path,
+                            ]
+                        )
+                        face_swap_prompt = format_head_swap_prompt(effective_prompt)
+                        log.info(
+                            "Face swap: BFS V3 composite %dx%d (%d frames) "
+                            "main panel %dx%d + LTXVAddGuide full composite",
+                            canvas_w,
+                            canvas_h,
+                            face_swap_nf,
+                            guide_layout.video_w,
+                            guide_layout.video_h,
+                        )
+                        if self.spill_dir and req.job_id:
                             try:
                                 self.spill_dir.mkdir(parents=True, exist_ok=True)
                                 slug = _spill_slug(req.prompt)
-                                dest = (
-                                    self.spill_dir
-                                    / f"{req.job_id}_{slug}_pose_control.mp4"
-                                )
-                                shutil.copy2(ic_vcond_cleanup[0], dest)
-                                log.info("IC-LoRA pose control saved → %s", dest)
+                                dest = self.spill_dir / f"{req.job_id}_{slug}_face_swap_guide.mp4"
+                                shutil.copy2(guide_path, dest)
+                                log.info("Face swap guide saved → %s", dest)
                             except OSError as exc:
-                                log.warning("Could not save pose control debug copy: %s", exc)
+                                log.warning("Could not save face swap guide debug copy: %s", exc)
+                        last_pipe = _run_face_swap_generation(
+                            self,
+                            req=req,
+                            prompt=face_swap_prompt,
+                            resolved_loras=resolved_loras,
+                            guide_path=guide_path,
+                            tmpdir=tmpdir,
+                            out_path=out_path,
+                            width=canvas_w,
+                            height=canvas_h,
+                            nf=face_swap_nf,
+                            seed=seed,
+                            steps=steps,
+                        )
+                        try:
+                            crop_face_swap_output_to_main_video(out_path, guide_layout)
+                            log.info(
+                                "Face swap: cropped output to main video area %dx%d",
+                                guide_layout.video_w,
+                                guide_layout.video_h,
+                            )
+                        except Exception as exc:
+                            log.warning("Face swap output crop failed (using full frame): %s", exc)
+                        _maybe_preserve_reference_audio(
+                            out_path,
+                            [tmp_video],
+                            job_id=req.job_id,
+                        )
+                    elif mode == "ic_lora":
+                        if not vc_items and not (
+                            resolved_loras and _ic_lora_uses_hdr_pipeline(resolved_loras)
+                        ):
+                            raise RuntimeError(
+                                "ic_lora / v2v requires a reference video "
+                                "(or an HDR LoRA for pure text-to-HDR)"
+                            )
+                        last_pipe = _run_ic_lora_generation(
+                            self,
+                            req=req,
+                            prompt=req.prompt,
+                            resolved_loras=resolved_loras,
+                            vc_items=vc_items,
+                            tmp_image=tmp_image,
+                            tmpdir=tmpdir,
+                            out_path=out_path,
+                            width=width,
+                            height=height,
+                            nf=nf,
+                            seed=seed,
+                            steps=steps,
+                            tmp_video_conditioning_cleanup=tmp_video_conditioning_cleanup,
+                            audio_reference_paths=[str(p) for p, _ in vc_items],
+                        )
                     elif tmp_image:
                         try:
                             from PIL import Image as PILImage
