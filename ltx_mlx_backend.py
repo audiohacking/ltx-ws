@@ -326,155 +326,52 @@ def _patch_video_io_pyav_only() -> None:
         log.debug("PyAV video_io patch applied (IC-LoRA reference video probe/decode)")
 
 
-def _count_lora_weight_matches(
-    model_keys: set[str],
-    lora_sd_keys: set[str],
-) -> tuple[int, int]:
-    """Return (matched_pairs, total_lora_pairs) for Comfy-style lora_A/lora_B keys."""
-    bases: set[str] = set()
-    for key in lora_sd_keys:
-        if key.endswith(".lora_A.weight"):
-            bases.add(key[: -len(".lora_A.weight")])
-        elif key.endswith(".lora_B.weight"):
-            bases.add(key[: -len(".lora_B.weight")])
-    matched = 0
-    for base in bases:
-        a = f"{base}.lora_A.weight"
-        b = f"{base}.lora_B.weight"
-        weight = f"{base}.weight"
-        if a in lora_sd_keys and b in lora_sd_keys and weight in model_keys:
-            matched += 1
-    return matched, len(bases)
-
-
-def _should_keep_ic_lora_for_stage2(pipe: Any) -> bool:
-    """True when Stage 2 must keep the fused IC-LoRA (CrossView / raw-RGB V2V).
-
-    Upstream reloads a *clean* distilled DiT for Stage 2 (HDR-friendly). That
-    wipe removes CrossView / community V2V adapters — Stage 2 then looks like
-    plain motion transfer with new characters and no camera change.
-    """
-    paths = list(getattr(pipe, "_lora_paths", None) or [])
-    if not paths:
-        return False
-    if any(_is_crossview_lora_path(str(p)) for p, _ in paths):
-        return True
-    if _ic_lora_uses_hdr_pipeline([(str(p), float(s)) for p, s in paths]):
-        return False
-    primary = str(paths[0][0])
-    # Union Control (ref downscale != 1): short clean Stage 2 is intentional.
-    if _ic_lora_reference_downscale_factor(primary) != 1:
-        return False
-    return True
-
-
 def _patch_iclora_stage2_x0_model() -> None:
-    """IC-LoRA Stage 2 fixes: keep CrossView LoRA; refresh X0Model when clean.
+    """Recreate X0Model after Stage 2 clean transformer reload.
 
     Upstream ``ICLoraPipeline.generate`` builds ``x0_model = X0Model(self.dit)``
     before Stage 1, then reloads a clean DiT for Stage 2 but keeps denoising
-    with the old (LoRA-fused) ``x0_model``. Rebuild the wrapper when we *do*
-    reload clean weights.
-
-    For CrossView / raw-RGB community IC-LoRAs, skipping the clean reload is
-    required — otherwise Stage 2 erases the adapter (see model card tips on
-    distilled workflows).
+    with the old (LoRA-fused) ``x0_model``. Rebuild the wrapper so Stage 2
+    matches the documented clean-distilled refine.
     """
     try:
         from ltx_pipelines_mlx.ic_lora import ICLoraPipeline
         from ltx_core_mlx.model.transformer.model import X0Model
-        from ltx_core_mlx.loader import (
-            LTXV_LORA_COMFY_RENAMING_MAP,
-            SafetensorsStateDictLoader,
-        )
     except ImportError:
         return
     if getattr(ICLoraPipeline, "_ltx_ws_stage2_x0_patched", False):
         return
 
     original = ICLoraPipeline._reload_clean_transformer
-    original_fuse = ICLoraPipeline._fuse_loras
-
-    def _fuse_loras_with_match_check(self: Any) -> None:
-        paths = list(getattr(self, "_lora_paths", None) or [])
-        if paths and getattr(self, "dit", None) is not None and not getattr(
-            self, "low_ram_streaming", False
-        ):
-            try:
-                import mlx.utils
-
-                model_keys = {
-                    str(k)
-                    for k, _ in mlx.utils.tree_flatten(self.dit.parameters())
-                }
-                loader = SafetensorsStateDictLoader()
-                total_matched = 0
-                total_pairs = 0
-                for lora_path, strength in paths:
-                    lora_sd = loader.load(
-                        str(lora_path), sd_ops=LTXV_LORA_COMFY_RENAMING_MAP
-                    )
-                    matched, pairs = _count_lora_weight_matches(
-                        model_keys, set(lora_sd.sd.keys())
-                    )
-                    total_matched += matched
-                    total_pairs += pairs
-                    log.info(
-                        "IC-LoRA fuse check: %s strength=%.2f matched %d/%d "
-                        "attention weight pairs",
-                        lora_path,
-                        float(strength),
-                        matched,
-                        pairs,
-                    )
-                if total_pairs and total_matched == 0:
-                    raise RuntimeError(
-                        "IC-LoRA keys did not match the loaded transformer — "
-                        "adapter would have zero effect. Check MLX weight layout "
-                        f"vs LoRA (paths={[p for p, _ in paths]})."
-                    )
-                if total_pairs and total_matched < max(1, total_pairs // 4):
-                    log.warning(
-                        "IC-LoRA fuse check: only %d/%d pairs matched — effect "
-                        "may be weak or wrong base model",
-                        total_matched,
-                        total_pairs,
-                    )
-            except RuntimeError:
-                raise
-            except Exception as exc:
-                log.warning("IC-LoRA fuse match check skipped: %s", exc)
-        original_fuse(self)
 
     def _reload_and_flag(self: Any) -> None:
-        if _should_keep_ic_lora_for_stage2(self):
-            log.info(
-                "IC-LoRA Stage 2: keeping LoRA-fused transformer "
-                "(CrossView / raw-RGB V2V adapter)"
-            )
-            self._ltx_ws_need_stage2_x0_refresh = False
-            return
         original(self)
-        # Stash flag so generate can rebuild x0_model on the clean DiT.
+        # Stash flag so generate can rebuild x0_model; generate itself is long
+        # so we patch denoise by wrapping generate instead when possible.
         self._ltx_ws_need_stage2_x0_refresh = True
 
-    ICLoraPipeline._fuse_loras = _fuse_loras_with_match_check  # type: ignore[method-assign]
     ICLoraPipeline._reload_clean_transformer = _reload_and_flag  # type: ignore[method-assign]
 
     original_generate = ICLoraPipeline.generate
 
     def _generate_with_stage2_x0(self: Any, *args: Any, **kwargs: Any) -> Any:
+        # Wrap denoise_loop usage by monkeypatching X0Model construction mid-generate
+        # is fragile; instead post-process: if generate returns after stage2 with
+        # stale x0, we patch at the call site inside generate via local rewrite.
+        # Practical approach: wrap denoise_loop for this call.
         import ltx_pipelines_mlx.ic_lora as ic_mod
 
         self._ltx_ws_need_stage2_x0_refresh = False
         real_denoise = ic_mod.denoise_loop
+        x0_holder: dict[str, Any] = {"model": None}
 
         def denoise_loop(*, model, **kw):  # type: ignore[no-untyped-def]
             if getattr(self, "_ltx_ws_need_stage2_x0_refresh", False):
-                # Stage 2 clean reload: rebuild X0 around the new dit.
+                # Stage 2: rebuild X0 around the clean reloaded dit.
                 model = X0Model(self.dit)
                 self._ltx_ws_need_stage2_x0_refresh = False
                 log.info("IC-LoRA Stage 2: rebuilt X0Model on clean transformer")
+            x0_holder["model"] = model
             return real_denoise(model=model, **kw)
 
         ic_mod.denoise_loop = denoise_loop  # type: ignore[assignment]
@@ -485,10 +382,7 @@ def _patch_iclora_stage2_x0_model() -> None:
 
     ICLoraPipeline.generate = _generate_with_stage2_x0  # type: ignore[method-assign]
     ICLoraPipeline._ltx_ws_stage2_x0_patched = True
-    log.info(
-        "Patched ICLoraPipeline: keep CrossView LoRA in Stage 2; "
-        "refresh X0Model after clean reload; verify fuse key matches"
-    )
+    log.info("Patched ICLoraPipeline Stage 2 to use clean X0Model after LoRA reload")
 
 
 def _apply_ltx_mlx_patches(*, default_fps: float = 24.0) -> None:
@@ -2056,20 +1950,11 @@ def _run_ic_lora_generation(
             "IC-LoRA Union motion transfer: stage2_steps=1 "
             "(override with stage2_steps in API)"
         )
-    elif primary_lora and _is_crossview_lora_path(primary_lora[0]):
-        # Author tip: CrossView is weak on distilled; Stage 2 without LoRA
-        # previously wiped the camera change. Keep LoRA (patch) + short Stage 2.
-        ic_kwargs["stage2_steps"] = 1
-        log.info(
-            "CrossView: stage2_steps=1 + keep LoRA in Stage 2 "
-            "(override with stage2_steps in API)"
-        )
     if primary_lora and _is_crossview_lora_path(primary_lora[0]):
         log.info(
             "CrossView V2V: prompt must use the fixed vocabulary "
             "(e.g. 'crossview. new camera angle: to the right, lower, closer.'); "
-            "LoRA strength=%.2f attention=%.2f — see "
-            "https://huggingface.co/Cseti/LTX2.3-22B_IC-LoRA-CrossView-Prompt",
+            "LoRA strength=%.2f attention=%.2f",
             float(resolved_loras[0][1]),
             float(ic_kwargs["conditioning_attention_strength"]),
         )
