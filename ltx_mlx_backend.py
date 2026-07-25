@@ -33,7 +33,7 @@ log = logging.getLogger("fvserver")
 
 LTX2_SPATIAL_ALIGN = 32
 IC_LORA_IMAGE_CRF = 33  # ltx_pipelines_mlx.utils.media_io.DEFAULT_IMAGE_CRF
-LTX2_MLX_GIT_TAG = "v0.14.15"
+LTX2_MLX_GIT_TAG = "v0.14.19"
 
 CHAIN_METHOD_AUTOCONTINUE = "autocontinue"
 CHAIN_METHOD_NATIVE_EXTEND = "native_extend"
@@ -1864,6 +1864,36 @@ def _prepare_face_swap_guide_video(
     return guide_path, layout, vae_frames, canvas_w, canvas_h
 
 
+def _iclora_supports_control_aware_refine() -> bool:
+    """True when installed ltx-2-mlx has ``upsample_only`` / ``refine_steps`` (0.14.17+)."""
+    try:
+        from ltx_pipelines_mlx.ic_lora import ICLoraPipeline
+    except ImportError:
+        return False
+    try:
+        params = inspect.signature(ICLoraPipeline.generate_and_save).parameters
+    except (TypeError, ValueError):
+        return False
+    return "upsample_only" in params and "refine_steps" in params
+
+
+def _should_use_control_aware_refine(resolved_loras: list[tuple[str, float]]) -> bool:
+    """Use upsample-only + LoRA-kept refine for raw-RGB V2V adapters (e.g. CrossView).
+
+    HDR and Union Control keep the legacy clean Stage 2 path. Community raw-RGB
+    IC-LoRAs (ref_downscale=1) lose their effect under clean Stage 2; upstream
+    0.14.17+ ``upsample_only`` + ``refine_steps`` is the supported alternative.
+    """
+    if not resolved_loras:
+        return False
+    if _ic_lora_uses_hdr_pipeline(resolved_loras):
+        return False
+    primary = resolved_loras[0][0]
+    if _ic_lora_reference_downscale_factor(primary) != 1:
+        return False
+    return True
+
+
 def _run_ic_lora_generation(
     gen: "LocalVideoGenerator",
     *,
@@ -1942,7 +1972,24 @@ def _run_ic_lora_generation(
         ic_kwargs["images"] = guide_images
     elif tmp_image:
         ic_kwargs["images"] = _build_ic_lora_image_conditionings(tmp_image, nf)
-    if req.stage2_steps is not None:
+
+    use_control_aware = (
+        _should_use_control_aware_refine(resolved_loras)
+        and _iclora_supports_control_aware_refine()
+    )
+    if use_control_aware:
+        # Upstream 0.14.17+: keep IC-LoRA fused during full-res refine (not legacy
+        # clean Stage 2). CrossView / raw-RGB V2V need this or the adapter washes out.
+        refine_n = int(req.stage2_steps) if req.stage2_steps is not None else 3
+        refine_n = max(1, min(refine_n, 8))
+        ic_kwargs["upsample_only"] = True
+        ic_kwargs["refine_steps"] = refine_n
+        log.info(
+            "IC-LoRA control-aware refine: upsample_only=True refine_steps=%d "
+            "(keeps LoRA fused; requires ltx-2-mlx >= 0.14.17)",
+            refine_n,
+        )
+    elif req.stage2_steps is not None:
         ic_kwargs["stage2_steps"] = int(req.stage2_steps)
     elif uses_pose and tmp_image:
         ic_kwargs["stage2_steps"] = 1
@@ -1954,10 +2001,18 @@ def _run_ic_lora_generation(
         log.info(
             "CrossView V2V: prompt must use the fixed vocabulary "
             "(e.g. 'crossview. new camera angle: to the right, lower, closer.'); "
-            "LoRA strength=%.2f attention=%.2f",
+            "LoRA strength=%.2f attention=%.2f — see "
+            "https://huggingface.co/Cseti/LTX2.3-22B_IC-LoRA-CrossView-Prompt",
             float(resolved_loras[0][1]),
             float(ic_kwargs["conditioning_attention_strength"]),
         )
+        if not use_control_aware:
+            log.warning(
+                "CrossView without control-aware refine (upgrade ltx-2-mlx to "
+                "%s+ for upsample_only/refine_steps). Legacy clean Stage 2 will "
+                "weaken the camera-angle effect on distilled.",
+                LTX2_MLX_GIT_TAG,
+            )
     if ic_vcond_cleanup:
         log.info(
             "IC-LoRA pose control video: %s — verify colored "

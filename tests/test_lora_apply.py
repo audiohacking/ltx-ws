@@ -82,3 +82,32 @@ def test_clamp_conditioning_attention_strength():
     assert _clamp_conditioning_attention_strength(1.25) == pytest.approx(1.0)
     assert _clamp_conditioning_attention_strength(0.8) == pytest.approx(0.8)
     assert _clamp_conditioning_attention_strength(None) is None
+
+
+def test_should_use_control_aware_refine_for_crossview():
+    from ltx_mlx_backend import _should_use_control_aware_refine
+
+    assert (
+        _should_use_control_aware_refine(
+            [("/loras/Cseti__CrossView-Prompt/x.safetensors", 1.25)]
+        )
+        is True
+    )
+
+
+def test_should_use_control_aware_refine_skips_hdr():
+    from ltx_mlx_backend import _should_use_control_aware_refine
+
+    assert (
+        _should_use_control_aware_refine(
+            [("/weights/LTX-2.3-22b-IC-LoRA-HDR.safetensors", 1.0)]
+        )
+        is False
+    )
+
+
+def test_iclora_supports_control_aware_refine_on_current_install():
+    """Pinned ltx-2-mlx >= 0.14.17 exposes upsample_only / refine_steps."""
+    from ltx_mlx_backend import _iclora_supports_control_aware_refine
+
+    assert _iclora_supports_control_aware_refine() is True
