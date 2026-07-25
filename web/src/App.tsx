@@ -752,13 +752,20 @@ export default function App() {
     if (!spec || addingCustomLora) return;
     setAddingCustomLora(true);
     try {
+      const lower = spec.toLowerCase();
+      const isCrossView = lower.includes("crossview") || lower.includes("cross-view");
+      let scale = parseFloat(customLoraScale) || 1.0;
+      if (isCrossView && scale < 1.2) {
+        scale = 1.25;
+        setCustomLoraScale("1.25");
+      }
       const r = await fetch(`${API}/api/loras/custom`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           spec,
           label: customLoraLabel.trim() || undefined,
-          scale: parseFloat(customLoraScale) || 1.0,
+          scale,
         }),
       });
       if (!r.ok) {
@@ -2364,9 +2371,12 @@ export default function App() {
                           CrossView Prompt
                         </a>
                         ), paste the resolve URL below — it is added to the LoRA list and
-                        selected automatically (HDR/Union are cleared). No character image
-                        needed for video-only adapters. Use that adapter&apos;s prompt
-                        vocabulary.
+                        selected automatically (HDR/Union are cleared). Use strength{" "}
+                        <strong>1.2–1.5</strong> on distilled (auto-bumped from 1.0). No
+                        character image needed for video-only adapters. Prompt must use
+                        that adapter&apos;s vocabulary (e.g.{" "}
+                        <code>crossview. new camera angle: to the right, lower, closer.</code>
+                        ).
                       </p>
                       <div className="media-upload-row">
                         <label className="media-upload">

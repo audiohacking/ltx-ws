@@ -326,6 +326,65 @@ def _patch_video_io_pyav_only() -> None:
         log.debug("PyAV video_io patch applied (IC-LoRA reference video probe/decode)")
 
 
+def _patch_iclora_stage2_x0_model() -> None:
+    """Recreate X0Model after Stage 2 clean transformer reload.
+
+    Upstream ``ICLoraPipeline.generate`` builds ``x0_model = X0Model(self.dit)``
+    before Stage 1, then reloads a clean DiT for Stage 2 but keeps denoising
+    with the old (LoRA-fused) ``x0_model``. Rebuild the wrapper so Stage 2
+    matches the documented clean-distilled refine.
+    """
+    try:
+        from ltx_pipelines_mlx.ic_lora import ICLoraPipeline
+        from ltx_core_mlx.model.transformer.model import X0Model
+    except ImportError:
+        return
+    if getattr(ICLoraPipeline, "_ltx_ws_stage2_x0_patched", False):
+        return
+
+    original = ICLoraPipeline._reload_clean_transformer
+
+    def _reload_and_flag(self: Any) -> None:
+        original(self)
+        # Stash flag so generate can rebuild x0_model; generate itself is long
+        # so we patch denoise by wrapping generate instead when possible.
+        self._ltx_ws_need_stage2_x0_refresh = True
+
+    ICLoraPipeline._reload_clean_transformer = _reload_and_flag  # type: ignore[method-assign]
+
+    original_generate = ICLoraPipeline.generate
+
+    def _generate_with_stage2_x0(self: Any, *args: Any, **kwargs: Any) -> Any:
+        # Wrap denoise_loop usage by monkeypatching X0Model construction mid-generate
+        # is fragile; instead post-process: if generate returns after stage2 with
+        # stale x0, we patch at the call site inside generate via local rewrite.
+        # Practical approach: wrap denoise_loop for this call.
+        import ltx_pipelines_mlx.ic_lora as ic_mod
+
+        self._ltx_ws_need_stage2_x0_refresh = False
+        real_denoise = ic_mod.denoise_loop
+        x0_holder: dict[str, Any] = {"model": None}
+
+        def denoise_loop(*, model, **kw):  # type: ignore[no-untyped-def]
+            if getattr(self, "_ltx_ws_need_stage2_x0_refresh", False):
+                # Stage 2: rebuild X0 around the clean reloaded dit.
+                model = X0Model(self.dit)
+                self._ltx_ws_need_stage2_x0_refresh = False
+                log.info("IC-LoRA Stage 2: rebuilt X0Model on clean transformer")
+            x0_holder["model"] = model
+            return real_denoise(model=model, **kw)
+
+        ic_mod.denoise_loop = denoise_loop  # type: ignore[assignment]
+        try:
+            return original_generate(self, *args, **kwargs)
+        finally:
+            ic_mod.denoise_loop = real_denoise  # type: ignore[assignment]
+
+    ICLoraPipeline.generate = _generate_with_stage2_x0  # type: ignore[method-assign]
+    ICLoraPipeline._ltx_ws_stage2_x0_patched = True
+    log.info("Patched ICLoraPipeline Stage 2 to use clean X0Model after LoRA reload")
+
+
 def _apply_ltx_mlx_patches(*, default_fps: float = 24.0) -> None:
     """Apply all ltx-ws runtime patches (PyAV-only media, pipeline compat)."""
     _patch_media_io_pyav_only()
@@ -333,6 +392,7 @@ def _apply_ltx_mlx_patches(*, default_fps: float = 24.0) -> None:
     _patch_video_io_pyav_only()
     _patch_ltx_pipelines_compat(default_fps=default_fps)
     _patch_video_decode_pyav_only()
+    _patch_iclora_stage2_x0_model()
 
 
 def looks_like_hf_repo_id(model: str) -> bool:
@@ -1066,8 +1126,88 @@ def _decode_weighted_media_inputs(
 
 
 def _apply_pending_loras(pipe: Any, lora_paths: list[tuple[str, float]] | None) -> None:
-    if hasattr(pipe, "_pending_loras"):
-        pipe._pending_loras = list(lora_paths or [])
+    """Attach request LoRAs so the next transformer load fuses them.
+
+    ``ltx_pipelines_mlx`` only fuses ``_pending_loras`` inside
+    ``BasePipeline._load_transformer_with_optional_streaming``. The attribute is
+    optional (the CLI assigns it directly). We must always set it — a previous
+    ``hasattr`` guard silently dropped Web UI / MCP LoRAs because Distilled /
+    T2V pipes never pre-declare the attribute.
+
+    IC-LoRA / HDR / LipDub pipelines fuse via constructor ``_lora_paths`` inside
+    ``generate()``; leave those alone.
+
+    When the DiT is already loaded under a different LoRA set (typical: ``load()``
+    during ``_get_pipe`` with no LoRAs, then request LoRAs arrive here), reload so
+    fusion actually happens.
+    """
+    # IC-style pipelines own fusion via ``_lora_paths`` (non-empty list).
+    owned = getattr(pipe, "_lora_paths", None)
+    if owned:
+        return
+
+    desired = [(str(p), float(s)) for p, s in (lora_paths or [])]
+    previous = [(str(p), float(s)) for p, s in (getattr(pipe, "_pending_loras", None) or [])]
+    pipe._pending_loras = desired
+
+    dit_loaded = getattr(pipe, "dit", None) is not None
+    if not dit_loaded:
+        if desired:
+            log.info("Queued %d LoRA(s) for next transformer load", len(desired))
+        return
+    if desired == previous:
+        return
+
+    log.info(
+        "Reloading transformer to apply %d LoRA(s) (previously %d)",
+        len(desired),
+        len(previous),
+    )
+    pipe.dit = None
+    if hasattr(pipe, "_loaded"):
+        pipe._loaded = False
+    load_fn = getattr(pipe, "load", None)
+    if callable(load_fn):
+        load_fn()
+
+
+def _is_crossview_lora_path(path: str) -> bool:
+    lowered = (path or "").lower()
+    return "crossview" in lowered or "cross-view" in lowered
+
+
+def _tune_ic_lora_strengths(
+    resolved_loras: list[tuple[str, float]],
+) -> list[tuple[str, float]]:
+    """Raise CrossView LoRA strength on distilled workflows (author tip: 1.2–1.5)."""
+    tuned: list[tuple[str, float]] = []
+    for path, scale in resolved_loras:
+        s = float(scale)
+        if _is_crossview_lora_path(path) and s < 1.2:
+            log.warning(
+                "CrossView IC-LoRA on distilled is weak below 1.2 — raising strength "
+                "%.2f → 1.25 (author tip: 1.2–1.5). Set scale explicitly to override.",
+                s,
+            )
+            s = 1.25
+        tuned.append((path, s))
+    return tuned
+
+
+def _clamp_conditioning_attention_strength(value: float | None) -> float | None:
+    """ICLoraPipeline requires conditioning_attention_strength in [0, 1]."""
+    if value is None:
+        return None
+    v = float(value)
+    if v < 0.0 or v > 1.0:
+        clamped = max(0.0, min(1.0, v))
+        log.warning(
+            "conditioning_attention_strength %.3f out of [0,1] — clamping to %.3f",
+            v,
+            clamped,
+        )
+        return clamped
+    return v
 
 
 def _pipeline_load_state_inconsistent(pipe: Any) -> bool:
@@ -1752,6 +1892,8 @@ def _run_ic_lora_generation(
     ic_pipe_key = (
         "hdr_ic_lora" if _ic_lora_uses_hdr_pipeline(resolved_loras) else "ic_lora"
     )
+    # CrossView was trained on full LTX-2.3; strengthen on distilled few-step.
+    resolved_loras = _tune_ic_lora_strengths(resolved_loras)
     primary_lora = _ic_lora_primary_lora(resolved_loras)
     uses_pose = _needs_pose_control_preprocessing(resolved_loras, vc_items)
     log.info(
@@ -1779,6 +1921,11 @@ def _run_ic_lora_generation(
         tmpdir=tmpdir,
     )
     tmp_video_conditioning_cleanup.extend(ic_vcond_cleanup)
+    attn = _clamp_conditioning_attention_strength(
+        float(req.reference_strength)
+        if req.reference_strength is not None
+        else 1.0
+    )
     ic_kwargs: dict[str, Any] = {
         "prompt": prompt,
         "output_path": out_path,
@@ -1789,14 +1936,12 @@ def _run_ic_lora_generation(
         "frame_rate": float(gen.fps),
         "seed": seed,
         "stage1_steps": int(steps),
-        "conditioning_attention_strength": 1.0,
+        "conditioning_attention_strength": 1.0 if attn is None else float(attn),
     }
     if guide_images:
         ic_kwargs["images"] = guide_images
     elif tmp_image:
         ic_kwargs["images"] = _build_ic_lora_image_conditionings(tmp_image, nf)
-    if req.reference_strength is not None:
-        ic_kwargs["conditioning_attention_strength"] = float(req.reference_strength)
     if req.stage2_steps is not None:
         ic_kwargs["stage2_steps"] = int(req.stage2_steps)
     elif uses_pose and tmp_image:
@@ -1804,6 +1949,14 @@ def _run_ic_lora_generation(
         log.info(
             "IC-LoRA Union motion transfer: stage2_steps=1 "
             "(override with stage2_steps in API)"
+        )
+    if primary_lora and _is_crossview_lora_path(primary_lora[0]):
+        log.info(
+            "CrossView V2V: prompt must use the fixed vocabulary "
+            "(e.g. 'crossview. new camera angle: to the right, lower, closer.'); "
+            "LoRA strength=%.2f attention=%.2f",
+            float(resolved_loras[0][1]),
+            float(ic_kwargs["conditioning_attention_strength"]),
         )
     if ic_vcond_cleanup:
         log.info(
