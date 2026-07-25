@@ -1696,7 +1696,7 @@ export default function App() {
   const canSubmit = useMemo(() => {
     if (!prompt.trim() || busy || !serverOk) return false;
     if ((isV2v || isIcLora) && loraBusy) return false;
-    // V2V: reference video required; LoRA optional (pure motion transfer OK).
+    // V2V: reference video required; LoRA optional (empty → first-frame I2V rewrite).
     if (isV2v && !hasConditioningVideo) return false;
     // IC-LoRA HDR/Union: need a selected LoRA (server may also inject defaults).
     if (isIcLora && loraPresetIds.length === 0) return false;
@@ -2485,9 +2485,11 @@ export default function App() {
                     <>
                       <span className="media-panel-title">Video to Video</span>
                       <p className="hint hint-inline">
-                        Re-render from a reference clip using your prompt. LoRA is
-                        optional — leave none selected for prompt + structure transfer,
-                        or pick a community IC-LoRA (e.g.{" "}
+                        Re-render from a reference clip using your prompt. With{" "}
+                        <strong>no LoRA</strong>, the first frame seeds image-to-video so
+                        the text can change appearance (motion follows the prompt, not a
+                        frame-locked copy). For camera/structure transfer, pick an IC-LoRA
+                        such as{" "}
                         <a
                           href="https://huggingface.co/Cseti/LTX2.3-22B_IC-LoRA-CrossView-Prompt"
                           target="_blank"
@@ -2496,7 +2498,7 @@ export default function App() {
                           CrossView
                         </a>
                         {" "}
-                        at strength <strong>1.2–1.5</strong>). No HDR/Union defaults.
+                        at strength <strong>1.2–1.5</strong>. No HDR/Union defaults.
                       </p>
                       <div className="media-upload-row">
                         <label className="media-upload">

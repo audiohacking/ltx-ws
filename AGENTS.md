@@ -311,9 +311,10 @@ Structure prompts as a **timeline**, not duplicate full scene descriptions.
 
 **V2V / CrossView (Web UI `mode: v2v`):**
 
-- Does **not** stack the global OmniNFT default — request LoRAs only (empty = prompt + reference conditioning).
+- Does **not** stack the global OmniNFT default — request LoRAs only.
+- **No LoRA:** first-frame I2V so the text prompt can rewrite appearance (raw IC-RGB without an adapter near-copies the reference and ignores text).
+- **With IC-LoRA (e.g. CrossView):** keep the IC-LoRA + `video_conditioning` path unchanged; control-aware refine (`upsample_only` + `refine_steps`) so Stage 2 does not wipe the adapter.
 - CrossView Prompt LoRA: strength **1.2–1.5** on distilled; prompts use the fixed vocabulary, e.g. `crossview. new camera angle: to the right, lower, closer.`
-- Uses control-aware refine (`upsample_only` + `refine_steps`) so Stage 2 does not wipe the adapter.
 - HF: https://huggingface.co/Cseti/LTX2.3-22B_IC-LoRA-CrossView-Prompt
 
 **Face swap (`mode: face_swap`)** — Comfy-aligned BFS V3 on MLX (`ltx_ltxv_add_guide` + `FaceSwapPipeline`):

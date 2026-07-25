@@ -3156,7 +3156,7 @@ def create_app(
         if ui_mode == "v2v":
             if not body.get("video_conditioning"):
                 raise HTTPException(400, "v2v mode requires a reference video")
-            # LoRA is optional: empty = pure reference-video conditioning (motion transfer).
+            # LoRA optional: empty → first-frame I2V (prompt rewrite); with IC-LoRA → structure transfer.
             for lora_item in body.get("lora_specs") or []:
                 if not isinstance(lora_item, (list, tuple)) or not lora_item:
                     continue

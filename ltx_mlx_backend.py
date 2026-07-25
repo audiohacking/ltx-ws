@@ -1883,18 +1883,17 @@ def _iclora_supports_control_aware_refine() -> bool:
 
 
 def _should_use_control_aware_refine(resolved_loras: list[tuple[str, float]]) -> bool:
-    """Use upsample-only + control-aware refine for raw-RGB V2V.
+    """Use upsample-only + control-aware refine for raw-RGB IC-LoRA V2V.
 
-    Empty LoRAs (pure reference conditioning) and community raw-RGB IC-LoRAs
-    (ref_downscale=1, e.g. CrossView) use upstream 0.14.17+ ``upsample_only`` +
-    ``refine_steps`` so Stage 2 does not wipe control / adapter effect.
+    Community raw-RGB IC-LoRAs (ref_downscale=1, e.g. CrossView) use upstream
+    0.14.17+ ``upsample_only`` + ``refine_steps`` so Stage 2 does not wipe the
+    adapter. Empty LoRAs do **not** use this path — see
+    ``_should_use_prompt_i2v_for_v2v``.
 
     HDR and Union Control keep the legacy clean Stage 2 path.
     """
     if not resolved_loras:
-        # Pure V2V / motion transfer without an adapter — still benefit from
-        # full-res control re-append during refine.
-        return True
+        return False
     # CrossView (and similar) must win even if a style LoRA was stacked first.
     if any(_is_crossview_lora_path(path) for path, _ in resolved_loras):
         return True
@@ -1904,6 +1903,95 @@ def _should_use_control_aware_refine(resolved_loras: list[tuple[str, float]]) ->
     if _ic_lora_reference_downscale_factor(primary) != 1:
         return False
     return True
+
+
+def _should_use_prompt_i2v_for_v2v(
+    resolved_loras: list[tuple[str, float]],
+    vc_items: list[tuple[str, float]],
+) -> bool:
+    """True when V2V has a reference clip but no IC adapter LoRA.
+
+    Raw RGB ``video_conditioning`` without an IC-LoRA reconstructs the reference
+    and ignores the text prompt. Use first-frame I2V so the prompt drives output.
+    CrossView / HDR / Union always pass LoRAs and stay on the IC path.
+    """
+    return bool(vc_items) and not resolved_loras
+
+
+def _extract_video_frame_png(
+    video_path: str,
+    dest_png: str,
+    *,
+    frame_index: int = 0,
+) -> str:
+    """Decode one frame from ``video_path`` to a PNG (for no-LoRA V2V I2V)."""
+    try:
+        import av
+    except ImportError as exc:
+        raise RuntimeError(
+            "V2V without LoRA needs PyAV to read the reference first frame (pip install av)"
+        ) from exc
+
+    with av.open(str(video_path)) as container:
+        stream = container.streams.video[0]
+        stream.thread_type = "AUTO"
+        for i, frame in enumerate(container.decode(stream)):
+            if i < frame_index:
+                continue
+            frame.to_image().save(dest_png, format="PNG")
+            return dest_png
+    raise RuntimeError(f"Could not decode frame {frame_index} from {video_path}")
+
+
+def _run_v2v_prompt_i2v_from_reference(
+    gen: "LocalVideoGenerator",
+    *,
+    req: GenerationRequest,
+    prompt: str,
+    vc_items: list[tuple[str, float]],
+    tmpdir: str,
+    out_path: str,
+    width: int,
+    height: int,
+    nf: int,
+    seed: int,
+    steps: int,
+    audio_reference_paths: list[str] | None = None,
+) -> Any:
+    """Prompt-driven V2V without an IC-LoRA: I2V from the reference first frame."""
+    ref_path = str(vc_items[0][0])
+    start_png = os.path.join(tmpdir, "v2v_no_lora_start.png")
+    _extract_video_frame_png(ref_path, start_png, frame_index=0)
+    profile = _normalize_pipeline_profile(req.pipeline_profile)
+    pipe_key = gen._resolve_generate_pipe_key(profile, has_image=True)
+    log.info(
+        "V2V without LoRA: prompt-driven I2V from reference first frame "
+        "(pipe=%s). Raw IC-RGB conditioning without an adapter ignores text. "
+        "prompt=%r",
+        pipe_key,
+        (prompt or "")[:160],
+    )
+    pipe = gen._get_pipe(pipe_key)
+    gen_kwargs: dict[str, Any] = {
+        "prompt": prompt,
+        "output_path": out_path,
+        "image": start_png,
+        "height": height,
+        "width": width,
+        "num_frames": nf,
+        "frame_rate": float(gen.fps),
+        "seed": seed,
+        "num_steps": int(steps),
+    }
+    _apply_optional_generate_kwargs(gen_kwargs, req)
+    _invoke_generate_and_save(pipe, **gen_kwargs)
+    if audio_reference_paths:
+        _maybe_preserve_reference_audio(
+            out_path,
+            audio_reference_paths,
+            job_id=req.job_id,
+        )
+    return pipe
 
 
 def _run_ic_lora_generation(
@@ -1927,9 +2015,30 @@ def _run_ic_lora_generation(
 ) -> Any:
     """Shared IC-LoRA invoke path for ``ic_lora`` / V2V (and face_swap guides).
 
-    LoRAs are optional when a reference video is present (pure V2V). HDR LoRAs
-    may omit video conditioning (pure T2V HDR), matching upstream ``hdr-ic-lora``.
+    Upstream ``ic-lora`` (ltx-2-mlx ``docs/PIPELINES.md``) requires both a
+    control LoRA and ``video_conditioning``. HDR may omit the video (pure T2V
+    HDR). CrossView / Union / HDR keep this IC path.
+
+    No-LoRA + reference video is **not** a supported IC recipe upstream — raw
+    RGB ``VideoConditionByReferenceLatent`` without an adapter near-copies the
+    clip — so those jobs route to prompt-driven I2V from the first frame.
     """
+    if _should_use_prompt_i2v_for_v2v(resolved_loras, vc_items):
+        return _run_v2v_prompt_i2v_from_reference(
+            gen,
+            req=req,
+            prompt=prompt,
+            vc_items=vc_items,
+            tmpdir=tmpdir,
+            out_path=out_path,
+            width=width,
+            height=height,
+            nf=nf,
+            seed=seed,
+            steps=steps,
+            audio_reference_paths=audio_reference_paths,
+        )
+
     is_hdr = bool(resolved_loras) and _ic_lora_uses_hdr_pipeline(resolved_loras)
     if not vc_items and not is_hdr:
         raise RuntimeError(
@@ -2872,7 +2981,9 @@ class LocalVideoGenerator:
                     media_cleanups.append(path)
             if mode in ("face_swap", "face-swap", "lipdub", "lip_dub", "ic_lora"):
                 # Exclusive adapter modes: never stack global OmniNFT defaults.
-                # V2V maps to ic_lora — empty request = prompt + reference only;
+                # V2V maps to ic_lora — empty request = no OmniNFT; no-LoRA V2V
+                # then uses first-frame I2V so the text prompt can drive rewrite.
+                # Face Swap / lipdub also must not inherit OmniNFT.
                 # CrossView / HDR / Union come only from the request (Web UI / MCP).
                 for lora_spec, lora_scale in (req.lora_specs or []):
                     lora_path, lora_cleanup = _resolve_lora_path(str(lora_spec))

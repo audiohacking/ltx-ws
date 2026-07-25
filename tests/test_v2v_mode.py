@@ -71,10 +71,22 @@ def test_v2v_label_is_video_to_video():
     assert "video to video" in v2v["label"].lower()
 
 
-def test_should_use_control_aware_refine_for_pure_v2v_no_lora():
-    from ltx_mlx_backend import _should_use_control_aware_refine
+def test_should_use_prompt_i2v_for_v2v_when_no_lora():
+    """Raw IC-RGB without an adapter ignores text — route to first-frame I2V."""
+    from ltx_mlx_backend import (
+        _should_use_control_aware_refine,
+        _should_use_prompt_i2v_for_v2v,
+    )
 
-    assert _should_use_control_aware_refine([]) is True
+    assert _should_use_prompt_i2v_for_v2v([], [("/tmp/ref.mp4", 1.0)]) is True
+    assert _should_use_control_aware_refine([]) is False
+
+
+def test_should_use_prompt_i2v_false_when_crossview_lora():
+    from ltx_mlx_backend import _should_use_prompt_i2v_for_v2v
+
+    cross = f"/models/{CROSSVIEW.split('/')[-1]}"
+    assert _should_use_prompt_i2v_for_v2v([(cross, 1.25)], [("/tmp/ref.mp4", 1.0)]) is False
 
 
 def test_should_use_control_aware_refine_when_crossview_not_first():
