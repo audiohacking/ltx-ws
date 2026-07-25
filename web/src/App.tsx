@@ -257,30 +257,47 @@ function LoraMultiSelect({
       </button>
       {open && (
         <div className="multi-select-menu" role="listbox" aria-label="LoRA presets">
-          {presets.map((p) => (
-            <label key={p.id} className="multi-select-item">
-              <input
-                type="checkbox"
-                checked={selectedIds.includes(p.id)}
-                disabled={disabled}
-                onChange={(e) => onToggle(p.id, e.target.checked)}
-              />
-              <span className="multi-select-item-label">{p.label}</span>
-              <button
-                type="button"
-                className="lora-remove"
-                title="Remove from list"
-                disabled={disabled}
-                onClick={(e) => {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  onRemovePreset(p);
-                }}
+          {presets.map((p) => {
+            const checked = selectedIds.includes(p.id);
+            return (
+              <div
+                key={p.id}
+                className={`multi-select-item${checked ? " is-selected" : ""}`}
+                role="option"
+                aria-selected={checked}
               >
-                ×
-              </button>
-            </label>
-          ))}
+                <input
+                  type="checkbox"
+                  checked={checked}
+                  disabled={disabled}
+                  aria-label={p.label}
+                  onChange={(e) => onToggle(p.id, e.target.checked)}
+                />
+                <span
+                  className="multi-select-item-label"
+                  title={p.label}
+                  onClick={() => {
+                    if (!disabled) onToggle(p.id, !checked);
+                  }}
+                >
+                  {p.label}
+                </span>
+                <button
+                  type="button"
+                  className="lora-remove"
+                  title="Remove from list"
+                  disabled={disabled}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    onRemovePreset(p);
+                  }}
+                >
+                  ×
+                </button>
+              </div>
+            );
+          })}
         </div>
       )}
     </div>
@@ -1877,7 +1894,7 @@ export default function App() {
               <div className="prompt-field-actions">
                 <button
                   type="button"
-                  className={`btn-prompt-clear${showNegativePrompt || negativePrompt.trim() ? " is-active" : ""}`}
+                  className={`btn-prompt-action${showNegativePrompt || negativePrompt.trim() ? " is-active" : ""}`}
                   onClick={() => {
                     setShowNegativePrompt((v) => {
                       const next = !v;
@@ -1892,18 +1909,19 @@ export default function App() {
                       ? "Hide negative prompt"
                       : "Show negative prompt"
                   }
-                  title="Negative prompt"
+                  title="Show or hide negative prompt"
                 >
-                  NEG
+                  Negative
                 </button>
                 <button
                   type="button"
-                  className="btn-prompt-clear"
+                  className="btn-prompt-action"
                   onClick={() => setPrompt("")}
                   disabled={busy || !prompt}
                   aria-label="Clear prompt"
+                  title="Clear prompt"
                 >
-                  CLEAR
+                  Clear
                 </button>
               </div>
             </div>
@@ -2061,8 +2079,8 @@ export default function App() {
               )}
 
               <div className="lora-row">
-                <label className="lora-row-select">
-                  LoRA
+                <div className="lora-row-select">
+                  <span className="lora-field-label">LoRA</span>
                   <LoraMultiSelect
                     presets={(config.lora_presets ?? []).filter((p) => p.id !== "none")}
                     selectedIds={loraPresetIds}
@@ -2070,7 +2088,7 @@ export default function App() {
                     onToggle={(id, checked) => toggleLoraPreset(id, checked)}
                     onRemovePreset={(preset) => void removeLoraPreset(preset)}
                   />
-                </label>
+                </div>
                 <div className="lora-row-add">
                   <input
                     type="text"

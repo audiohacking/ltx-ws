@@ -467,6 +467,54 @@ def web_dist_stale() -> bool:
     return newest_src > newest_js.stat().st_mtime
 
 
+def ensure_web_dist_built(*, auto_build: bool = True) -> bool:
+    """Rebuild web/dist when missing/stale so git pulls show UI changes.
+
+    ``web/dist`` is gitignored, so pulling source alone leaves a stale UI.
+    Returns True when a usable dist exists after this call.
+    """
+    dist = resolve_web_dist()
+    if dist.is_dir() and not web_dist_stale():
+        return True
+    if not auto_build:
+        return dist.is_dir() and not web_dist_stale()
+
+    web_dir = REPO_ROOT / "web"
+    pkg = web_dir / "package.json"
+    if not pkg.is_file():
+        log.warning("Web UI package.json missing at %s — cannot auto-build", pkg)
+        return False
+
+    npm = shutil.which("npm")
+    if not npm:
+        log.warning(
+            "web/dist is stale/missing and npm was not found — run: cd web && npm run build"
+        )
+        return False
+
+    cmd = [npm, "run", "build"]
+    if not (web_dir / "node_modules").is_dir():
+        cmd = [npm, "install", "--no-fund", "--no-audit"]
+        log.info("Installing Web UI deps (node_modules missing)…")
+        try:
+            subprocess.run(cmd, cwd=str(web_dir), check=True)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            log.warning("Web UI npm install failed: %s", exc)
+            return False
+        cmd = [npm, "run", "build"]
+
+    log.info("Building Web UI (web/dist missing or older than web/src)…")
+    try:
+        subprocess.run(cmd, cwd=str(web_dir), check=True)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        log.warning("Web UI build failed: %s — run: cd web && npm run build", exc)
+        return False
+    ok = dist.is_dir() and not web_dist_stale()
+    if ok:
+        log.info("Web UI build ready at %s", dist)
+    return ok
+
+
 def resolve_favicon_path() -> Path | None:
     """Locate favicon for embedded Web UI (built dist, then source public/)."""
     for candidate in (
