@@ -1390,6 +1390,37 @@ body {
   color: var(--text);
 }
 
+.v2v-lora-strengths {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.v2v-lora-strength-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 5.5rem;
+  gap: 10px;
+  align-items: center;
+  font-size: 0.85rem;
+}
+
+.v2v-lora-strength-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+
+.v2v-lora-strength-row input[type="number"] {
+  font-size: 0.8rem;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  width: 100%;
+}
+
 .lora-ic-auto {
   margin: 0;
   padding: 8px 10px;

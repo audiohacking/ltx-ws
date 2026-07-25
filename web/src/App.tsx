@@ -753,6 +753,35 @@ export default function App() {
     [config?.ic_lora_motion_preset_id, config?.ic_lora_preset_id, ensureLoraPresets, loraBusy, mode, persistLoraSelection],
   );
 
+  const updateLoraPresetScale = useCallback(
+    (presetId: string, scale: number) => {
+      const nextScale = Math.min(2, Math.max(0, scale));
+      const preset =
+        loraPresetsRef.current.find((p) => p.id === presetId) ??
+        config?.lora_presets?.find((p) => p.id === presetId);
+      setConfig((c) => {
+        if (!c?.lora_presets) return c;
+        const nextPresets = c.lora_presets.map((p) =>
+          p.id === presetId ? { ...p, scale: nextScale } : p,
+        );
+        loraPresetsRef.current = nextPresets;
+        return { ...c, lora_presets: nextPresets };
+      });
+      if (preset?.custom && preset.spec) {
+        void fetch(`${API}/api/loras/custom`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            spec: preset.spec,
+            label: preset.label,
+            scale: nextScale,
+          }),
+        }).catch((err) => console.warn("Could not persist LoRA strength", err));
+      }
+    },
+    [config?.lora_presets],
+  );
+
   async function addCustomLora() {
     const spec = customLoraUrl.trim();
     if (!spec || addingCustomLora) return;
@@ -801,8 +830,11 @@ export default function App() {
       // Select the new adapter so it shows checked in the menu and is used on generate.
       setLoraPresetIds((prev) => {
         let nextIds: string[];
-        if (mode === "ic_lora" || mode === "v2v" || mode === "lipdub" || mode === "face_swap") {
+        if (mode === "ic_lora" || mode === "lipdub" || mode === "face_swap") {
           nextIds = [newId];
+        } else if (mode === "v2v") {
+          // V2V allows stacking multiple community LoRAs.
+          nextIds = [...prev.filter((id) => id !== newId), newId];
         } else {
           nextIds = prev.filter((id) => id !== newId);
           nextIds.push(newId);
@@ -2432,6 +2464,41 @@ export default function App() {
                           </select>
                         </label>
                       )}
+                      <div className="v2v-lora-strengths">
+                        <span className="media-upload-label">LoRA strength</span>
+                        {loraPresetIds.length === 0 ? (
+                          <p className="media-source-note">
+                            Select one or more LoRAs above (Options → LoRA). CrossView
+                            works best at <strong>1.2–1.5</strong> on distilled.
+                          </p>
+                        ) : (
+                          (config?.lora_presets ?? [])
+                            .filter((p) => loraPresetIds.includes(p.id) && p.spec)
+                            .map((p) => (
+                              <label key={p.id} className="v2v-lora-strength-row">
+                                <span className="v2v-lora-strength-label" title={p.label}>
+                                  {p.label}
+                                </span>
+                                <input
+                                  type="number"
+                                  min={0}
+                                  max={2}
+                                  step={0.05}
+                                  value={p.scale}
+                                  disabled={busy || loraBusy}
+                                  title="LoRA adapter strength (0–2). CrossView tip: 1.2–1.5"
+                                  aria-label={`LoRA strength for ${p.label}`}
+                                  onChange={(e) =>
+                                    updateLoraPresetScale(
+                                      p.id,
+                                      Number(e.target.value) || 0,
+                                    )
+                                  }
+                                />
+                              </label>
+                            ))
+                        )}
+                      </div>
                       <label className="ic-lora-scale">
                         Reference attention strength
                         <input
@@ -2441,7 +2508,7 @@ export default function App() {
                           step={0.05}
                           value={referenceStrength}
                           disabled={!hasConditioningVideo}
-                          title="How strongly the reference video guides the result (0–1)"
+                          title="How strongly the reference video guides the result (0–1). Separate from LoRA strength."
                           onChange={(e) =>
                             setReferenceStrength(
                               Math.min(1, Math.max(0, Number(e.target.value) || 0)),
@@ -2449,6 +2516,10 @@ export default function App() {
                           }
                         />
                       </label>
+                      <p className="hint hint-inline">
+                        LoRA strength is the adapter weight (often &gt;1). Reference attention
+                        (0–1) controls how tightly the model follows the reference clip.
+                      </p>
                       {hasConditioningVideo ? (
                         <p className="media-source-note">
                           {conditioningClipId
