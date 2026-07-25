@@ -618,6 +618,13 @@ body {
   min-width: 0;
 }
 
+.prompt-field-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  align-items: center;
+}
+
 .btn-prompt-clear {
   align-self: flex-end;
   border: none;
@@ -635,9 +642,37 @@ body {
   color: var(--text);
 }
 
+.btn-prompt-clear.is-active {
+  color: var(--text);
+}
+
 .btn-prompt-clear:disabled {
   opacity: 0.35;
   cursor: default;
+}
+
+.negative-prompt-input {
+  width: 100%;
+  border: none;
+  border-top: 1px solid var(--border);
+  outline: none;
+  font: inherit;
+  font-size: 0.85rem;
+  line-height: 1.4;
+  background: transparent;
+  color: var(--muted);
+  padding: 6px 0 2px;
+  margin: 0;
+}
+
+.negative-prompt-input::placeholder {
+  color: var(--muted);
+  opacity: 0.75;
+}
+
+.negative-prompt-input:disabled {
+  opacity: 0.65;
+  cursor: not-allowed;
 }
 
 .prompt-input {

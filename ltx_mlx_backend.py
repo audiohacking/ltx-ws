@@ -701,11 +701,144 @@ def _hf_lora_cache_file(resolved: _HfLoraResolve) -> Path:
     return (_local_lora_cache_dir() / resolved.cache_dir_name / resolved.filename).resolve()
 
 
+def _is_usable_lora_file(path: Path | None) -> bool:
+    """True when path is a non-empty .safetensors (or any) weight file on disk."""
+    if path is None:
+        return False
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _materialize_lora_cache(src: Path, dest: Path) -> Path:
+    """Place src at the canonical cache path (hardlink, then copy)."""
+    src = src.resolve()
+    dest = dest.resolve()
+    if src == dest and _is_usable_lora_file(dest):
+        return dest
+    if _is_usable_lora_file(dest):
+        return dest
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        dest.unlink()
+    try:
+        os.link(src, dest)
+    except OSError:
+        import shutil
+
+        shutil.copy2(src, dest)
+    return dest
+
+
+def _find_lora_by_basename(filename: str) -> Path | None:
+    """Search the persistent LoRA cache for an existing file by basename."""
+    name = Path(filename).name
+    if not name:
+        return None
+    root = _local_lora_cache_dir()
+    if not root.is_dir():
+        return None
+    # Prefer exact relative layout when present (e.g. loras/foo.safetensors).
+    exact = (root / filename).resolve()
+    if _is_usable_lora_file(exact):
+        return exact
+    matches: list[Path] = []
+    for match in root.rglob(name):
+        if not _is_usable_lora_file(match):
+            continue
+        # Skip HF download metadata / incomplete sidecars mistaken as weights.
+        if match.suffix.lower() != ".safetensors" and not name.endswith(match.suffix):
+            continue
+        if ".cache" in match.parts:
+            continue
+        matches.append(match.resolve())
+    if not matches:
+        return None
+    # Prefer paths under a repo-named cache dir that include the relative filename.
+    for m in matches:
+        if filename in str(m).replace("\\", "/"):
+            return m
+    return matches[0]
+
+
+def _find_lora_in_hf_hub_cache(resolved: _HfLoraResolve) -> Path | None:
+    """Return a hub-cache hit without network when repo_id is known."""
+    if not resolved.repo_id:
+        return None
+    try:
+        from huggingface_hub import try_to_load_from_cache
+    except ImportError:
+        return None
+    try:
+        cached = try_to_load_from_cache(
+            repo_id=resolved.repo_id,
+            filename=resolved.filename,
+            revision=resolved.revision,
+        )
+    except Exception:
+        return None
+    if cached is None or cached is False:
+        return None
+    path = Path(str(cached))
+    return path if _is_usable_lora_file(path) else None
+
+
+def _resolve_existing_hf_lora(resolved: _HfLoraResolve) -> Path | None:
+    """Locate an already-downloaded LoRA and promote it to the canonical cache path."""
+    dest = _hf_lora_cache_file(resolved)
+    if _is_usable_lora_file(dest):
+        return dest
+
+    # Same repo cache dir, possibly nested (hf_hub_download local_dir layouts).
+    cache_dir = (_local_lora_cache_dir() / resolved.cache_dir_name).resolve()
+    if cache_dir.is_dir():
+        for match in cache_dir.rglob(Path(resolved.filename).name):
+            if ".cache" in match.parts:
+                continue
+            if _is_usable_lora_file(match):
+                return _materialize_lora_cache(match, dest)
+
+    # Any prior download under ./loras (or VIDEOFENTANYL_LORA_DIR) by basename.
+    found = _find_lora_by_basename(resolved.filename)
+    if found is not None:
+        log.info("Reusing cached LoRA %s → %s", found, dest)
+        return _materialize_lora_cache(found, dest)
+
+    # Hugging Face hub cache from a previous hf_hub_download / CLI pull.
+    hub_hit = _find_lora_in_hf_hub_cache(resolved)
+    if hub_hit is not None:
+        log.info("Reusing Hugging Face hub LoRA cache %s → %s", hub_hit, dest)
+        return _materialize_lora_cache(hub_hit, dest)
+
+    # Offline hub probe: may resolve snapshot paths try_to_load_from_cache misses.
+    if resolved.repo_id and resolved.revision:
+        try:
+            from huggingface_hub import hf_hub_download
+        except ImportError:
+            return None
+        try:
+            local = hf_hub_download(
+                repo_id=resolved.repo_id,
+                filename=resolved.filename,
+                revision=resolved.revision,
+                local_files_only=True,
+            )
+        except Exception:
+            return None
+        path = Path(local)
+        if _is_usable_lora_file(path):
+            log.info("Reusing local-only hub LoRA %s → %s", path, dest)
+            return _materialize_lora_cache(path, dest)
+    return None
+
+
 def _download_hf_lora_resolve(resolved: _HfLoraResolve) -> Path:
     """Download a Hugging Face resolve URL into the persistent LoRA cache."""
+    existing = _resolve_existing_hf_lora(resolved)
+    if existing is not None:
+        return existing
     dest = _hf_lora_cache_file(resolved)
-    if dest.is_file():
-        return dest
     dest.parent.mkdir(parents=True, exist_ok=True)
     if resolved.repo_id and resolved.revision:
         try:
@@ -748,26 +881,27 @@ def _lora_cached_path(spec: str) -> Path | None:
     if _is_http_url(raw):
         resolved = _parse_hf_lora_resolve_url(raw)
         if resolved is not None:
-            candidate = _hf_lora_cache_file(resolved)
-            if candidate.is_file():
-                return candidate
-            cache_dir = candidate.parent
-            if cache_dir.is_dir():
-                for match in cache_dir.rglob(Path(resolved.filename).name):
-                    if match.is_file():
-                        return match.resolve()
+            return _resolve_existing_hf_lora(resolved)
+        # Non-HF URL: still reuse a prior basename hit under the LoRA cache.
+        name = Path(urlparse(raw).path).name
+        if name.endswith(".safetensors"):
+            return _find_lora_by_basename(name)
         return None
 
     p = Path(raw).expanduser()
-    if p.is_file():
+    if _is_usable_lora_file(p):
         return p.resolve()
 
     if looks_like_hf_repo_id(raw):
         dest = (_local_lora_cache_dir() / raw.replace("/", "__")).resolve()
         if dest.is_dir():
             picked = _pick_safetensors_file(dest)
-            if picked is not None:
+            if picked is not None and _is_usable_lora_file(picked):
                 return picked.resolve()
+        # Basename fallback when a resolve-URL download already placed the weights.
+        found = _find_lora_by_basename(raw.rsplit("/", 1)[-1])
+        if found is not None:
+            return found
 
     return None
 
@@ -1070,6 +1204,9 @@ def _apply_optional_generate_kwargs(call_kwargs: dict[str, Any], req: Generation
         call_kwargs["reference_strength"] = float(req.reference_strength)
     if req.audio_start_seconds is not None and float(req.audio_start_seconds) > 0:
         call_kwargs["audio_start_time"] = float(req.audio_start_seconds)
+    neg = (req.negative_prompt or "").strip()
+    if neg:
+        call_kwargs["negative_prompt"] = neg
 
 
 def _frame_rate_from_kwargs(kwargs: dict[str, Any], default: float) -> float:
@@ -2303,7 +2440,6 @@ class LocalVideoGenerator:
             log.error("  ✗ spill salvage failed: %s", exc)
 
     def _generate_sync(self, req: GenerationRequest) -> str:
-        del req.negative_prompt  # reserved for future CFG-enabled variants
         self._check_cancel()
         self.load()
         self._check_cancel()

@@ -1706,6 +1706,7 @@ def _build_params_from_request(body: dict[str, Any], *, state: AppState | None =
         no_regen_audio=bool(body.get("no_regen_audio", False)),
         reference_strength=_optional_float(body.get("reference_strength")),
         audio_start_seconds=audio_start_seconds,
+        negative_prompt=str(body.get("negative_prompt") or "").strip(),
     )
 
 
@@ -1887,6 +1888,7 @@ async def _run_clip_inprocess(
                         no_regen_audio=bool(getattr(params, "no_regen_audio", False)),
                         reference_strength=getattr(params, "reference_strength", None),
                         audio_start_seconds=getattr(params, "audio_start_seconds", None),
+                        negative_prompt=str(getattr(params, "negative_prompt", "") or ""),
                     )
                 )
                 while not gen_task.done():

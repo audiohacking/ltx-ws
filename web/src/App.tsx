@@ -294,6 +294,8 @@ export default function App() {
   const [chainId, setChainId] = useState<string | null>(null);
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
   const [prompt, setPrompt] = useState("");
+  const [negativePrompt, setNegativePrompt] = useState("");
+  const [showNegativePrompt, setShowNegativePrompt] = useState(false);
   const [busy, setBusy] = useState(false);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [progress, setProgress] = useState<ProgressState | null>(null);
@@ -1505,6 +1507,10 @@ export default function App() {
       chain_id: isChainEdit ? chainId : undefined,
       continue_from: isChainEdit ? activeClip?.id : undefined,
     };
+    const neg = negativePrompt.trim();
+    if (neg) {
+      body.negative_prompt = neg;
+    }
     if (mode === "retake") {
       body.retake_start = retakeStart;
       body.retake_end = retakeEnd;
@@ -1851,15 +1857,55 @@ export default function App() {
                 }}
                 disabled={busy}
               />
-              <button
-                type="button"
-                className="btn-prompt-clear"
-                onClick={() => setPrompt("")}
-                disabled={busy || !prompt}
-                aria-label="Clear prompt"
-              >
-                CLEAR
-              </button>
+              {(showNegativePrompt || !!negativePrompt.trim()) && (
+                <input
+                  type="text"
+                  className="negative-prompt-input"
+                  placeholder="Negative prompt (optional)"
+                  value={negativePrompt}
+                  onChange={(e) => setNegativePrompt(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      void handleGenerate();
+                    }
+                  }}
+                  disabled={busy}
+                  aria-label="Negative prompt"
+                />
+              )}
+              <div className="prompt-field-actions">
+                <button
+                  type="button"
+                  className={`btn-prompt-clear${showNegativePrompt || negativePrompt.trim() ? " is-active" : ""}`}
+                  onClick={() => {
+                    setShowNegativePrompt((v) => {
+                      const next = !v;
+                      if (!next) setNegativePrompt("");
+                      return next;
+                    });
+                  }}
+                  disabled={busy}
+                  aria-pressed={showNegativePrompt || !!negativePrompt.trim()}
+                  aria-label={
+                    showNegativePrompt || negativePrompt.trim()
+                      ? "Hide negative prompt"
+                      : "Show negative prompt"
+                  }
+                  title="Negative prompt"
+                >
+                  NEG
+                </button>
+                <button
+                  type="button"
+                  className="btn-prompt-clear"
+                  onClick={() => setPrompt("")}
+                  disabled={busy || !prompt}
+                  aria-label="Clear prompt"
+                >
+                  CLEAR
+                </button>
+              </div>
             </div>
             <button
               type="button"
