@@ -2863,6 +2863,13 @@ class LocalVideoGenerator:
                     media_cleanups.append(path)
             if self._resolved_default_loras is not None and not req.lora_specs:
                 resolved_loras = list(self._resolved_default_loras)
+            elif mode in ("face_swap", "face-swap", "lipdub", "lip_dub"):
+                # Exclusive single-adapter modes: never stack global OmniNFT defaults.
+                for lora_spec, lora_scale in (req.lora_specs or []):
+                    lora_path, lora_cleanup = _resolve_lora_path(str(lora_spec))
+                    resolved_loras.append((lora_path, float(lora_scale)))
+                    if lora_cleanup:
+                        tmp_lora_cleanup.append(lora_cleanup)
             else:
                 for lora_spec, lora_scale in effective_loras:
                     lora_path, lora_cleanup = _resolve_lora_path(str(lora_spec))
@@ -3150,10 +3157,6 @@ class LocalVideoGenerator:
                         )
 
                         ref_path = tmp_video
-                        ref_scale = 1.0
-                        if vc_items:
-                            ref_path, ref_scale = vc_items[0]
-                        trimmed_ref = os.path.join(tmpdir, "face_swap_ref_trimmed.mp4")
                         guide_path, guide_layout, face_swap_nf, canvas_w, canvas_h = (
                             _prepare_face_swap_guide_video(
                                 str(ref_path),
@@ -3167,7 +3170,7 @@ class LocalVideoGenerator:
                         )
                         tmp_video_conditioning_cleanup.extend(
                             [
-                                trimmed_ref,
+                                os.path.join(tmpdir, "face_swap_ref_trimmed.mp4"),
                                 os.path.join(tmpdir, "face_swap_bfs_v3_guide.mp4"),
                                 guide_path,
                             ]

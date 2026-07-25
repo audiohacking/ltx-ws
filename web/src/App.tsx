@@ -343,6 +343,7 @@ export default function App() {
   const [audioDurationSeconds, setAudioDurationSeconds] = useState<number | null>(null);
   const [audioStartSeconds, setAudioStartSeconds] = useState(0);
   const [videoPath, setVideoPath] = useState<string | null>(null);
+  const [videoName, setVideoName] = useState<string | null>(null);
   const [conditioningVideoPath, setConditioningVideoPath] = useState<string | null>(null);
   const [conditioningVideoName, setConditioningVideoName] = useState<string | null>(null);
   const [conditioningClipId, setConditioningClipId] = useState<string | null>(null);
@@ -1115,6 +1116,7 @@ export default function App() {
     setEndImageName(null);
     resetAudioSelection();
     setVideoPath(null);
+    setVideoName(null);
     setSourceClipId(null);
     setConditioningVideoPath(null);
     setConditioningVideoName(null);
@@ -1144,6 +1146,7 @@ export default function App() {
     }
     if (!["retake", "extend", "lipdub", "face_swap"].includes(nextMode)) {
       setVideoPath(null);
+      setVideoName(null);
       setSourceClipId(null);
       if (videoRef.current) videoRef.current.value = "";
     }
@@ -1204,7 +1207,7 @@ export default function App() {
   const audioTrimAvailable = pyavAvailable;
   const needsEndImageUpload = mode === "keyframe";
   const needsVideoUpload =
-    mode === "retake" || mode === "extend" || mode === "lipdub" || mode === "face_swap";
+    mode === "retake" || mode === "extend" || mode === "lipdub";
   const isT2vLike = mode === "generate" || mode === "i2v";
   const showChainMethodChoice =
     isT2vLike && !audiocontinue && isMultiClip;
@@ -1702,6 +1705,7 @@ export default function App() {
     if (isIcLora && Boolean(imagePath) && !hasConditioningVideo) return false;
     if (mode === "lipdub" && loraBusy) return false;
     if (mode === "face_swap" && loraBusy) return false;
+    if (mode === "face_swap" && loraPresetIds.length !== 1) return false;
     const continuing = willContinueChain;
     if (mode === "i2v" && !imagePath && !continuing) return false;
     if (mode === "face_swap" && !imagePath) return false;
@@ -2138,7 +2142,7 @@ export default function App() {
                   <LoraMultiSelect
                     presets={(config.lora_presets ?? []).filter((p) => p.id !== "none")}
                     selectedIds={loraPresetIds}
-                    disabled={loraBusy || addingCustomLora}
+                    disabled={loraBusy || addingCustomLora || isFaceSwap || isLipDub}
                     onToggle={(id, checked) => toggleLoraPreset(id, checked)}
                     onRemovePreset={(preset) => void removeLoraPreset(preset)}
                   />
@@ -2362,10 +2366,9 @@ export default function App() {
                     <>
                       <span className="media-panel-title">Face swap inputs</span>
                       <p className="hint hint-inline">
-                        Replace the face in your reference video with the identity image.
-                        Uses the BFS V3 composite guide (green side panel + face) required by
-                        the head-swap LoRA. Audio from the reference clip is preserved when present.
-                        LoRA:{" "}
+                        Face identity image + reference performance video. Uses the BFS V3
+                        composite guide (green side panel + face). Head-swap LoRA is locked
+                        above; audio from the reference clip is preserved when present.{" "}
                         <a
                           href="https://www.runcomfy.com/comfyui-workflows/ltx-2-3-video-face-swap-in-comfyui-realistic-face-replacement-workflow"
                           target="_blank"
@@ -2393,6 +2396,89 @@ export default function App() {
                           {imageName ?? "Choose face photo…"}
                         </span>
                       </label>
+                      <div className="media-upload-row">
+                        <label className="media-upload">
+                          <span className="media-upload-label">Reference video (required)</span>
+                          <input
+                            ref={videoRef}
+                            type="file"
+                            accept="video/*"
+                            onChange={async (e) => {
+                              const f = e.target.files?.[0];
+                              if (f) {
+                                setSourceClipId(null);
+                                setVideoPath(await uploadFile(f, "video"));
+                                setVideoName(f.name);
+                              }
+                            }}
+                          />
+                          <span className="media-upload-hint">
+                            {videoName ?? (videoPath ? "✓ file selected" : "Choose reference video…")}
+                          </span>
+                        </label>
+                      </div>
+                      {videoLibraryClips.length > 0 && (
+                        <label className="clip-source-picker">
+                          <span className="media-upload-label">Or from library</span>
+                          <select
+                            value={sourceClipId ?? ""}
+                            onChange={(e) => {
+                              const id = e.target.value || null;
+                              setSourceClipId(id);
+                              if (id) {
+                                setVideoPath(null);
+                                setVideoName(null);
+                                if (videoRef.current) videoRef.current.value = "";
+                              }
+                            }}
+                          >
+                            <option value="">Select a clip…</option>
+                            {videoLibraryClips.map((c) => {
+                              const label = clipDisplayPrompt(c.prompt);
+                              const meta = [
+                                c.label,
+                                c.width && c.height ? `${c.width}×${c.height}` : null,
+                              ]
+                                .filter(Boolean)
+                                .join(" · ");
+                              return (
+                                <option key={c.id} value={c.id}>
+                                  {meta ? `${label} (${meta})` : label}
+                                </option>
+                              );
+                            })}
+                          </select>
+                        </label>
+                      )}
+                      {hasVideoSource && (
+                        <p className="media-source-note">
+                          {sourceClipId
+                            ? "Using library clip as reference video (performance)."
+                            : "Using uploaded file as reference video (performance)."}
+                        </p>
+                      )}
+                      {(config?.lora_presets ?? [])
+                        .filter((p) => loraPresetIds.includes(p.id) && p.spec)
+                        .map((p) => (
+                          <label key={p.id} className="v2v-lora-strength-row">
+                            <span className="v2v-lora-strength-label" title={p.label}>
+                              Head-swap LoRA strength
+                            </span>
+                            <input
+                              type="number"
+                              min={0}
+                              max={2}
+                              step={0.01}
+                              value={p.scale}
+                              disabled={busy || loraBusy}
+                              title="Head-swap adapter strength (Comfy tip: ~0.98–1.0)"
+                              aria-label={`LoRA strength for ${p.label}`}
+                              onChange={(e) =>
+                                updateLoraPresetScale(p.id, Number(e.target.value) || 0)
+                              }
+                            />
+                          </label>
+                        ))}
                     </>
                   )}
                   {isV2v && (
@@ -2780,11 +2866,9 @@ export default function App() {
                     <>
                       {!isA2v && (
                         <span className="media-panel-title">
-                          {isFaceSwap
-                            ? "Reference video (required)"
-                            : isLipDub
-                              ? "Reference video (required, visual motion)"
-                              : "Source video"}
+                          {isLipDub
+                            ? "Reference video (required, visual motion)"
+                            : "Source video"}
                         </span>
                       )}
                       <label className="media-upload">
@@ -2798,11 +2882,12 @@ export default function App() {
                             if (f) {
                               setSourceClipId(null);
                               setVideoPath(await uploadFile(f, "video"));
+                              setVideoName(f.name);
                             }
                           }}
                         />
                         <span className="media-upload-hint">
-                          {videoPath ? "✓ file selected" : "Choose video file…"}
+                          {videoName ?? (videoPath ? "✓ file selected" : "Choose video file…")}
                         </span>
                       </label>
                       {videoLibraryClips.length > 0 && (
@@ -2815,6 +2900,7 @@ export default function App() {
                               setSourceClipId(id);
                               if (id) {
                                 setVideoPath(null);
+                                setVideoName(null);
                                 if (videoRef.current) videoRef.current.value = "";
                               }
                             }}

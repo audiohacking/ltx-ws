@@ -43,6 +43,23 @@ def test_build_params_face_swap(tmp_path: Path):
     assert len(params.lora_specs) == 1
 
 
+def test_face_swap_ui_payload_fields_are_mapped():
+    """UI contract: face → image_path, performance → video_path/source_clip_id."""
+    from pathlib import Path
+
+    app = Path("web/src/App.tsx").read_text(encoding="utf-8")
+    assert 'mode === "face_swap"' in app
+    assert "Face identity image" in app
+    assert "Reference video (required)" in app
+    # Face swap video lives in the dedicated panel (not shared retake/extend upload).
+    assert 'mode === "retake" || mode === "extend" || mode === "lipdub"' in app
+    assert 'mode === "face_swap" && selectedLoras.length !== 1' in app
+    assert "body.image_path = imagePath" in app
+    assert "body.video_path = videoPath" in app
+    assert "body.source_clip_id = sourceClipId" in app
+    assert "disabled={loraBusy || addingCustomLora || isFaceSwap || isLipDub}" in app
+
+
 def test_face_swap_mode_uses_bfs_face_swap_pipeline():
     """Face swap uses BFS composite + FaceSwapPipeline (stage-2 LoRA + ref), not LipDub."""
     from pathlib import Path
