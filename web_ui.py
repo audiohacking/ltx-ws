@@ -51,7 +51,7 @@ GENERATION_MODES = [
     {"id": "generate", "label": "Text to video"},
     {"id": "i2v", "label": "Image to video (i2v)"},
     {"id": "a2v", "label": "Audio to video (a2v)"},
-    {"id": "v2v", "label": "V2V (reference ± optional LoRA)"},
+    {"id": "v2v", "label": "Video to Video"},
     {"id": "retake", "label": "Retake (edit region)"},
     {"id": "extend", "label": "Extend video"},
     {"id": "keyframe", "label": "Keyframe interpolation"},

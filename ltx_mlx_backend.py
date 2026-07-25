@@ -1564,8 +1564,12 @@ class GenerationCancelledError(RuntimeError):
 def _ic_lora_primary_lora(
     resolved_loras: list[tuple[str, float]],
 ) -> tuple[str, float] | None:
+    """Pick the IC-LoRA that should drive conditioning (not a style default)."""
     if not resolved_loras:
         return None
+    for path, scale in resolved_loras:
+        if _is_crossview_lora_path(path):
+            return (path, float(scale))
     return resolved_loras[0]
 
 
@@ -1891,6 +1895,9 @@ def _should_use_control_aware_refine(resolved_loras: list[tuple[str, float]]) ->
         # Pure V2V / motion transfer without an adapter — still benefit from
         # full-res control re-append during refine.
         return True
+    # CrossView (and similar) must win even if a style LoRA was stacked first.
+    if any(_is_crossview_lora_path(path) for path, _ in resolved_loras):
+        return True
     if _ic_lora_uses_hdr_pipeline(resolved_loras):
         return False
     primary = resolved_loras[0][0]
@@ -2029,8 +2036,10 @@ def _run_ic_lora_generation(
             )
     if not resolved_loras and vc_items:
         log.info(
-            "V2V / IC-LoRA with no adapter LoRA — reference-video conditioning only "
-            "(pure motion / structure transfer)"
+            "V2V / IC-LoRA with no adapter LoRA — prompt + reference-video conditioning "
+            "(prompt=%r attention=%.2f)",
+            (prompt or "")[:120],
+            float(ic_kwargs["conditioning_attention_strength"]),
         )
     if ic_vcond_cleanup:
         log.info(
@@ -2861,15 +2870,17 @@ class LocalVideoGenerator:
                     media_cleanups.append(cleanup)
                 elif path and marker in path:
                     media_cleanups.append(path)
-            if self._resolved_default_loras is not None and not req.lora_specs:
-                resolved_loras = list(self._resolved_default_loras)
-            elif mode in ("face_swap", "face-swap", "lipdub", "lip_dub"):
-                # Exclusive single-adapter modes: never stack global OmniNFT defaults.
+            if mode in ("face_swap", "face-swap", "lipdub", "lip_dub", "ic_lora"):
+                # Exclusive adapter modes: never stack global OmniNFT defaults.
+                # V2V maps to ic_lora — empty request = prompt + reference only;
+                # CrossView / HDR / Union come only from the request (Web UI / MCP).
                 for lora_spec, lora_scale in (req.lora_specs or []):
                     lora_path, lora_cleanup = _resolve_lora_path(str(lora_spec))
                     resolved_loras.append((lora_path, float(lora_scale)))
                     if lora_cleanup:
                         tmp_lora_cleanup.append(lora_cleanup)
+            elif self._resolved_default_loras is not None and not req.lora_specs:
+                resolved_loras = list(self._resolved_default_loras)
             else:
                 for lora_spec, lora_scale in effective_loras:
                     lora_path, lora_cleanup = _resolve_lora_path(str(lora_spec))
@@ -3233,7 +3244,7 @@ class LocalVideoGenerator:
                         last_pipe = _run_ic_lora_generation(
                             self,
                             req=req,
-                            prompt=req.prompt,
+                            prompt=effective_prompt,
                             resolved_loras=resolved_loras,
                             vc_items=vc_items,
                             tmp_image=tmp_image,

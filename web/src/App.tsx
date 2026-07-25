@@ -2483,22 +2483,20 @@ export default function App() {
                   )}
                   {isV2v && (
                     <>
-                      <span className="media-panel-title">V2V inputs</span>
+                      <span className="media-panel-title">Video to Video</span>
                       <p className="hint hint-inline">
-                        Re-render from a reference clip. LoRA is optional: leave none
-                        selected for pure motion / structure transfer, or add a community
-                        IC-LoRA (e.g.{" "}
+                        Re-render from a reference clip using your prompt. LoRA is
+                        optional — leave none selected for prompt + structure transfer,
+                        or pick a community IC-LoRA (e.g.{" "}
                         <a
                           href="https://huggingface.co/Cseti/LTX2.3-22B_IC-LoRA-CrossView-Prompt"
                           target="_blank"
                           rel="noreferrer"
                         >
-                          CrossView Prompt
+                          CrossView
                         </a>
-                        ). No HDR/Union defaults. CrossView strength{" "}
-                        <strong>1.2–1.5</strong> on distilled; prompts use the fixed
-                        vocabulary, e.g.{" "}
-                        <code>crossview. new camera angle: to the right, lower, closer.</code>
+                        {" "}
+                        at strength <strong>1.2–1.5</strong>). No HDR/Union defaults.
                       </p>
                       <div className="media-upload-row">
                         <label className="media-upload">
@@ -2556,16 +2554,10 @@ export default function App() {
                           </select>
                         </label>
                       )}
-                      <div className="v2v-lora-strengths">
-                        <span className="media-upload-label">LoRA strength</span>
-                        {loraPresetIds.length === 0 ? (
-                          <p className="media-source-note">
-                            No LoRA selected — pure reference-video conditioning. Add
-                            CrossView or another IC-LoRA above for adapter-driven V2V
-                            (CrossView tip: strength <strong>1.2–1.5</strong>).
-                          </p>
-                        ) : (
-                          (config?.lora_presets ?? [])
+                      {loraPresetIds.length > 0 && (
+                        <div className="v2v-lora-strengths">
+                          <span className="media-upload-label">LoRA strength</span>
+                          {(config?.lora_presets ?? [])
                             .filter((p) => loraPresetIds.includes(p.id) && p.spec)
                             .map((p) => (
                               <label key={p.id} className="v2v-lora-strength-row">
@@ -2589,9 +2581,9 @@ export default function App() {
                                   }
                                 />
                               </label>
-                            ))
-                        )}
-                      </div>
+                            ))}
+                        </div>
+                      )}
                       <label className="ic-lora-scale">
                         Reference attention strength
                         <input
@@ -2601,7 +2593,7 @@ export default function App() {
                           step={0.05}
                           value={referenceStrength}
                           disabled={!hasConditioningVideo}
-                          title="How strongly the reference video guides the result (0–1). Separate from LoRA strength."
+                          title="How strongly the reference video guides the result (0–1). Lower values leave more room for the text prompt."
                           onChange={(e) =>
                             setReferenceStrength(
                               Math.min(1, Math.max(0, Number(e.target.value) || 0)),
@@ -2610,8 +2602,10 @@ export default function App() {
                         />
                       </label>
                       <p className="hint hint-inline">
-                        LoRA strength is the adapter weight (often &gt;1). Reference attention
-                        (0–1) controls how tightly the model follows the reference clip.
+                        Your prompt is always applied. LoRA strength is the adapter weight
+                        (often &gt;1). Reference attention (0–1) controls how tightly the
+                        model follows the reference — try a lower value if the prompt seems
+                        ignored.
                       </p>
                       {hasConditioningVideo ? (
                         <p className="media-source-note">

@@ -305,8 +305,16 @@ Structure prompts as a **timeline**, not duplicate full scene descriptions.
 | `a2v` | Video driven by audio track | `prompt`, `audio` |
 | `retake` | Replace a segment of source video | `prompt`, `video`, `retake_start`, `retake_end` |
 | `extend` | Add frames before/after source | `prompt`, `video`, `extend_frames`, `extend_direction` |
-| `ic_lora` | Reference-video conditioning + LoRA | `prompt`, `lora_specs`, `video_conditioning` |
+| `ic_lora` | HDR / Union Control (Web UI injects LoRAs) | `prompt`, `lora_specs`, `video_conditioning` |
+| `v2v` (Web UI) | Video-to-video; maps to `ic_lora` pipeline | reference video; LoRA optional |
 | `face_swap` | BFS V3 head swap (identity image + reference video) | `prompt`, `image` (face), `video`, exactly one head-swap `lora_specs` |
+
+**V2V / CrossView (Web UI `mode: v2v`):**
+
+- Does **not** stack the global OmniNFT default — request LoRAs only (empty = prompt + reference conditioning).
+- CrossView Prompt LoRA: strength **1.2–1.5** on distilled; prompts use the fixed vocabulary, e.g. `crossview. new camera angle: to the right, lower, closer.`
+- Uses control-aware refine (`upsample_only` + `refine_steps`) so Stage 2 does not wipe the adapter.
+- HF: https://huggingface.co/Cseti/LTX2.3-22B_IC-LoRA-CrossView-Prompt
 
 **Face swap (`mode: face_swap`)** — Comfy-aligned BFS V3 on MLX (`ltx_ltxv_add_guide` + `FaceSwapPipeline`):
 
