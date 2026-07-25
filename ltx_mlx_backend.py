@@ -1141,8 +1141,9 @@ def _apply_pending_loras(pipe: Any, lora_paths: list[tuple[str, float]] | None) 
     during ``_get_pipe`` with no LoRAs, then request LoRAs arrive here), reload so
     fusion actually happens.
     """
-    # IC-style pipelines own fusion via ``_lora_paths`` (non-empty list).
-    owned = getattr(pipe, "_lora_paths", None)
+    # IC / FaceSwap own fusion via constructor LoRAs — never reload a clean DiT
+    # here or the adapter is silently washed out (CrossView Stage-2 lesson).
+    owned = getattr(pipe, "_lora_paths", None) or getattr(pipe, "_head_swap_lora", None)
     if owned:
         return
 
@@ -2056,6 +2057,91 @@ def _run_ic_lora_generation(
     return pipe
 
 
+# Comfy V3 Face Swap LoRA stack (see docs/FACESWAP_COMFY_GRAPH.md).
+FACE_SWAP_DISTILLED_DYNAMIC_SPEC = (
+    "https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/"
+    "loras/ltx-2.3-22b-distilled-lora-dynamic_fro09_avg_rank_105_bf16.safetensors"
+)
+FACE_SWAP_DISTILLED_DYNAMIC_SCALE = 1.0
+FACE_SWAP_DISTILLED_DYNAMIC_NAMES = (
+    "ltx-2.3-22b-distilled-lora-dynamic_fro09_avg_rank_105_bf16.safetensors",
+    "ltx-2.3-22b-distilled-lora-dynamic.safetensors",
+)
+ENV_FACE_SWAP_DISTILLED_LORA = "LTX_WS_FACE_SWAP_DISTILLED_LORA"
+ENV_FACE_SWAP_NO_DISTILLED_LORA = "LTX_WS_FACE_SWAP_NO_DISTILLED_LORA"
+
+
+def _find_local_face_swap_distilled_dynamic(model_dir: Path | None = None) -> Path | None:
+    """Prefer an already-downloaded distilled-dynamic LoRA over a fresh HF fetch."""
+    candidates: list[Path] = []
+    if model_dir is not None:
+        root = Path(model_dir)
+        for name in FACE_SWAP_DISTILLED_DYNAMIC_NAMES:
+            candidates.append(root / name)
+            candidates.append(root / "loras" / name)
+    cache = _local_lora_cache_dir()
+    for name in FACE_SWAP_DISTILLED_DYNAMIC_NAMES:
+        candidates.append(cache / name)
+        candidates.append(cache / "loras" / name)
+        candidates.append(cache / "Kijai__LTX2.3_comfy" / "loras" / name)
+        candidates.append(cache / "Kijai__LTX2.3_comfy" / name)
+    for hit in candidates:
+        if hit.is_file():
+            return hit.resolve()
+    return None
+
+
+def _build_face_swap_lora_stack(
+    head_swap_loras: list[tuple[str, float]],
+    *,
+    model_dir: Path | None = None,
+) -> list[tuple[str, float]]:
+    """Comfy V3 order: distilled-dynamic @1.0, then user head-swap LoRA(s).
+
+    Skip with ``LTX_WS_FACE_SWAP_NO_DISTILLED_LORA=1``. Override path/URL via
+    ``LTX_WS_FACE_SWAP_DISTILLED_LORA``.
+    """
+    if not head_swap_loras:
+        raise RuntimeError("Face swap requires exactly one head-swap LoRA")
+
+    stack: list[tuple[str, float]] = []
+    skip = os.environ.get(ENV_FACE_SWAP_NO_DISTILLED_LORA, "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if not skip:
+        override = os.environ.get(ENV_FACE_SWAP_DISTILLED_LORA, "").strip()
+        try:
+            if override:
+                path, _cleanup = _resolve_lora_path(override)
+                stack.append((path, FACE_SWAP_DISTILLED_DYNAMIC_SCALE))
+            else:
+                local = _find_local_face_swap_distilled_dynamic(model_dir)
+                if local is not None:
+                    stack.append((str(local), FACE_SWAP_DISTILLED_DYNAMIC_SCALE))
+                else:
+                    path, _cleanup = _resolve_lora_path(FACE_SWAP_DISTILLED_DYNAMIC_SPEC)
+                    stack.append((path, FACE_SWAP_DISTILLED_DYNAMIC_SCALE))
+            log.info(
+                "Face swap LoRA stack: distilled-dynamic @%.2f → %s",
+                stack[-1][1],
+                Path(stack[-1][0]).name,
+            )
+        except Exception as exc:
+            log.warning(
+                "Face swap: distilled-dynamic LoRA unavailable (%s: %s); "
+                "continuing with head-swap only (identity transfer may be weak)",
+                type(exc).__name__,
+                exc,
+            )
+    else:
+        log.info("Face swap: distilled-dynamic LoRA skipped (%s=1)", ENV_FACE_SWAP_NO_DISTILLED_LORA)
+
+    stack.extend((str(p), float(s)) for p, s in head_swap_loras)
+    return stack
+
+
 def _run_face_swap_generation(
     gen: "LocalVideoGenerator",
     *,
@@ -2071,14 +2157,19 @@ def _run_face_swap_generation(
     seed: int,
     steps: int,
 ) -> Any:
-    """BFS V3 face swap via Comfy LTXVAddGuide + distilled sampler + head-swap LoRA."""
+    """BFS V3 face swap via Comfy LTXVAddGuide + distilled-dynamic + head-swap LoRA."""
     if len(resolved_loras) != 1:
         raise RuntimeError("Face swap requires exactly one head-swap LoRA")
 
+    model_dir = Path(getattr(gen, "model_dir", "") or "")
+    lora_stack = _build_face_swap_lora_stack(
+        [(str(p), float(s)) for p, s in resolved_loras],
+        model_dir=model_dir if model_dir.is_dir() else None,
+    )
     log.info(
-        "Face swap invoke: FaceSwapPipeline lora=%s guide=%s (%dx%d, %d frames) "
-        "add_guide=full_composite crop_guides=yes dev_cfg=yes",
-        resolved_loras[0][0],
+        "Face swap invoke: FaceSwapPipeline loras=%s guide=%s (%dx%d, %d frames) "
+        "add_guide=full_composite crop_guides=yes schedule=DISTILLED_SIGMAS",
+        [Path(p).name for p, _ in lora_stack],
         guide_path,
         width,
         height,
@@ -2086,13 +2177,13 @@ def _run_face_swap_generation(
     )
     pipe = gen._get_pipe(
         "face_swap",
-        pipe_kwargs={"lora_paths": [(str(p), float(s)) for p, s in resolved_loras]},
+        pipe_kwargs={"lora_paths": lora_stack},
     )
-    from ltx_face_swap_pipeline import FaceSwapPipeline
+    from ltx_face_swap_pipeline import DEFAULT_FACE_SWAP_CFG, FaceSwapPipeline
 
     if not isinstance(pipe, FaceSwapPipeline):
         raise RuntimeError(
-            f"face_swap expected FaceSwapPipeline (dev+CFG), got {type(pipe).__name__}; "
+            f"face_swap expected FaceSwapPipeline (dev+Comfy LoRA stack), got {type(pipe).__name__}; "
             "update ltx-ws faceswap branch"
         )
     from ltx_ltxv_add_guide import DEFAULT_GUIDE_CRF
@@ -2108,11 +2199,13 @@ def _run_face_swap_generation(
         "seed": seed,
         "num_steps": int(steps),
         "guide_crf": DEFAULT_GUIDE_CRF,
+        # Comfy V3 default; request override still wins below.
+        "cfg_scale": float(DEFAULT_FACE_SWAP_CFG),
     }
     if req.reference_strength is not None:
         swap_kwargs["guide_strength"] = float(req.reference_strength)
     if req.stage2_steps is not None:
-        log.info("Face swap: stage2_steps ignored (single-stage V3 workflow)")
+        log.info("Face swap: stage2_steps ignored (single-stage V3; keep LoRAs fused)")
     if req.cfg_scale is not None:
         swap_kwargs["cfg_scale"] = float(req.cfg_scale)
     _apply_optional_generate_kwargs(swap_kwargs, req)

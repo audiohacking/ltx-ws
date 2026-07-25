@@ -116,8 +116,9 @@ def test_face_swap_pipeline_uses_add_guide_in_source():
     assert "ltxv_preprocess_rgb_frame" in guide
     assert "crop_guides_from_video_tokens" in pipe
     assert "guided_denoise_loop" in pipe
-    assert "ltx2_schedule" in pipe
+    assert "DISTILLED_SIGMAS" in pipe
     assert "_fuse_head_swap_lora" in pipe
+    assert "self._lora_paths" in pipe
     assert "extract_bfs_guide_keyframe_images" not in pipe
     assert "append_ic_lora_reference_video_conditionings" not in pipe
 
@@ -125,10 +126,12 @@ def test_face_swap_pipeline_uses_add_guide_in_source():
 def test_face_swap_pipeline_class_exports():
     from ltx_face_swap_pipeline import (
         DEFAULT_FACE_SWAP_CFG,
+        DEFAULT_FACE_SWAP_STG,
         FaceSwapPipeline,
     )
     from ltx_pipelines_mlx.ti2vid_one_stage import TI2VidOneStagePipeline
 
     assert issubclass(FaceSwapPipeline, TI2VidOneStagePipeline)
     assert hasattr(FaceSwapPipeline, "generate_face_swap")
-    assert DEFAULT_FACE_SWAP_CFG == 3.0
+    assert DEFAULT_FACE_SWAP_CFG == 1.0
+    assert DEFAULT_FACE_SWAP_STG == 0.0

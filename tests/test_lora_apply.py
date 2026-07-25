@@ -53,6 +53,63 @@ def test_apply_pending_loras_skips_ic_lora_owned_paths():
     assert pipe._pending_loras == []
 
 
+def test_apply_pending_loras_skips_face_swap_owned_paths():
+    """Face swap owns fusion via ``_head_swap_lora`` / ``_lora_paths`` (CrossView lesson)."""
+    from ltx_mlx_backend import _apply_pending_loras
+
+    pipe = SimpleNamespace(
+        dit=object(),
+        _loaded=True,
+        _lora_paths=[("head_swap_v3.safetensors", 0.98)],
+        _head_swap_lora=[("head_swap_v3.safetensors", 0.98)],
+        _pending_loras=[],
+    )
+    loads: list[int] = []
+
+    def load() -> None:
+        loads.append(1)
+
+    pipe.load = load
+    _apply_pending_loras(pipe, None)
+    assert pipe._pending_loras == []
+    assert loads == []
+
+
+def test_build_face_swap_lora_stack_prepends_distilled_dynamic(monkeypatch, tmp_path):
+    from ltx_mlx_backend import (
+        FACE_SWAP_DISTILLED_DYNAMIC_SCALE,
+        _build_face_swap_lora_stack,
+    )
+
+    distilled = tmp_path / "ltx-2.3-22b-distilled-lora-dynamic_fro09_avg_rank_105_bf16.safetensors"
+    distilled.write_bytes(b"lora")
+    head = tmp_path / "head_swap_v3_rank_adaptive_fro_098.safetensors"
+    head.write_bytes(b"head")
+
+    monkeypatch.delenv("LTX_WS_FACE_SWAP_NO_DISTILLED_LORA", raising=False)
+    monkeypatch.delenv("LTX_WS_FACE_SWAP_DISTILLED_LORA", raising=False)
+
+    stack = _build_face_swap_lora_stack(
+        [(str(head), 0.98)],
+        model_dir=tmp_path,
+    )
+    assert len(stack) == 2
+    assert stack[0] == (str(distilled.resolve()), FACE_SWAP_DISTILLED_DYNAMIC_SCALE)
+    assert stack[1][0] == str(head)
+    assert stack[1][1] == pytest.approx(0.98)
+
+
+def test_build_face_swap_lora_stack_can_skip_distilled(monkeypatch, tmp_path):
+    from ltx_mlx_backend import _build_face_swap_lora_stack
+
+    head = tmp_path / "head_swap_v3.safetensors"
+    head.write_bytes(b"head")
+    monkeypatch.setenv("LTX_WS_FACE_SWAP_NO_DISTILLED_LORA", "1")
+
+    stack = _build_face_swap_lora_stack([(str(head), 0.98)], model_dir=tmp_path)
+    assert stack == [(str(head), 0.98)]
+
+
 def test_tune_crossview_strength_bumps_low_scale():
     from ltx_mlx_backend import _tune_ic_lora_strengths
 

@@ -1,10 +1,15 @@
-"""BFS V3 face swap — dev + CFG + LTXVAddGuide (Comfy-aligned).
+"""BFS V3 face swap — Comfy-aligned LoRA stack + LTXVAddGuide.
 
-Head-swap LoRA is trained for the **dev** transformer with CFG/STG guidance and
-full composite guide via ``LTXVAddGuide`` append + crop. Distilled-only sampling
-copies the main-panel performance without identity transfer.
+Comfy V3 (``docs/FACESWAP_COMFY_GRAPH.md``) loads the **dev** DiT with:
 
-See ``docs/FACESWAP_COMFY_GRAPH.md``.
+1. distilled-dynamic LoRA @ 1.0 (turns Dev into distilled-like low-step behaviour)
+2. head-swap LoRA @ ~0.98–1.0
+
+then samples with the distilled 8-step sigma table at CFG ≈ 1.0.
+
+This pipeline owns fusion via ``_lora_paths`` / ``_head_swap_lora`` so
+``_apply_pending_loras`` never reloads a clean DiT and washes the adapters
+(CrossView Stage-2 lesson). Single-stage only — no legacy clean Stage 2.
 """
 
 from __future__ import annotations
@@ -16,6 +21,7 @@ import mlx.core as mx
 
 from ltx_core_mlx.components.guiders import MultiModalGuiderParams, create_multimodal_guider_factory
 from ltx_core_mlx.loader import (
+    LTXV_LORA_BLOCK_PREFIX,
     LTXV_LORA_COMFY_RENAMING_MAP,
     LoraStateDictWithStrength,
     SafetensorsStateDictLoader,
@@ -33,8 +39,8 @@ from ltx_ltxv_add_guide import (
     encode_guide_video,
     generation_token_count,
 )
-from ltx_pipelines_mlx.scheduler import ltx2_schedule
-from ltx_pipelines_mlx.ti2vid_one_stage import DEFAULT_CFG_SCALE, TI2VidOneStagePipeline
+from ltx_pipelines_mlx.scheduler import DISTILLED_SIGMAS
+from ltx_pipelines_mlx.ti2vid_one_stage import TI2VidOneStagePipeline
 from ltx_pipelines_mlx.utils.helpers import create_noised_state
 from ltx_pipelines_mlx.utils.samplers import guided_denoise_loop
 
@@ -42,8 +48,9 @@ logger = logging.getLogger(__name__)
 
 _mx_eval = getattr(mx, "eval")  # noqa: B009
 
-DEFAULT_FACE_SWAP_CFG = DEFAULT_CFG_SCALE
-DEFAULT_FACE_SWAP_STG = 1.0
+# Comfy V3 CFGGuider = 1.0 (effectively single-pass at distilled steps).
+DEFAULT_FACE_SWAP_CFG = 1.0
+DEFAULT_FACE_SWAP_STG = 0.0
 DEFAULT_GUIDE_STRENGTH = 1.0
 
 
@@ -54,8 +61,24 @@ def _resolve_dev_transformer(model_dir: Path) -> str:
     return "transformer-dev.safetensors"
 
 
+def _count_lora_matches(model_sd: StateDict, lora_sd: StateDict) -> tuple[int, int]:
+    """Return ``(matched_A_B_pairs, total_lora_A_tensors)`` after Comfy remap."""
+    total = 0
+    matched = 0
+    for key in lora_sd.sd:
+        if not key.endswith(".lora_A.weight"):
+            continue
+        total += 1
+        prefix = key[: -len(".lora_A.weight")]
+        key_b = f"{prefix}.lora_B.weight"
+        weight_key = f"{prefix}.weight"
+        if key_b in lora_sd.sd and weight_key in model_sd.sd:
+            matched += 1
+    return matched, total
+
+
 class FaceSwapPipeline(TI2VidOneStagePipeline):
-    """BFS head-swap: dev + CFG + full composite LTXVAddGuide."""
+    """BFS head-swap: Comfy V3 LoRA stack + LTXVAddGuide on the dev DiT."""
 
     def __init__(
         self,
@@ -65,8 +88,17 @@ class FaceSwapPipeline(TI2VidOneStagePipeline):
         low_memory: bool = True,
         low_ram_streaming: bool = False,
     ):
-        if not lora_paths or len(lora_paths) != 1:
-            raise ValueError("Face swap requires exactly one head-swap LoRA.")
+        if not lora_paths:
+            raise ValueError("Face swap requires at least one LoRA (head-swap; optional distilled-dynamic stack).")
+        head_named = [p for p, _ in lora_paths if "head_swap" in Path(str(p)).name.lower()]
+        if not head_named and len(lora_paths) == 1:
+            # Single user LoRA is assumed to be the head-swap adapter.
+            pass
+        elif not head_named:
+            raise ValueError(
+                "Face swap LoRA stack must include a head-swap adapter "
+                f"(got {[Path(str(p)).name for p, _ in lora_paths]})."
+            )
         model_path = Path(model_dir)
         super().__init__(
             model_dir,
@@ -75,8 +107,12 @@ class FaceSwapPipeline(TI2VidOneStagePipeline):
             low_ram_streaming=low_ram_streaming,
             dev_transformer=_resolve_dev_transformer(model_path),
         )
+        # Own LoRAs the same way ICLoraPipeline does: ``_lora_paths`` marks this
+        # pipe as fusion-owned so ``_apply_pending_loras`` never reloads a clean DiT.
         self._head_swap_lora = [(str(p), float(s)) for p, s in lora_paths]
+        self._lora_paths = list(self._head_swap_lora)
         self._loras_fused = False
+        self.pipeline_type = "face_swap"
 
     def _fuse_head_swap_lora(self) -> None:
         if self._loras_fused or not self._head_swap_lora:
@@ -91,14 +127,19 @@ class FaceSwapPipeline(TI2VidOneStagePipeline):
                 sources.append(
                     BlockLoraSource(
                         lora_path,
-                        block_prefix="transformer.transformer_blocks.",
+                        block_prefix=LTXV_LORA_BLOCK_PREFIX,
                         strength=strength,
                         sd_ops=LTXV_LORA_COMFY_RENAMING_MAP,
                     )
                 )
-                logger.info("Face swap: attached head-swap LoRA stream %s (strength=%s)", lora_path, strength)
+                logger.info(
+                    "Face swap: attached LoRA stream %s (strength=%.3f)",
+                    Path(lora_path).name,
+                    strength,
+                )
             object.__setattr__(self.dit, "_lora_sources", sources)
             self._loras_fused = True
+            self._lora_paths = list(self._head_swap_lora)
             return
 
         import mlx.utils
@@ -109,17 +150,37 @@ class FaceSwapPipeline(TI2VidOneStagePipeline):
         lora_sds = []
         for lora_path, strength in self._head_swap_lora:
             lora_sd = loader.load(lora_path, sd_ops=LTXV_LORA_COMFY_RENAMING_MAP)
+            matched, total = _count_lora_matches(model_sd, lora_sd)
+            logger.info(
+                "Face swap: loaded LoRA %s (strength=%.3f) key match %d/%d",
+                Path(lora_path).name,
+                strength,
+                matched,
+                total,
+            )
+            if total > 0 and matched == 0:
+                raise RuntimeError(
+                    f"Face swap LoRA incompatible with loaded DiT (0/{total} keys matched): {lora_path}"
+                )
+            if matched == 0:
+                logger.warning(
+                    "Face swap: LoRA %s produced no A/B pairs after remap — fusion may be a no-op",
+                    Path(lora_path).name,
+                )
             lora_sds.append(LoraStateDictWithStrength(state_dict=lora_sd, strength=strength))
-            logger.info("Face swap: loaded head-swap LoRA %s (strength=%s)", lora_path, strength)
         fused_sd = apply_loras(model_sd=model_sd, lora_sd_and_strengths=lora_sds)
         apply_quantization(self.dit, fused_sd.sd)
         self.dit.load_weights(list(fused_sd.sd.items()))
         aggressive_cleanup()
         self._loras_fused = True
-        logger.info("Face swap: fused head-swap LoRA into dev transformer")
+        self._lora_paths = list(self._head_swap_lora)
+        logger.info(
+            "Face swap: fused %d LoRA(s) into dev transformer (owned; no Stage-2 reload)",
+            len(self._head_swap_lora),
+        )
 
     def load(self) -> None:
-        """Load dev DiT (head-swap LoRA fused) + VAE encoder."""
+        """Load dev DiT (LoRA stack fused) + VAE encoder."""
         if self._loaded:
             return
         if self.dit is None:
@@ -148,13 +209,21 @@ class FaceSwapPipeline(TI2VidOneStagePipeline):
         guide_crf: int = DEFAULT_GUIDE_CRF,
     ) -> tuple[mx.array, mx.array]:
         if stage2_steps:
-            logger.info("Face swap: stage2_steps ignored (single-stage dev+CFG)")
+            logger.info("Face swap: stage2_steps ignored (single-stage Comfy V3; LoRAs stay fused)")
 
         if not (num_steps or stage1_steps):
             raise ValueError("face_swap requires num_steps from the generation request")
         steps = int(num_steps or stage1_steps)
         if steps < 1:
             raise ValueError(f"face_swap num_steps must be >= 1, got {steps}")
+        max_distilled_steps = len(DISTILLED_SIGMAS) - 1
+        if steps > max_distilled_steps:
+            logger.info(
+                "Face swap: clamping steps %d → %d (DISTILLED_SIGMAS)",
+                steps,
+                max_distilled_steps,
+            )
+            steps = max_distilled_steps
 
         f_lat, h_lat, w_lat, gen_tokens = generation_token_count(num_frames, height, width)
         enc_h = h_lat * 32
@@ -201,7 +270,8 @@ class FaceSwapPipeline(TI2VidOneStagePipeline):
             sigma=1.0,
         )
 
-        sigmas = ltx2_schedule(steps, num_tokens=gen_tokens)
+        # Comfy V3 / IC distilled path: fixed 8-step table (not token-shifted ltx2_schedule).
+        sigmas = DISTILLED_SIGMAS[: steps + 1]
 
         vgp = MultiModalGuiderParams(
             cfg_scale=cfg_scale,
@@ -211,7 +281,7 @@ class FaceSwapPipeline(TI2VidOneStagePipeline):
             stg_blocks=[28],
         )
         agp = MultiModalGuiderParams(
-            cfg_scale=7.0,
+            cfg_scale=max(cfg_scale, 1.0) if cfg_scale > 1.0 else 1.0,
             stg_scale=stg_scale,
             rescale_scale=0.7,
             modality_scale=3.0,
@@ -221,11 +291,13 @@ class FaceSwapPipeline(TI2VidOneStagePipeline):
         audio_factory = create_multimodal_guider_factory(agp, negative_context=neg_audio_embeds)
 
         logger.info(
-            "Face swap: dev+CFG steps=%d cfg=%.1f stg=%.1f add_guide=composite crf=%d "
-            "tokens_gen=%d tokens_guide=%d canvas=%dx%d frames=%d",
+            "Face swap: steps=%d cfg=%.1f stg=%.1f schedule=DISTILLED_SIGMAS "
+            "loras=%d add_guide=composite crf=%d tokens_gen=%d tokens_guide=%d "
+            "canvas=%dx%d frames=%d",
             steps,
             cfg_scale,
             stg_scale,
+            len(self._head_swap_lora),
             guide_crf,
             gen_tokens,
             int(encoded.tokens.shape[1]),
@@ -318,6 +390,6 @@ class FaceSwapPipeline(TI2VidOneStagePipeline):
 __all__ = [
     "DEFAULT_FACE_SWAP_CFG",
     "DEFAULT_FACE_SWAP_STG",
-    "DEFAULT_GUIDE_STRENGTH",
     "FaceSwapPipeline",
+    "_count_lora_matches",
 ]

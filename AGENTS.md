@@ -312,12 +312,14 @@ Structure prompts as a **timeline**, not duplicate full scene descriptions.
 
 1. Builds composite guide (green side strip + identity face every frame + performance video).
 2. `LTXVPreprocess` (CRF 33) + `LTXVAddGuide` full-video append + `LTXVCropGuides`.
-3. Dev transformer + CFG stage 1 (~20 steps) + head-swap LoRA; stage 2 distilled refine.
-4. Output cropped to main panel; reference audio muxed when present.
+3. **Dev** DiT + Comfy V3 LoRA stack fused in one pass (never washed by Stage 2):
+   - `ltx-2.3-22b-distilled-lora-dynamic_fro09…` @ 1.0 (auto from Kijai / local cache)
+   - head-swap LoRA @ ~0.98
+4. Distilled 8-step sigma table, CFG≈1.0 (Comfy V3); output cropped to main panel; reference audio muxed when present.
 
 LoRA preset: `Alissonerdx/BFS-Best-Face-Swap-Video` → `head_swap_v3_rank_adaptive_fro_098.safetensors` @ 0.98.  
 Prompt trigger: `head_swap:` with `FACE:` / `ACTION:` sections (identity from image, not face description in text).  
-Requires **dev** MLX weights (`dgrauet/ltx-2.3-mlx` or q8). Not compatible with distilled-only shortcuts.
+Requires **dev** MLX weights (`dgrauet/ltx-2.3-mlx` or q8). Skip distilled-dynamic with `LTX_WS_FACE_SWAP_NO_DISTILLED_LORA=1`.
 
 For most **director narrative** work, stay on `mode: generate` with **autocontinue sequences**.
 
