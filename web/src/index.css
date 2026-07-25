@@ -1206,21 +1206,27 @@ body {
 }
 
 .media-panel {
-  margin-top: 14px;
-  padding: 12px;
+  margin: 12px 0 4px;
+  padding: 14px;
   border: 1px solid var(--border);
   border-radius: 10px;
-  background: var(--bg);
+  background: color-mix(in srgb, var(--accent) 6%, var(--bg));
   display: flex;
   flex-direction: column;
   gap: 10px;
 }
 
 .media-panel-title {
-  font-size: 0.75rem;
-  font-weight: 600;
-  color: var(--muted);
-  letter-spacing: 0.04em;
+  font-size: 0.8rem;
+  font-weight: 650;
+  color: var(--text);
+  letter-spacing: 0.03em;
+}
+
+.submit-blocked-hint {
+  margin: 8px 0 0;
+  color: color-mix(in srgb, var(--accent) 75%, var(--muted));
+  font-weight: 500;
 }
 
 .media-upload-row {
