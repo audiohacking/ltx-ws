@@ -51,7 +51,7 @@ GENERATION_MODES = [
     {"id": "generate", "label": "Text to video"},
     {"id": "i2v", "label": "Image to video (i2v)"},
     {"id": "a2v", "label": "Audio to video (a2v)"},
-    {"id": "v2v", "label": "V2V + LoRA (CrossView, custom)"},
+    {"id": "v2v", "label": "V2V (reference ± optional LoRA)"},
     {"id": "retake", "label": "Retake (edit region)"},
     {"id": "extend", "label": "Extend video"},
     {"id": "keyframe", "label": "Keyframe interpolation"},
@@ -3156,13 +3156,8 @@ def create_app(
         if ui_mode == "v2v":
             if not body.get("video_conditioning"):
                 raise HTTPException(400, "v2v mode requires a reference video")
-            lora_items = body.get("lora_specs") or []
-            if not lora_items:
-                raise HTTPException(
-                    400,
-                    "v2v mode requires at least one LoRA (e.g. CrossView Prompt)",
-                )
-            for lora_item in lora_items:
+            # LoRA is optional: empty = pure reference-video conditioning (motion transfer).
+            for lora_item in body.get("lora_specs") or []:
                 if not isinstance(lora_item, (list, tuple)) or not lora_item:
                     continue
                 spec = str(lora_item[0])
@@ -3175,6 +3170,16 @@ def create_app(
                     ) from exc
         if ui_mode == "ic_lora":
             body = _apply_ic_lora_defaults(body)
+            if not body.get("video_conditioning") and not body.get("image_path"):
+                # HDR T2V (upstream hdr-ic-lora without --video-conditioning).
+                pass
+            elif not body.get("video_conditioning"):
+                # Union / motion transfer always needs a reference clip.
+                raise HTTPException(
+                    400,
+                    "IC-LoRA with a character image requires a reference video "
+                    "(Union Control). For HDR text-to-video, omit the character image.",
+                )
             for lora_item in body.get("lora_specs") or []:
                 if not isinstance(lora_item, (list, tuple)) or not lora_item:
                     continue

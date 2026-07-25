@@ -61,3 +61,16 @@ def test_resolve_v2v_video_conditioning(tmp_path: Path):
         },
     )
     assert out["video_conditioning"][0][0] == str(ref.resolve())
+
+
+def test_v2v_label_allows_optional_lora():
+    from web_ui import GENERATION_MODES
+
+    v2v = next(m for m in GENERATION_MODES if m["id"] == "v2v")
+    assert "optional" in v2v["label"].lower() or "±" in v2v["label"]
+
+
+def test_should_use_control_aware_refine_for_pure_v2v_no_lora():
+    from ltx_mlx_backend import _should_use_control_aware_refine
+
+    assert _should_use_control_aware_refine([]) is True

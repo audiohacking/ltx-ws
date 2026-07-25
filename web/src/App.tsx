@@ -1693,8 +1693,13 @@ export default function App() {
   const canSubmit = useMemo(() => {
     if (!prompt.trim() || busy || !serverOk) return false;
     if ((isV2v || isIcLora) && loraBusy) return false;
-    if ((isV2v || isIcLora) && !hasConditioningVideo) return false;
-    if ((isV2v || isIcLora) && loraPresetIds.length === 0) return false;
+    // V2V: reference video required; LoRA optional (pure motion transfer OK).
+    if (isV2v && !hasConditioningVideo) return false;
+    // IC-LoRA HDR/Union: need a selected LoRA (server may also inject defaults).
+    if (isIcLora && loraPresetIds.length === 0) return false;
+    // Union / motion transfer needs a reference clip when a character image is set.
+    // HDR text-to-video may omit the reference (matches upstream hdr-ic-lora).
+    if (isIcLora && Boolean(imagePath) && !hasConditioningVideo) return false;
     if (mode === "lipdub" && loraBusy) return false;
     if (mode === "face_swap" && loraBusy) return false;
     const continuing = willContinueChain;
@@ -2392,10 +2397,11 @@ export default function App() {
                   )}
                   {isV2v && (
                     <>
-                      <span className="media-panel-title">V2V + LoRA inputs</span>
+                      <span className="media-panel-title">V2V inputs</span>
                       <p className="hint hint-inline">
-                        Re-render a reference video with a community / custom IC-LoRA
-                        (e.g.{" "}
+                        Re-render from a reference clip. LoRA is optional: leave none
+                        selected for pure motion / structure transfer, or add a community
+                        IC-LoRA (e.g.{" "}
                         <a
                           href="https://huggingface.co/Cseti/LTX2.3-22B_IC-LoRA-CrossView-Prompt"
                           target="_blank"
@@ -2403,9 +2409,9 @@ export default function App() {
                         >
                           CrossView Prompt
                         </a>
-                        ). No HDR/Union defaults — pick the LoRA in the menu (or Add URL).
-                        Strength <strong>1.2–1.5</strong> on distilled. CrossView prompts
-                        use the fixed vocabulary, e.g.{" "}
+                        ). No HDR/Union defaults. CrossView strength{" "}
+                        <strong>1.2–1.5</strong> on distilled; prompts use the fixed
+                        vocabulary, e.g.{" "}
                         <code>crossview. new camera angle: to the right, lower, closer.</code>
                       </p>
                       <div className="media-upload-row">
@@ -2468,8 +2474,9 @@ export default function App() {
                         <span className="media-upload-label">LoRA strength</span>
                         {loraPresetIds.length === 0 ? (
                           <p className="media-source-note">
-                            Select one or more LoRAs above (Options → LoRA). CrossView
-                            works best at <strong>1.2–1.5</strong> on distilled.
+                            No LoRA selected — pure reference-video conditioning. Add
+                            CrossView or another IC-LoRA above for adapter-driven V2V
+                            (CrossView tip: strength <strong>1.2–1.5</strong>).
                           </p>
                         ) : (
                           (config?.lora_presets ?? [])
@@ -2546,13 +2553,18 @@ export default function App() {
                         )}
                       </p>
                       <p className="hint hint-inline">
-                        Built-in HDR (video-only) or Union Control (video + character image).
-                        For CrossView / other community adapters, use{" "}
-                        <strong>V2V + LoRA</strong> instead.
+                        Built-in HDR (video optional for pure T2V HDR) or Union Control
+                        (video + character image). For CrossView / other community adapters,
+                        use <strong>V2V</strong> instead.
                       </p>
                       <div className="media-upload-row">
                         <label className="media-upload">
-                          <span className="media-upload-label">Reference video (required)</span>
+                          <span className="media-upload-label">
+                            Reference video
+                            {icLoraSubMode === "motion_transfer"
+                              ? " (required)"
+                              : " (optional for HDR T2V)"}
+                          </span>
                           <input
                             ref={conditioningVideoRef}
                             type="file"

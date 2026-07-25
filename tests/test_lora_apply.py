@@ -95,6 +95,12 @@ def test_should_use_control_aware_refine_for_crossview():
     )
 
 
+def test_should_use_control_aware_refine_for_empty_loras():
+    from ltx_mlx_backend import _should_use_control_aware_refine
+
+    assert _should_use_control_aware_refine([]) is True
+
+
 def test_should_use_control_aware_refine_skips_hdr():
     from ltx_mlx_backend import _should_use_control_aware_refine
 

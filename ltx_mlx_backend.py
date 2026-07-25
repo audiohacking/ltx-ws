@@ -1878,14 +1878,18 @@ def _iclora_supports_control_aware_refine() -> bool:
 
 
 def _should_use_control_aware_refine(resolved_loras: list[tuple[str, float]]) -> bool:
-    """Use upsample-only + LoRA-kept refine for raw-RGB V2V adapters (e.g. CrossView).
+    """Use upsample-only + control-aware refine for raw-RGB V2V.
 
-    HDR and Union Control keep the legacy clean Stage 2 path. Community raw-RGB
-    IC-LoRAs (ref_downscale=1) lose their effect under clean Stage 2; upstream
-    0.14.17+ ``upsample_only`` + ``refine_steps`` is the supported alternative.
+    Empty LoRAs (pure reference conditioning) and community raw-RGB IC-LoRAs
+    (ref_downscale=1, e.g. CrossView) use upstream 0.14.17+ ``upsample_only`` +
+    ``refine_steps`` so Stage 2 does not wipe control / adapter effect.
+
+    HDR and Union Control keep the legacy clean Stage 2 path.
     """
     if not resolved_loras:
-        return False
+        # Pure V2V / motion transfer without an adapter — still benefit from
+        # full-res control re-append during refine.
+        return True
     if _ic_lora_uses_hdr_pipeline(resolved_loras):
         return False
     primary = resolved_loras[0][0]
@@ -1913,15 +1917,21 @@ def _run_ic_lora_generation(
     audio_reference_paths: list[str] | None = None,
     guide_images: list[tuple[str, int, float, int]] | None = None,
 ) -> Any:
-    """Shared IC-LoRA invoke path for ``ic_lora`` and ``face_swap`` modes."""
-    if not resolved_loras:
-        raise RuntimeError("IC-LoRA generation requires at least one LoRA spec")
-    if not vc_items:
-        raise RuntimeError("IC-LoRA generation requires video conditioning")
+    """Shared IC-LoRA invoke path for ``ic_lora`` / V2V (and face_swap guides).
 
-    ic_pipe_key = (
-        "hdr_ic_lora" if _ic_lora_uses_hdr_pipeline(resolved_loras) else "ic_lora"
-    )
+    LoRAs are optional when a reference video is present (pure V2V). HDR LoRAs
+    may omit video conditioning (pure T2V HDR), matching upstream ``hdr-ic-lora``.
+    """
+    is_hdr = bool(resolved_loras) and _ic_lora_uses_hdr_pipeline(resolved_loras)
+    if not vc_items and not is_hdr:
+        raise RuntimeError(
+            "IC-LoRA / V2V requires a reference video "
+            "(or an HDR LoRA for pure text-to-HDR)"
+        )
+    if not resolved_loras and not vc_items:
+        raise RuntimeError("IC-LoRA / V2V requires a reference video and/or LoRA")
+
+    ic_pipe_key = "hdr_ic_lora" if is_hdr else "ic_lora"
     # CrossView was trained on full LTX-2.3; strengthen on distilled few-step.
     resolved_loras = _tune_ic_lora_strengths(resolved_loras)
     primary_lora = _ic_lora_primary_lora(resolved_loras)
@@ -1929,7 +1939,7 @@ def _run_ic_lora_generation(
     log.info(
         "IC-LoRA invoke: pipe=%s primary=%s vcond_in=%d image=%s (%d) pose_preprocess=%s",
         ic_pipe_key,
-        primary_lora[0] if primary_lora else "?",
+        primary_lora[0] if primary_lora else "(none)",
         len(vc_items),
         "guide" if guide_images else ("i2v" if tmp_image else "no"),
         len(guide_images) if guide_images else (1 if tmp_image else 0),
@@ -1973,21 +1983,24 @@ def _run_ic_lora_generation(
     elif tmp_image:
         ic_kwargs["images"] = _build_ic_lora_image_conditionings(tmp_image, nf)
 
+    # Control-aware refine needs a reference clip; never pass upsample_only to HDR.
     use_control_aware = (
-        _should_use_control_aware_refine(resolved_loras)
+        bool(vc_items)
+        and (not is_hdr)
+        and _should_use_control_aware_refine(resolved_loras)
         and _iclora_supports_control_aware_refine()
     )
     if use_control_aware:
-        # Upstream 0.14.17+: keep IC-LoRA fused during full-res refine (not legacy
-        # clean Stage 2). CrossView / raw-RGB V2V need this or the adapter washes out.
+        # Upstream 0.14.17+: re-append control at full res; keep LoRA fused when present.
         refine_n = int(req.stage2_steps) if req.stage2_steps is not None else 3
         refine_n = max(1, min(refine_n, 8))
         ic_kwargs["upsample_only"] = True
         ic_kwargs["refine_steps"] = refine_n
         log.info(
             "IC-LoRA control-aware refine: upsample_only=True refine_steps=%d "
-            "(keeps LoRA fused; requires ltx-2-mlx >= 0.14.17)",
+            "(ltx-2-mlx >= 0.14.17; LoRAs=%d)",
             refine_n,
+            len(resolved_loras),
         )
     elif req.stage2_steps is not None:
         ic_kwargs["stage2_steps"] = int(req.stage2_steps)
@@ -2013,6 +2026,11 @@ def _run_ic_lora_generation(
                 "weaken the camera-angle effect on distilled.",
                 LTX2_MLX_GIT_TAG,
             )
+    if not resolved_loras and vc_items:
+        log.info(
+            "V2V / IC-LoRA with no adapter LoRA — reference-video conditioning only "
+            "(pure motion / structure transfer)"
+        )
     if ic_vcond_cleanup:
         log.info(
             "IC-LoRA pose control video: %s — verify colored "
@@ -3109,10 +3127,13 @@ class LocalVideoGenerator:
                             job_id=req.job_id,
                         )
                     elif mode == "ic_lora":
-                        if not resolved_loras:
-                            raise RuntimeError("ic_lora mode requires at least one LoRA spec")
-                        if not vc_items:
-                            raise RuntimeError("ic_lora mode requires video conditioning")
+                        if not vc_items and not (
+                            resolved_loras and _ic_lora_uses_hdr_pipeline(resolved_loras)
+                        ):
+                            raise RuntimeError(
+                                "ic_lora / v2v requires a reference video "
+                                "(or an HDR LoRA for pure text-to-HDR)"
+                            )
                         last_pipe = _run_ic_lora_generation(
                             self,
                             req=req,
