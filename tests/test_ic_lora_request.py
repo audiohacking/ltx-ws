@@ -151,6 +151,43 @@ def test_apply_ic_lora_defaults_keeps_extra_loras():
     assert len(out["lora_specs"]) == 2
 
 
+def test_apply_ic_lora_defaults_respects_custom_only_crossview():
+    """CrossView-style V2V: custom IC-LoRA alone must not get HDR injected."""
+    from web_ui import IC_LORA_DEFAULT_SPEC, _apply_ic_lora_defaults
+
+    crossview = (
+        "https://huggingface.co/Cseti/LTX2.3-22B_IC-LoRA-CrossView-Prompt/"
+        "resolve/main/LTX2.3-22B_IC-LoRA-CrossView-Prompt_v0.9_13700.safetensors"
+    )
+    out = _apply_ic_lora_defaults(
+        {
+            "mode": "ic_lora",
+            "prompt": "crossview. new camera angle: to the right, lower, closer.",
+            "video_conditioning": [["/tmp/ref.mp4", 1.0]],
+            "lora_specs": [[crossview, 1.2]],
+        }
+    )
+    assert out["lora_specs"] == [[crossview, 1.2]]
+    assert IC_LORA_DEFAULT_SPEC not in [row[0] for row in out["lora_specs"]]
+
+
+def test_build_params_passes_reference_strength(tmp_path: Path):
+    from web_ui import IC_LORA_DEFAULT_SPEC, _build_params_from_request
+
+    motion = tmp_path / "ref.mp4"
+    motion.write_bytes(b"x")
+    params = _build_params_from_request(
+        {
+            "mode": "ic_lora",
+            "prompt": "crossview. new camera angle: to the left, higher, further.",
+            "video_conditioning": [[str(motion), 0.9]],
+            "lora_specs": [[IC_LORA_DEFAULT_SPEC, 1.0]],
+            "reference_strength": 1.25,
+        }
+    )
+    assert params.reference_strength == pytest.approx(1.25)
+
+
 def test_apply_ic_lora_defaults_strips_alternate_builtin():
     from web_ui import (
         IC_LORA_DEFAULT_SCALE,

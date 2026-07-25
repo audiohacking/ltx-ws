@@ -328,6 +328,7 @@ export default function App() {
   const [conditioningVideoName, setConditioningVideoName] = useState<string | null>(null);
   const [conditioningClipId, setConditioningClipId] = useState<string | null>(null);
   const [conditioningVideoScale, setConditioningVideoScale] = useState(1.0);
+  const [referenceStrength, setReferenceStrength] = useState(1.0);
   const [sourceClipId, setSourceClipId] = useState<string | null>(null);
   const [retakeStart, setRetakeStart] = useState(1);
   const [retakeEnd, setRetakeEnd] = useState(1);
@@ -389,9 +390,9 @@ export default function App() {
       case "motion_transfer":
         return "Union Control — motion transfer (video + character)";
       case "v2v":
-        return "HDR — reference video only (V2V / T2V + video)";
+        return "V2V — reference video + IC-LoRA (HDR default; custom LoRAs OK)";
       default:
-        return "HDR — text to video (no reference video)";
+        return "T2V — no reference video (HDR default)";
     }
   }, [icLoraSubMode]);
 
@@ -625,6 +626,9 @@ export default function App() {
 
     if (entered) {
       preIcLoraPresetIdsRef.current = loraPresetIds;
+      // Drop carry-over LoRAs from other modes so HDR/Union can be applied cleanly;
+      // custom-only IC-LoRA selections are preserved by the sync effect below.
+      setLoraPresetIds([]);
     } else if (left && preIcLoraPresetIdsRef.current !== null) {
       setLoraPresetIds(preIcLoraPresetIdsRef.current);
       preIcLoraPresetIdsRef.current = null;
@@ -638,12 +642,19 @@ export default function App() {
     const motionId = config?.ic_lora_motion_preset_id ?? "ic_lora_union_motion";
     setLoraPresetIds((prev) => {
       const extras = prev.filter((id) => id !== hdrId && id !== motionId);
+      const hasBuiltin = prev.includes(hdrId) || prev.includes(motionId);
+      // Customs-only (e.g. CrossView Prompt): do not force HDR/Union back on.
+      if (prev.length > 0 && !hasBuiltin) {
+        return prev;
+      }
       const next = [icLoraPresetId, ...extras];
       if (next.length === prev.length && next.every((id, i) => prev[i] === id)) {
         return prev;
       }
       return next;
     });
+    // Ensure download for the submode primary when builtins are in play; customs
+    // are ensured when the user adds/toggles them via toggleLoraPreset.
     void ensureLoraPresets([icLoraPresetId], config?.lora_presets, { interactive: true });
   }, [
     mode,
@@ -1022,6 +1033,7 @@ export default function App() {
     setConditioningVideoName(null);
     setConditioningClipId(null);
     setConditioningVideoScale(1.0);
+    setReferenceStrength(1.0);
     if (imageRef.current) imageRef.current.value = "";
     if (endImageRef.current) endImageRef.current.value = "";
     if (videoRef.current) videoRef.current.value = "";
@@ -1053,6 +1065,7 @@ export default function App() {
       setConditioningVideoName(null);
       setConditioningClipId(null);
       setConditioningVideoScale(1.0);
+      setReferenceStrength(1.0);
       if (conditioningVideoRef.current) conditioningVideoRef.current.value = "";
     }
     if (nextMode === "a2v") {
@@ -1511,6 +1524,7 @@ export default function App() {
         body.conditioning_clip_id = conditioningClipId;
         body.conditioning_video_scale = conditioningVideoScale;
       }
+      body.reference_strength = referenceStrength;
     }
     if ((mode === "retake" || mode === "extend" || mode === "lipdub" || mode === "face_swap") && sourceClipId) {
       body.source_clip_id = sourceClipId;
@@ -1588,6 +1602,8 @@ export default function App() {
   const canSubmit = useMemo(() => {
     if (!prompt.trim() || busy || !serverOk) return false;
     if (mode === "ic_lora" && loraBusy) return false;
+    if (mode === "ic_lora" && !hasConditioningVideo) return false;
+    if (mode === "ic_lora" && loraPresetIds.length === 0) return false;
     if (mode === "lipdub" && loraBusy) return false;
     if (mode === "face_swap" && loraBusy) return false;
     const continuing = willContinueChain;
@@ -1615,6 +1631,8 @@ export default function App() {
     videoPath,
     sourceClipId,
     hasVideoSource,
+    hasConditioningVideo,
+    loraPresetIds,
     autocontinue,
     activeClip,
     chainId,
@@ -2248,10 +2266,25 @@ export default function App() {
                           </>
                         )}
                       </p>
+                      <p className="hint hint-inline">
+                        V2V: upload a reference video, keep HDR for default IC-LoRA, or add a
+                        community adapter (e.g.{" "}
+                        <a
+                          href="https://huggingface.co/Cseti/LTX2.3-22B_IC-LoRA-CrossView-Prompt"
+                          target="_blank"
+                          rel="noreferrer"
+                        >
+                          CrossView Prompt
+                        </a>
+                        ) as a custom LoRA and uncheck HDR/Union. No character image needed for
+                        video-only adapters.
+                      </p>
                       <div className="media-upload-row">
                         <label className="media-upload">
                           <span className="media-upload-label">
-                            Motion reference video (optional)
+                            {icLoraSubMode === "t2v"
+                              ? "Reference video (needed for V2V)"
+                              : "Reference video (required)"}
                           </span>
                           <input
                             ref={conditioningVideoRef}
@@ -2344,11 +2377,31 @@ export default function App() {
                           }
                         />
                       </label>
+                      <label className="ic-lora-scale">
+                        Reference attention strength
+                        <input
+                          type="number"
+                          min={0}
+                          max={2}
+                          step={0.05}
+                          value={referenceStrength}
+                          disabled={!hasConditioningVideo}
+                          title="IC-LoRA conditioning_attention_strength (how strongly the reference video guides the result)"
+                          onChange={(e) =>
+                            setReferenceStrength(
+                              Math.min(2, Math.max(0, Number(e.target.value) || 0)),
+                            )
+                          }
+                        />
+                      </label>
                       {hasConditioningVideo && (
                         <p className="media-source-note">
                           {conditioningClipId
                             ? "Using library clip as motion reference."
                             : "Using uploaded file as motion reference."}
+                          {" "}
+                          Motion strength scales the reference clip weight; attention strength
+                          controls how tightly the model follows it (default 1.0).
                         </p>
                       )}
                     </>

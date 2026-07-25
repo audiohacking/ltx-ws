@@ -1492,8 +1492,9 @@ def _ic_lora_primary_spec(*, has_motion: bool, has_character: bool) -> str:
 
 
 def _apply_ic_lora_defaults(body: dict[str, Any]) -> dict[str, Any]:
-    """Ensure the correct primary IC-LoRA is first; keep extra user-selected LoRAs.
+    """Ensure a sensible primary IC-LoRA; keep extra user-selected LoRAs.
 
+  - Custom-only LoRA list (e.g. CrossView Prompt) → leave as-is (no HDR/Union inject).
   - Motion video + character image → Union Control (pose motion transfer).
   - Motion video only → HDR IC-LoRA (V2V / T2V + reference video).
   - No motion video → HDR IC-LoRA (pure T2V).
@@ -1501,23 +1502,39 @@ def _apply_ic_lora_defaults(body: dict[str, Any]) -> dict[str, Any]:
     if (body.get("mode") or "generate").strip().lower() != "ic_lora":
         return body
     new_body = dict(body)
-    has_motion = _ic_lora_has_motion_reference(new_body)
-    has_character = bool(new_body.get("image_path"))
-    primary = _ic_lora_primary_spec(has_motion=has_motion, has_character=has_character)
-    merged: list[list[Any]] = [[primary, IC_LORA_DEFAULT_SCALE]]
-    seen = {primary}
+
+    parsed: list[list[Any]] = []
+    seen_specs: set[str] = set()
     for item in new_body.get("lora_specs") or []:
         if not isinstance(item, (list, tuple)) or len(item) < 2:
             continue
         spec = str(item[0]).strip()
-        if not spec or spec in seen:
-            continue
-        if spec in IC_LORA_BUILTIN_SPECS and spec != primary:
+        if not spec or spec in seen_specs:
             continue
         try:
             scale = float(item[1])
         except (TypeError, ValueError):
             scale = IC_LORA_DEFAULT_SCALE
+        parsed.append([spec, scale])
+        seen_specs.add(spec)
+
+    has_builtin = any(spec in IC_LORA_BUILTIN_SPECS for spec, _ in parsed)
+    custom_only = bool(parsed) and not has_builtin
+    if custom_only:
+        # User chose a non-builtin IC-LoRA (CrossView, community adapters, …).
+        new_body["lora_specs"] = parsed
+        return new_body
+
+    has_motion = _ic_lora_has_motion_reference(new_body)
+    has_character = bool(new_body.get("image_path"))
+    primary = _ic_lora_primary_spec(has_motion=has_motion, has_character=has_character)
+    merged: list[list[Any]] = [[primary, IC_LORA_DEFAULT_SCALE]]
+    seen = {primary}
+    for spec, scale in parsed:
+        if spec in seen:
+            continue
+        if spec in IC_LORA_BUILTIN_SPECS and spec != primary:
+            continue
         merged.append([spec, scale])
         seen.add(spec)
     new_body["lora_specs"] = merged
@@ -1537,6 +1554,15 @@ def _resolve_seed(raw: Any) -> int:
     if raw is None:
         return -1
     return int(raw)
+
+
+def _optional_float(raw: Any) -> float | None:
+    if raw in (None, ""):
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 def _local_file_ref(path: str | None) -> str | None:
@@ -1651,7 +1677,7 @@ def _build_params_from_request(body: dict[str, Any], *, state: AppState | None =
         stg_scale=body.get("stg_scale"),
         stage2_steps=body.get("stage2_steps"),
         no_regen_audio=bool(body.get("no_regen_audio", False)),
-        reference_strength=body.get("reference_strength"),
+        reference_strength=_optional_float(body.get("reference_strength")),
         audio_start_seconds=audio_start_seconds,
     )
 
