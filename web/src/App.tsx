@@ -409,9 +409,9 @@ export default function App() {
       case "motion_transfer":
         return "Union Control — motion transfer (video + character)";
       case "v2v":
-        return "V2V — reference video + IC-LoRA (HDR default; custom LoRAs OK)";
+        return "HDR IC-LoRA — reference video (built-in)";
       default:
-        return "T2V — no reference video (HDR default)";
+        return "HDR IC-LoRA — add a reference video";
     }
   }, [icLoraSubMode]);
 
@@ -641,19 +641,25 @@ export default function App() {
   useEffect(() => {
     const entered = mode === "ic_lora" && prevModeRef.current !== "ic_lora";
     const left = mode !== "ic_lora" && prevModeRef.current === "ic_lora";
+    const enteredV2v = mode === "v2v" && prevModeRef.current !== "v2v";
     prevModeRef.current = mode;
 
     if (entered) {
       preIcLoraPresetIdsRef.current = loraPresetIds;
-      // Drop carry-over LoRAs from other modes so HDR/Union can be applied cleanly;
-      // custom-only IC-LoRA selections are preserved by the sync effect below.
+      // Drop carry-over LoRAs from other modes so HDR/Union can be applied cleanly.
       setLoraPresetIds([]);
     } else if (left && preIcLoraPresetIdsRef.current !== null) {
       setLoraPresetIds(preIcLoraPresetIdsRef.current);
       preIcLoraPresetIdsRef.current = null;
     }
+    if (enteredV2v) {
+      const hdrId = config?.ic_lora_preset_id ?? "ic_lora_hdr";
+      const motionId = config?.ic_lora_motion_preset_id ?? "ic_lora_union_motion";
+      // V2V is custom-LoRA oriented — drop built-in HDR/Union so they are not applied.
+      setLoraPresetIds((prev) => prev.filter((id) => id !== hdrId && id !== motionId));
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- snapshot on mode enter only
-  }, [mode]);
+  }, [mode, config?.ic_lora_preset_id, config?.ic_lora_motion_preset_id]);
 
   useEffect(() => {
     if (mode !== "ic_lora" || !icLoraPresetId) return;
@@ -662,7 +668,7 @@ export default function App() {
     setLoraPresetIds((prev) => {
       const extras = prev.filter((id) => id !== hdrId && id !== motionId);
       const hasBuiltin = prev.includes(hdrId) || prev.includes(motionId);
-      // Customs-only (e.g. CrossView Prompt): do not force HDR/Union back on.
+      // Rare: user cleared builtins — don't force HDR back if they emptied the list mid-edit.
       if (prev.length > 0 && !hasBuiltin) {
         return prev;
       }
@@ -795,7 +801,7 @@ export default function App() {
       // Select the new adapter so it shows checked in the menu and is used on generate.
       setLoraPresetIds((prev) => {
         let nextIds: string[];
-        if (mode === "ic_lora" || mode === "lipdub" || mode === "face_swap") {
+        if (mode === "ic_lora" || mode === "v2v" || mode === "lipdub" || mode === "face_swap") {
           nextIds = [newId];
         } else {
           nextIds = prev.filter((id) => id !== newId);
@@ -806,7 +812,7 @@ export default function App() {
       });
       setCustomLoraUrl("");
       setCustomLoraLabel("");
-      setCustomLoraScale("1.0");
+      setCustomLoraScale(isCrossView ? "1.25" : "1.0");
       await ensureLoraPresets([newId], nextPresets, { interactive: true });
       setLoraActivity({
         phase: "ready",
@@ -1090,7 +1096,7 @@ export default function App() {
   }
 
   function clearMediaForMode(nextMode: string) {
-    if (!["i2v", "generate", "a2v", "keyframe", "ic_lora", "lipdub", "face_swap"].includes(nextMode)) {
+    if (!["i2v", "generate", "a2v", "keyframe", "ic_lora", "v2v", "lipdub", "face_swap"].includes(nextMode)) {
       setImagePath(null);
       setImageName(null);
       if (imageRef.current) imageRef.current.value = "";
@@ -1109,7 +1115,7 @@ export default function App() {
       setSourceClipId(null);
       if (videoRef.current) videoRef.current.value = "";
     }
-    if (nextMode !== "ic_lora") {
+    if (nextMode !== "ic_lora" && nextMode !== "v2v") {
       setConditioningVideoPath(null);
       setConditioningVideoName(null);
       setConditioningClipId(null);
@@ -1120,7 +1126,7 @@ export default function App() {
     if (nextMode === "a2v") {
       setChainMethod("autocontinue");
     }
-    if (nextMode === "ic_lora" || nextMode === "face_swap" || nextMode === "lipdub") {
+    if (nextMode === "ic_lora" || nextMode === "v2v" || nextMode === "face_swap" || nextMode === "lipdub") {
       setClipMultiplier(1);
       setAutocontinue(false);
       setAutoconcat(false);
@@ -1157,6 +1163,7 @@ export default function App() {
 
   const needsImageUpload = mode === "i2v" || mode === "keyframe";
   const isA2v = mode === "a2v";
+  const isV2v = mode === "v2v";
   const isIcLora = mode === "ic_lora";
   const isFaceSwap = mode === "face_swap";
   const isLipDub = mode === "lipdub";
@@ -1544,7 +1551,7 @@ export default function App() {
       body.extend_direction = extendDirection;
     }
     if (
-      (mode === "i2v" || mode === "generate" || mode === "a2v" || mode === "keyframe" || mode === "ic_lora" || mode === "lipdub" || mode === "face_swap") &&
+      (mode === "i2v" || mode === "generate" || mode === "a2v" || mode === "keyframe" || mode === "ic_lora" || mode === "v2v" || mode === "lipdub" || mode === "face_swap") &&
       imagePath
     ) {
       body.image_path = imagePath;
@@ -1569,7 +1576,7 @@ export default function App() {
     if (mode === "lipdub" && resolvedAudioPath) {
       body.audio_path = resolvedAudioPath;
     }
-    if (mode === "ic_lora") {
+    if (mode === "ic_lora" || mode === "v2v") {
       if (conditioningVideoPath) {
         body.conditioning_video_path = conditioningVideoPath;
         body.conditioning_video_scale = conditioningVideoScale;
@@ -1654,9 +1661,9 @@ export default function App() {
 
   const canSubmit = useMemo(() => {
     if (!prompt.trim() || busy || !serverOk) return false;
-    if (mode === "ic_lora" && loraBusy) return false;
-    if (mode === "ic_lora" && !hasConditioningVideo) return false;
-    if (mode === "ic_lora" && loraPresetIds.length === 0) return false;
+    if ((isV2v || isIcLora) && loraBusy) return false;
+    if ((isV2v || isIcLora) && !hasConditioningVideo) return false;
+    if ((isV2v || isIcLora) && loraPresetIds.length === 0) return false;
     if (mode === "lipdub" && loraBusy) return false;
     if (mode === "face_swap" && loraBusy) return false;
     const continuing = willContinueChain;
@@ -1674,6 +1681,8 @@ export default function App() {
     busy,
     serverOk,
     mode,
+    isV2v,
+    isIcLora,
     imagePath,
     audioPath,
     audioFile,
@@ -1690,6 +1699,8 @@ export default function App() {
     activeClip,
     chainId,
     loraBusy,
+    willContinueChain,
+    audioStartSeconds,
   ]);
 
   const fitPromptHeight = useCallback(() => {
@@ -2348,6 +2359,99 @@ export default function App() {
                       </label>
                     </>
                   )}
+                  {isV2v && (
+                    <>
+                      <span className="media-panel-title">V2V + LoRA inputs</span>
+                      <p className="hint hint-inline">
+                        Re-render a reference video with a community / custom IC-LoRA
+                        (e.g.{" "}
+                        <a
+                          href="https://huggingface.co/Cseti/LTX2.3-22B_IC-LoRA-CrossView-Prompt"
+                          target="_blank"
+                          rel="noreferrer"
+                        >
+                          CrossView Prompt
+                        </a>
+                        ). No HDR/Union defaults — pick the LoRA in the menu (or Add URL).
+                        Strength <strong>1.2–1.5</strong> on distilled. CrossView prompts
+                        use the fixed vocabulary, e.g.{" "}
+                        <code>crossview. new camera angle: to the right, lower, closer.</code>
+                      </p>
+                      <div className="media-upload-row">
+                        <label className="media-upload">
+                          <span className="media-upload-label">Reference video (required)</span>
+                          <input
+                            ref={conditioningVideoRef}
+                            type="file"
+                            accept="video/*"
+                            onChange={async (e) => {
+                              const f = e.target.files?.[0];
+                              if (f) {
+                                setConditioningClipId(null);
+                                setConditioningVideoPath(await uploadFile(f, "video"));
+                                setConditioningVideoName(f.name);
+                              }
+                            }}
+                          />
+                          <span className="media-upload-hint">
+                            {conditioningVideoName ?? "Choose reference video…"}
+                          </span>
+                        </label>
+                      </div>
+                      {videoLibraryClips.length > 0 && (
+                        <label className="clip-source-picker">
+                          <span className="media-upload-label">Or reference from library</span>
+                          <select
+                            value={conditioningClipId ?? ""}
+                            onChange={(e) => {
+                              const id = e.target.value || null;
+                              setConditioningClipId(id);
+                              if (id) {
+                                setConditioningVideoPath(null);
+                                setConditioningVideoName(null);
+                                if (conditioningVideoRef.current) {
+                                  conditioningVideoRef.current.value = "";
+                                }
+                              }
+                            }}
+                          >
+                            <option value="">Select a clip…</option>
+                            {videoLibraryClips.map((c) => {
+                              const label = clipDisplayPrompt(c.prompt);
+                              const meta = [
+                                c.label,
+                                c.width && c.height ? `${c.width}×${c.height}` : null,
+                              ]
+                                .filter(Boolean)
+                                .join(" · ");
+                              return (
+                                <option key={c.id} value={c.id}>
+                                  {meta ? `${label} (${meta})` : label}
+                                </option>
+                              );
+                            })}
+                          </select>
+                        </label>
+                      )}
+                      <label className="ic-lora-scale">
+                        Reference attention strength
+                        <input
+                          type="number"
+                          min={0}
+                          max={1}
+                          step={0.05}
+                          value={referenceStrength}
+                          disabled={!hasConditioningVideo}
+                          title="How strongly the reference video guides the result (0–1)"
+                          onChange={(e) =>
+                            setReferenceStrength(
+                              Math.min(1, Math.max(0, Number(e.target.value) || 0)),
+                            )
+                          }
+                        />
+                      </label>
+                    </>
+                  )}
                   {isIcLora && (
                     <>
                       <span className="media-panel-title">IC-LoRA inputs</span>
@@ -2361,30 +2465,13 @@ export default function App() {
                         )}
                       </p>
                       <p className="hint hint-inline">
-                        V2V: upload a reference video. Default LoRA is HDR; for community
-                        adapters (e.g.{" "}
-                        <a
-                          href="https://huggingface.co/Cseti/LTX2.3-22B_IC-LoRA-CrossView-Prompt"
-                          target="_blank"
-                          rel="noreferrer"
-                        >
-                          CrossView Prompt
-                        </a>
-                        ), paste the resolve URL below — it is added to the LoRA list and
-                        selected automatically (HDR/Union are cleared). Use strength{" "}
-                        <strong>1.2–1.5</strong> on distilled (auto-bumped from 1.0). No
-                        character image needed for video-only adapters. Prompt must use
-                        that adapter&apos;s vocabulary (e.g.{" "}
-                        <code>crossview. new camera angle: to the right, lower, closer.</code>
-                        ).
+                        Built-in HDR (video-only) or Union Control (video + character image).
+                        For CrossView / other community adapters, use{" "}
+                        <strong>V2V + LoRA</strong> instead.
                       </p>
                       <div className="media-upload-row">
                         <label className="media-upload">
-                          <span className="media-upload-label">
-                            {icLoraSubMode === "t2v"
-                              ? "Reference video (needed for V2V)"
-                              : "Reference video (required)"}
-                          </span>
+                          <span className="media-upload-label">Reference video (required)</span>
                           <input
                             ref={conditioningVideoRef}
                             type="file"
@@ -2404,7 +2491,7 @@ export default function App() {
                         </label>
                         <label className="media-upload">
                           <span className="media-upload-label">
-                            Character reference image (optional)
+                            Character reference image (optional → Union Control)
                           </span>
                           <input
                             ref={imageRef}
@@ -2481,14 +2568,14 @@ export default function App() {
                         <input
                           type="number"
                           min={0}
-                          max={2}
+                          max={1}
                           step={0.05}
                           value={referenceStrength}
                           disabled={!hasConditioningVideo}
-                          title="IC-LoRA conditioning_attention_strength (how strongly the reference video guides the result)"
+                          title="IC-LoRA conditioning_attention_strength (0–1)"
                           onChange={(e) =>
                             setReferenceStrength(
-                              Math.min(2, Math.max(0, Number(e.target.value) || 0)),
+                              Math.min(1, Math.max(0, Number(e.target.value) || 0)),
                             )
                           }
                         />

@@ -51,11 +51,12 @@ GENERATION_MODES = [
     {"id": "generate", "label": "Text to video"},
     {"id": "i2v", "label": "Image to video (i2v)"},
     {"id": "a2v", "label": "Audio to video (a2v)"},
+    {"id": "v2v", "label": "V2V + LoRA (CrossView, custom)"},
     {"id": "retake", "label": "Retake (edit region)"},
     {"id": "extend", "label": "Extend video"},
     {"id": "keyframe", "label": "Keyframe interpolation"},
     {"id": "lipdub", "label": "LipDub (experimental)"},
-    {"id": "ic_lora", "label": "IC-LoRA (motion / character ref)"},
+    {"id": "ic_lora", "label": "IC-LoRA (HDR / Union Control)"},
     {"id": "face_swap", "label": "Face swap (LTX 2.3)"},
 ]
 
@@ -1522,9 +1523,9 @@ def _resolve_ic_lora_video_conditioning(
     state: AppState,
     body: dict[str, Any],
 ) -> dict[str, Any]:
-    """Normalize IC-LoRA motion-reference fields into ``video_conditioning``."""
+    """Normalize IC-LoRA / V2V motion-reference fields into ``video_conditioning``."""
     body = dict(body)
-    if (body.get("mode") or "generate").strip().lower() != "ic_lora":
+    if (body.get("mode") or "generate").strip().lower() not in ("ic_lora", "v2v"):
         return body
     if body.get("video_conditioning"):
         return body
@@ -1621,6 +1622,9 @@ def _api_mode(mode: str) -> str:
     m = (mode or "generate").strip().lower()
     if m == "i2v":
         return "generate"
+    # V2V + LoRA uses the same ICLoraPipeline path as IC-LoRA, without HDR/Union defaults.
+    if m == "v2v":
+        return "ic_lora"
     return m
 
 
@@ -1663,6 +1667,7 @@ def _build_params_from_request(body: dict[str, Any], *, state: AppState | None =
         "generate",
         "keyframe",
         "ic_lora",
+        "v2v",
         "lipdub",
         "face_swap",
     ) else None
@@ -3148,6 +3153,26 @@ def create_app(
             raise HTTPException(400, "a2v mode requires an audio upload")
         _validate_source_video_request(state, body, ui_mode)
         body = _resolve_ic_lora_video_conditioning(state, body)
+        if ui_mode == "v2v":
+            if not body.get("video_conditioning"):
+                raise HTTPException(400, "v2v mode requires a reference video")
+            lora_items = body.get("lora_specs") or []
+            if not lora_items:
+                raise HTTPException(
+                    400,
+                    "v2v mode requires at least one LoRA (e.g. CrossView Prompt)",
+                )
+            for lora_item in lora_items:
+                if not isinstance(lora_item, (list, tuple)) or not lora_item:
+                    continue
+                spec = str(lora_item[0])
+                try:
+                    await asyncio.to_thread(_ensure_lora_downloaded, spec)
+                except Exception as exc:
+                    raise HTTPException(
+                        400,
+                        f"Could not download V2V LoRA weights ({spec}): {exc}",
+                    ) from exc
         if ui_mode == "ic_lora":
             body = _apply_ic_lora_defaults(body)
             for lora_item in body.get("lora_specs") or []:
