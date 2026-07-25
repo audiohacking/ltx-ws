@@ -177,16 +177,22 @@ def _label_for_lora_spec(spec: str) -> str:
 
 
 def _read_custom_loras(output_dir: Path) -> list[dict[str, Any]]:
+    from ltx_mlx_backend import _normalize_lora_spec
+
     raw = read_web_settings(output_dir).get("custom_loras")
     if not isinstance(raw, list):
         return []
     out: list[dict[str, Any]] = []
+    dirty = False
     for item in raw:
         if not isinstance(item, dict):
             continue
-        spec = str(item.get("spec") or "").strip()
+        spec = _normalize_lora_spec(str(item.get("spec") or "").strip())
         if not spec:
             continue
+        original = str(item.get("spec") or "").strip()
+        if spec != original:
+            dirty = True
         lid = str(item.get("id") or "").strip() or f"custom_{uuid.uuid4().hex[:8]}"
         try:
             scale = float(item.get("scale", 1.0))
@@ -194,6 +200,12 @@ def _read_custom_loras(output_dir: Path) -> list[dict[str, Any]]:
             scale = 1.0
         label = str(item.get("label") or "").strip() or _label_for_lora_spec(spec)
         out.append({"id": lid, "label": label, "spec": spec, "scale": scale, "custom": True})
+    if dirty:
+        # Persist repaired URLs (Path()-mangled https:/… → https://…).
+        _write_custom_loras(
+            output_dir,
+            [{"id": e["id"], "label": e["label"], "spec": e["spec"], "scale": e["scale"]} for e in out],
+        )
     return out
 
 
@@ -2851,8 +2863,8 @@ def create_app(
             raise HTTPException(400, "spec or url is required")
         if not (
             spec.startswith(("http://", "https://"))
-            or spec.endswith(".safetensors")
-            or Path(spec).expanduser().exists()
+            or (spec.endswith(".safetensors") and Path(spec).expanduser().is_file())
+            or Path(spec).expanduser().is_file()
         ):
             raise HTTPException(
                 400,

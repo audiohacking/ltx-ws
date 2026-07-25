@@ -611,9 +611,27 @@ def _local_lora_cache_dir() -> Path:
 
 
 def _normalize_lora_spec(spec: str) -> str:
-    """Normalize common Hugging Face URL variants to resolve/download form."""
+    """Normalize LoRA specs: HF URL variants, and repair Path()-mangled URLs.
+
+    On macOS/Linux, ``Path("https://…").resolve()`` collapses ``://`` to ``:/`` and
+    may prefix the cwd (e.g. ``/repo/https:/huggingface.co/…``). Recover those.
+    """
     raw = (spec or "").strip()
-    if not raw or not raw.startswith(("http://", "https://")):
+    if not raw:
+        return raw
+
+    # Recover cwd-prefixed / Path-collapsed URLs before any Path() usage.
+    for marker in ("https://", "http://", "https:/", "http:/"):
+        idx = raw.find(marker)
+        if idx > 0 and ("huggingface.co" in raw or "hf.co" in raw):
+            raw = raw[idx:]
+            break
+    if raw.startswith("https:/") and not raw.startswith("https://"):
+        raw = "https://" + raw[len("https:/") :]
+    elif raw.startswith("http:/") and not raw.startswith("http://"):
+        raw = "http://" + raw[len("http:/") :]
+
+    if not raw.startswith(("http://", "https://")):
         return raw
     parsed = urlparse(raw)
     host = parsed.netloc.lower()
@@ -624,6 +642,10 @@ def _normalize_lora_spec(spec: str) -> str:
     if "huggingface.co" in raw and "/blob/" in raw:
         raw = raw.replace("/blob/", "/resolve/", 1)
     return raw
+
+
+def _is_http_url(value: str) -> bool:
+    return value.startswith(("http://", "https://"))
 
 
 def _pick_safetensors_file(root: Path) -> Path | None:
@@ -722,11 +744,8 @@ def _lora_cached_path(spec: str) -> Path | None:
     if not raw:
         return None
 
-    p = Path(raw).expanduser()
-    if p.is_file():
-        return p.resolve()
-
-    if raw.startswith(("http://", "https://")):
+    # URLs must not go through pathlib — Path("https://…") collapses :// → :/ .
+    if _is_http_url(raw):
         resolved = _parse_hf_lora_resolve_url(raw)
         if resolved is not None:
             candidate = _hf_lora_cache_file(resolved)
@@ -737,6 +756,11 @@ def _lora_cached_path(spec: str) -> Path | None:
                 for match in cache_dir.rglob(Path(resolved.filename).name):
                     if match.is_file():
                         return match.resolve()
+        return None
+
+    p = Path(raw).expanduser()
+    if p.is_file():
+        return p.resolve()
 
     if looks_like_hf_repo_id(raw):
         dest = (_local_lora_cache_dir() / raw.replace("/", "__")).resolve()
@@ -783,10 +807,7 @@ def _resolve_lora_path(spec: str) -> tuple[str, str | None]:
         log.debug("Using cached LoRA at %s", cached)
         return str(cached), None
 
-    p = Path(raw).expanduser()
-    if p.is_file():
-        return str(p.resolve()), None
-    if raw.startswith(("http://", "https://")):
+    if _is_http_url(raw):
         resolved = _parse_hf_lora_resolve_url(raw)
         if resolved is not None:
             return str(_download_hf_lora_resolve(resolved)), None
@@ -799,6 +820,10 @@ def _resolve_lora_path(spec: str) -> tuple[str, str | None]:
             max_bytes=None,
         )
         return tmp, tmp
+
+    p = Path(raw).expanduser()
+    if p.is_file():
+        return str(p.resolve()), None
 
     if looks_like_hf_repo_id(raw):
         try:
