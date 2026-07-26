@@ -349,6 +349,7 @@ export default function App() {
   const [conditioningClipId, setConditioningClipId] = useState<string | null>(null);
   const [conditioningVideoScale, setConditioningVideoScale] = useState(1.0);
   const [referenceStrength, setReferenceStrength] = useState(1.0);
+  const [skipStage2, setSkipStage2] = useState(false);
   const [sourceClipId, setSourceClipId] = useState<string | null>(null);
   const [retakeStart, setRetakeStart] = useState(1);
   const [retakeEnd, setRetakeEnd] = useState(1);
@@ -393,26 +394,32 @@ export default function App() {
   const hasVideoSource = Boolean(videoPath || sourceClipId);
   const hasConditioningVideo = Boolean(conditioningVideoPath || conditioningClipId);
 
-  const icLoraSubMode = useMemo(() => {
-    if (!hasConditioningVideo) return "t2v" as const;
-    if (imagePath) return "motion_transfer" as const;
-    return "v2v" as const;
-  }, [hasConditioningVideo, imagePath]);
+  const icLoraHdrId = config?.ic_lora_preset_id ?? "ic_lora_hdr";
+  const icLoraUnionId = config?.ic_lora_motion_preset_id ?? "ic_lora_union_motion";
+  const icLoraUnionSelected = loraPresetIds.includes(icLoraUnionId);
 
-  const icLoraPresetId = useMemo(() => {
-    const hdrId = config?.ic_lora_preset_id ?? "ic_lora_hdr";
-    const motionId = config?.ic_lora_motion_preset_id ?? "ic_lora_union_motion";
-    return icLoraSubMode === "motion_transfer" ? motionId : hdrId;
-  }, [config?.ic_lora_motion_preset_id, config?.ic_lora_preset_id, icLoraSubMode]);
+  // Upstream hdr-ic-lora: video and image are independently optional.
+  // Union Control is opt-in via the LoRA picker — never auto-switched by image.
+  const icLoraSubMode = useMemo(() => {
+    if (icLoraUnionSelected) return "motion_transfer" as const;
+    if (!hasConditioningVideo && imagePath) return "i2v" as const;
+    if (hasConditioningVideo && imagePath) return "i2v_v2v" as const;
+    if (hasConditioningVideo) return "v2v" as const;
+    return "t2v" as const;
+  }, [hasConditioningVideo, icLoraUnionSelected, imagePath]);
 
   const icLoraModeLabel = useMemo(() => {
     switch (icLoraSubMode) {
       case "motion_transfer":
-        return "Union Control — motion transfer (video + character)";
+        return "Union Control — motion / pose transfer (needs reference video)";
+      case "i2v_v2v":
+        return "HDR IC-LoRA — image-to-video + reference video";
+      case "i2v":
+        return "HDR IC-LoRA — image-to-video (optional video)";
       case "v2v":
-        return "HDR IC-LoRA — reference video (built-in)";
+        return "HDR IC-LoRA — video-to-video (SDR → HDR)";
       default:
-        return "HDR IC-LoRA — add a reference video";
+        return "HDR IC-LoRA — text-to-video (optional image / video)";
     }
   }, [icLoraSubMode]);
 
@@ -647,48 +654,23 @@ export default function App() {
 
     if (entered) {
       preIcLoraPresetIdsRef.current = loraPresetIds;
-      // Drop carry-over LoRAs from other modes so HDR/Union can be applied cleanly.
-      setLoraPresetIds([]);
+      // Enter IC-LoRA on HDR by default (upstream hdr-ic-lora). Union is opt-in.
+      setLoraPresetIds([icLoraHdrId]);
+      void ensureLoraPresets([icLoraHdrId], config?.lora_presets, { interactive: true });
     } else if (left && preIcLoraPresetIdsRef.current !== null) {
       setLoraPresetIds(preIcLoraPresetIdsRef.current);
       preIcLoraPresetIdsRef.current = null;
     }
     if (enteredV2v) {
-      const hdrId = config?.ic_lora_preset_id ?? "ic_lora_hdr";
-      const motionId = config?.ic_lora_motion_preset_id ?? "ic_lora_union_motion";
       // V2V is custom-LoRA oriented — drop built-in HDR/Union so they are not applied.
-      setLoraPresetIds((prev) => prev.filter((id) => id !== hdrId && id !== motionId));
+      setLoraPresetIds((prev) => prev.filter((id) => id !== icLoraHdrId && id !== icLoraUnionId));
+      // Avoid stale I2V image leaking into V2V jobs.
+      setImagePath(null);
+      setImageName(null);
+      if (imageRef.current) imageRef.current.value = "";
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- snapshot on mode enter only
-  }, [mode, config?.ic_lora_preset_id, config?.ic_lora_motion_preset_id]);
-
-  useEffect(() => {
-    if (mode !== "ic_lora" || !icLoraPresetId) return;
-    const hdrId = config?.ic_lora_preset_id ?? "ic_lora_hdr";
-    const motionId = config?.ic_lora_motion_preset_id ?? "ic_lora_union_motion";
-    setLoraPresetIds((prev) => {
-      const extras = prev.filter((id) => id !== hdrId && id !== motionId);
-      const hasBuiltin = prev.includes(hdrId) || prev.includes(motionId);
-      // Rare: user cleared builtins — don't force HDR back if they emptied the list mid-edit.
-      if (prev.length > 0 && !hasBuiltin) {
-        return prev;
-      }
-      const next = [icLoraPresetId, ...extras];
-      if (next.length === prev.length && next.every((id, i) => prev[i] === id)) {
-        return prev;
-      }
-      return next;
-    });
-    void ensureLoraPresets([icLoraPresetId], config?.lora_presets, { interactive: true });
-    // Intentionally omit config.lora_presets: catalog updates (custom add) must not
-    // re-run this sync and wipe or re-force the HDR/Union primary.
-  }, [
-    mode,
-    icLoraPresetId,
-    config?.ic_lora_preset_id,
-    config?.ic_lora_motion_preset_id,
-    ensureLoraPresets,
-  ]);
+  }, [mode, icLoraHdrId, icLoraUnionId]);
 
   useEffect(() => {
     if (mode !== "face_swap" || !faceSwapPresetId) return;
@@ -1620,6 +1602,9 @@ export default function App() {
       }
       body.reference_strength = referenceStrength;
     }
+    if (mode === "ic_lora" && skipStage2) {
+      body.skip_stage_2 = true;
+    }
     if ((mode === "retake" || mode === "extend" || mode === "lipdub" || mode === "face_swap") && sourceClipId) {
       body.source_clip_id = sourceClipId;
     } else if ((mode === "retake" || mode === "extend" || mode === "lipdub" || mode === "face_swap") && videoPath) {
@@ -1698,11 +1683,10 @@ export default function App() {
     if ((isV2v || isIcLora) && loraBusy) return false;
     // V2V: reference video required; LoRA optional (pure motion transfer OK).
     if (isV2v && !hasConditioningVideo) return false;
-    // IC-LoRA HDR/Union: need a selected LoRA (server may also inject defaults).
+    // IC-LoRA: need a selected LoRA (HDR default, or Union / custom).
     if (isIcLora && loraPresetIds.length === 0) return false;
-    // Union / motion transfer needs a reference clip when a character image is set.
-    // HDR text-to-video may omit the reference (matches upstream hdr-ic-lora).
-    if (isIcLora && Boolean(imagePath) && !hasConditioningVideo) return false;
+    // Union Control needs a reference video; HDR allows T2V / I2V without video.
+    if (isIcLora && icLoraUnionSelected && !hasConditioningVideo) return false;
     if (mode === "lipdub" && loraBusy) return false;
     if (mode === "face_swap" && loraBusy) return false;
     if (mode === "face_swap" && loraPresetIds.length !== 1) return false;
@@ -1735,6 +1719,7 @@ export default function App() {
     hasVideoSource,
     hasConditioningVideo,
     loraPresetIds,
+    icLoraUnionSelected,
     autocontinue,
     activeClip,
     chainId,
@@ -2639,17 +2624,19 @@ export default function App() {
                         )}
                       </p>
                       <p className="hint hint-inline">
-                        Built-in HDR (video optional for pure T2V HDR) or Union Control
-                        (video + character image). For CrossView / other community adapters,
-                        use <strong>V2V</strong> instead.
+                        Defaults to <strong>HDR IC-LoRA</strong> (upstream{" "}
+                        <code>hdr-ic-lora</code>): text-to-video with optional start image
+                        and/or SDR reference video. Pick <strong>Union Control</strong> in
+                        the LoRA menu for pose motion transfer. Community adapters
+                        (CrossView, etc.) belong in <strong>V2V</strong>.
                       </p>
                       <div className="media-upload-row">
                         <label className="media-upload">
                           <span className="media-upload-label">
                             Reference video
-                            {icLoraSubMode === "motion_transfer"
-                              ? " (required)"
-                              : " (optional for HDR T2V)"}
+                            {icLoraUnionSelected
+                              ? " (required for Union)"
+                              : " (optional — V2V / SDR→HDR)"}
                           </span>
                           <input
                             ref={conditioningVideoRef}
@@ -2665,12 +2652,14 @@ export default function App() {
                             }}
                           />
                           <span className="media-upload-hint">
-                            {conditioningVideoName ?? "Choose motion reference…"}
+                            {conditioningVideoName ?? "Choose reference video…"}
                           </span>
                         </label>
                         <label className="media-upload">
                           <span className="media-upload-label">
-                            Character reference image (optional → Union Control)
+                            {icLoraUnionSelected
+                              ? "Character image (optional for Union)"
+                              : "Start image (optional I2V)"}
                           </span>
                           <input
                             ref={imageRef}
@@ -2685,14 +2674,17 @@ export default function App() {
                             }}
                           />
                           <span className="media-upload-hint">
-                            {imageName ?? "Choose character image…"}
+                            {imageName ??
+                              (icLoraUnionSelected
+                                ? "Choose character image…"
+                                : "Choose start frame…")}
                           </span>
                         </label>
                       </div>
                       {videoLibraryClips.length > 0 && (
                         <label className="clip-source-picker">
                           <span className="media-upload-label">
-                            Or motion reference from library
+                            Or reference video from library
                           </span>
                           <select
                             value={conditioningClipId ?? ""}
@@ -2759,14 +2751,33 @@ export default function App() {
                           }
                         />
                       </label>
-                      {hasConditioningVideo && (
+                      <label className="check">
+                        <input
+                          type="checkbox"
+                          checked={skipStage2}
+                          onChange={(e) => setSkipStage2(e.target.checked)}
+                        />
+                        Skip stage 2 (half-res, faster)
+                      </label>
+                      {hasConditioningVideo ? (
                         <p className="media-source-note">
                           {conditioningClipId
-                            ? "Using library clip as motion reference."
-                            : "Using uploaded file as motion reference."}
+                            ? "Using library clip as reference video."
+                            : "Using uploaded file as reference video."}
                           {" "}
-                          Motion strength scales the reference clip weight; attention strength
+                          Motion strength scales the clip weight; attention strength
                           controls how tightly the model follows it (default 1.0).
+                        </p>
+                      ) : icLoraUnionSelected ? (
+                        <p className="media-source-note">
+                          Union Control needs a reference video (pose / motion).
+                        </p>
+                      ) : (
+                        <p className="media-source-note">
+                          No reference video — pure HDR text-to-video
+                          {imagePath ? " with start image (I2V)" : ""}.
+                          Output includes an SDR preview MP4 plus{" "}
+                          <code>.hdr.npz</code> when available.
                         </p>
                       )}
                     </>

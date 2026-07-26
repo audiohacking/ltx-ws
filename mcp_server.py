@@ -87,6 +87,7 @@ def _build_params(
     stage2_steps: int | None = None,
     no_regen_audio: bool = False,
     reference_strength: float | None = None,
+    skip_stage_2: bool = False,
 ) -> GenerationParams:
     normalized_mode = _normalize_mode(mode)
 
@@ -138,6 +139,7 @@ def _build_params(
         stage2_steps=stage2_steps,
         no_regen_audio=no_regen_audio,
         reference_strength=reference_strength,
+        skip_stage_2=bool(skip_stage_2),
     )
 
 
@@ -192,6 +194,7 @@ def _build_multi_job(
     lora_specs: list[tuple[str, float]],
     video_conditioning_specs: list[tuple[dict, float]],
     output_path: Path,
+    skip_stage_2: bool = False,
 ) -> Job:
     params = GenerationParams(
         prompt=prompt.strip(),
@@ -215,6 +218,7 @@ def _build_multi_job(
         extend_direction=extend_direction,
         lora_specs=lora_specs,
         video_conditioning_specs=video_conditioning_specs,
+        skip_stage_2=bool(skip_stage_2),
     )
     return Job(
         id=job_id,
@@ -250,10 +254,14 @@ async def ltx_generate_video(
     stage2_steps: int | None = None,
     no_regen_audio: bool = False,
     reference_strength: float | None = None,
+    skip_stage_2: bool = False,
     output_filename: str | None = None,
 ) -> dict[str, Any]:
     """
     Generate a single video clip through ltx-ws and return file/latency metadata.
+
+    For mode=ic_lora (HDR): video_conditioning and image are independently optional
+    (T2V / V2V / I2V). Pass HDR LoRA in lora_specs. skip_stage_2 skips the upscale stage.
     """
     if not prompt or not prompt.strip():
         raise ValueError("prompt is required")
@@ -314,6 +322,7 @@ async def ltx_generate_video(
         stage2_steps=stage2_steps,
         no_regen_audio=no_regen_audio,
         reference_strength=reference_strength,
+        skip_stage_2=skip_stage_2,
     )
 
     _OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -368,6 +377,7 @@ async def ltx_generate_sequence(
     stage2_steps: int | None = None,
     no_regen_audio: bool = False,
     reference_strength: float | None = None,
+    skip_stage_2: bool = False,
     output_prefix: str = DEFAULT_PREFIX,
 ) -> dict[str, Any]:
     """
@@ -448,6 +458,7 @@ async def ltx_generate_sequence(
                 lora_specs=parsed_loras,
                 video_conditioning_specs=parsed_vcond,
                 output_path=output_path,
+                skip_stage_2=skip_stage_2,
             )
         )
 

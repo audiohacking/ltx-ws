@@ -102,6 +102,7 @@ class GenerationRequest:
     no_regen_audio: bool = False
     reference_strength: float | None = None
     audio_start_seconds: float | None = None
+    skip_stage_2: bool = False
 
 
 # Pipelines that bind ``load_audio`` at import time (``from … import load_audio``).
@@ -1276,10 +1277,21 @@ def _unlink_fvserver_temp(path: str | None, marker: str) -> None:
 
 
 def _export_output_mp4(source_path: str) -> str:
-    """Copy generation output to a standalone temp file (outside per-job workdirs)."""
+    """Copy generation output to a standalone temp file (outside per-job workdirs).
+
+    When HDR IC-LoRA wrote ``<stem>.hdr.npz`` next to the MP4, copy that sidecar too.
+    """
     fd, final_path = mk_scratch_file(prefix="fvserver_out_", suffix=".mp4")
     os.close(fd)
     shutil.copy2(source_path, final_path)
+    hdr_src = Path(source_path).with_suffix(".hdr.npz")
+    if hdr_src.is_file():
+        hdr_dest = Path(final_path).with_suffix(".hdr.npz")
+        try:
+            shutil.copy2(hdr_src, hdr_dest)
+            log.info("Exported HDR tensor sidecar → %s", hdr_dest)
+        except OSError as exc:
+            log.warning("Could not export HDR .npz sidecar: %s", exc)
     return final_path
 
 
@@ -2011,6 +2023,13 @@ def _run_ic_lora_generation(
             "IC-LoRA Union motion transfer: stage2_steps=1 "
             "(override with stage2_steps in API)"
         )
+    if bool(getattr(req, "skip_stage_2", False)):
+        # Upstream hdr-ic-lora / ICLoraPipeline: half-res output, no upscale refine.
+        ic_kwargs.pop("upsample_only", None)
+        ic_kwargs.pop("refine_steps", None)
+        ic_kwargs.pop("stage2_steps", None)
+        ic_kwargs["skip_stage_2"] = True
+        log.info("IC-LoRA skip_stage_2=True (half-res output, no upscale stage)")
     if primary_lora and _is_crossview_lora_path(primary_lora[0]):
         log.info(
             "CrossView V2V: prompt must use the fixed vocabulary "
@@ -2687,6 +2706,7 @@ class LocalVideoGenerator:
         no_regen_audio: bool = False,
         reference_strength: float | None = None,
         audio_start_seconds: float | None = None,
+        skip_stage_2: bool = False,
     ) -> str:
         self.clear_cancel()
         loop = asyncio.get_event_loop()
@@ -2723,6 +2743,7 @@ class LocalVideoGenerator:
                     no_regen_audio=no_regen_audio,
                     reference_strength=reference_strength,
                     audio_start_seconds=audio_start_seconds,
+                    skip_stage_2=bool(skip_stage_2),
                 ),
             ),
         )
@@ -2861,15 +2882,17 @@ class LocalVideoGenerator:
                     media_cleanups.append(cleanup)
                 elif path and marker in path:
                     media_cleanups.append(path)
-            if self._resolved_default_loras is not None and not req.lora_specs:
-                resolved_loras = list(self._resolved_default_loras)
-            elif mode in ("face_swap", "face-swap", "lipdub", "lip_dub"):
-                # Exclusive single-adapter modes: never stack global OmniNFT defaults.
+            if mode in ("face_swap", "face-swap", "lipdub", "lip_dub", "ic_lora"):
+                # Exclusive adapter modes: never stack global OmniNFT defaults.
+                # V2V maps to ic_lora — empty request = pure reference conditioning.
+                # CrossView / HDR / Union come only from the request (Web UI / MCP).
                 for lora_spec, lora_scale in (req.lora_specs or []):
                     lora_path, lora_cleanup = _resolve_lora_path(str(lora_spec))
                     resolved_loras.append((lora_path, float(lora_scale)))
                     if lora_cleanup:
                         tmp_lora_cleanup.append(lora_cleanup)
+            elif self._resolved_default_loras is not None and not req.lora_specs:
+                resolved_loras = list(self._resolved_default_loras)
             else:
                 for lora_spec, lora_scale in effective_loras:
                     lora_path, lora_cleanup = _resolve_lora_path(str(lora_spec))
