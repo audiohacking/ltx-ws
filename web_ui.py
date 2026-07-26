@@ -547,7 +547,7 @@ async def _save_upload_file(
     upload_dir: Path,
     *,
     kind: str = "image",
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """Persist multipart upload; avoids FastAPI UploadFile annotations (PEP 563 ForwardRef)."""
     form = await request.form()
     upload_file = form.get("file")
@@ -562,7 +562,15 @@ async def _save_upload_file(
     dest = upload_dir / f"{uid}{ext}"
     content = await read()
     dest.write_bytes(content)
-    return {"path": str(dest), "filename": filename, "kind": kind}
+    out: dict[str, Any] = {"path": str(dest), "filename": filename, "kind": kind}
+    if kind == "video" and media_available():
+        try:
+            from ltx_media import summarize_video_for_retake
+
+            out["probe"] = summarize_video_for_retake(dest)
+        except Exception as exc:
+            log.warning("Video upload probe failed for %s: %s", dest, exc)
+    return out
 
 
 def local_hostname() -> str:
@@ -970,6 +978,46 @@ def _validate_source_video_request(state: AppState, body: dict[str, Any], ui_mod
         raise HTTPException(400, str(exc)) from exc
     if not resolved:
         raise HTTPException(400, f"{ui_mode} mode requires a source video (upload or library clip)")
+
+
+def _normalize_retake_range(state: AppState, body: dict[str, Any]) -> None:
+    """Clamp retake_start/end to latent bounds; default to full rewrite after frame 0."""
+    if not media_available():
+        return
+    try:
+        resolved = resolve_source_video_path(state, body)
+    except ValueError:
+        return
+    if not resolved:
+        return
+    try:
+        from ltx_media import summarize_video_for_retake
+
+        probe = summarize_video_for_retake(resolved)
+    except Exception as exc:
+        log.warning("Retake probe failed for %s: %s", resolved, exc)
+        return
+
+    latent_max = max(1, int(probe["latent_frames"]))
+    try:
+        start = int(body.get("retake_start")) if body.get("retake_start") is not None else None
+    except (TypeError, ValueError):
+        start = None
+    try:
+        end = int(body.get("retake_end")) if body.get("retake_end") is not None else None
+    except (TypeError, ValueError):
+        end = None
+
+    if start is None:
+        start = int(probe["suggested_start"])
+    if end is None or end <= start:
+        end = int(probe["suggested_end"])
+
+    start = max(0, min(start, latent_max - 1))
+    end = max(start + 1, min(end, latent_max))
+    body["retake_start"] = start
+    body["retake_end"] = end
+    body["retake_latent_frames"] = latent_max
 
 
 def _chain_clip_count(run: RunRecord) -> int:
@@ -3152,6 +3200,8 @@ def create_app(
         if ui_mode == "a2v" and not body.get("audio_path"):
             raise HTTPException(400, "a2v mode requires an audio upload")
         _validate_source_video_request(state, body, ui_mode)
+        if ui_mode == "retake":
+            _normalize_retake_range(state, body)
         body = _resolve_ic_lora_video_conditioning(state, body)
         if ui_mode == "v2v":
             if not body.get("video_conditioning"):
@@ -3450,6 +3500,29 @@ def create_app(
         except Exception as exc:
             log.exception("Upload failed for kind=%s", kind)
             raise HTTPException(500, f"Upload failed: {exc}") from exc
+
+    @app.post("/api/probe-video")
+    async def probe_video(request: Request):
+        """Return pixel/latent frame bounds for Retake UI (PyAV; no ffprobe)."""
+        if not media_available():
+            raise HTTPException(400, "Video probe requires PyAV — install with: pip install av")
+        body = await request.json()
+        try:
+            path = resolve_source_video_path(state, body if isinstance(body, dict) else {})
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        if not path and isinstance(body, dict) and body.get("path"):
+            candidate = Path(str(body["path"])).expanduser()
+            if candidate.is_file():
+                path = str(candidate.resolve())
+        if not path:
+            raise HTTPException(400, "path or source_clip_id is required")
+        try:
+            from ltx_media import summarize_video_for_retake
+
+            return {"ok": True, "probe": summarize_video_for_retake(path)}
+        except Exception as exc:
+            raise HTTPException(400, f"Could not probe video: {exc}") from exc
 
     @app.get("/api/frames")
     async def list_frames():

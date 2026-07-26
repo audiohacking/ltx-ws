@@ -20,12 +20,12 @@ import numpy as np
 from ltx_core_mlx.components.patchifiers import compute_video_latent_shape
 from ltx_core_mlx.conditioning.mask_utils import update_attention_mask
 from ltx_core_mlx.conditioning.types.latent_cond import LatentState
-from ltx_core_mlx.utils.ffmpeg import probe_video_info
 from ltx_core_mlx.utils.positions import (
     VIDEO_SPATIAL_SCALE,
     VIDEO_TEMPORAL_SCALE,
 )
-from ltx_core_mlx.utils.video import load_video_frames_normalized
+# Always use ltx-ws PyAV helpers — never Homebrew ffprobe/ffmpeg.
+from ltx_media import load_video_frames_normalized, probe_video_info
 
 logger = logging.getLogger(__name__)
 

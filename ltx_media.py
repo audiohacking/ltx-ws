@@ -190,6 +190,80 @@ def load_video_frames_normalized(
     return tensor.astype(mx.float32)
 
 
+def load_video_frames(
+    video_path: str,
+    height: int,
+    width: int,
+    num_frames: int,
+) -> Any:
+    """PyAV replacement for ``ltx_core_mlx.utils.image.load_video_frames``.
+
+    Returns ``(1, 3, F, H, W)`` in ``[-1, 1]`` as bfloat16 — the encoding range
+    Retake/Extend use (not the ``[0, 1]`` IC-LoRA normalized loader).
+    """
+    import mlx.core as mx
+    import numpy as np
+
+    require_media()
+    num_frames = max(1, int(num_frames))
+    frames_list: list[Any] = []
+
+    with av.open(str(video_path)) as container:
+        if not container.streams.video:
+            raise RuntimeError(f"No video stream found in {video_path}")
+        stream = container.streams.video[0]
+        for frame in container.decode(stream):
+            if len(frames_list) >= num_frames:
+                break
+            rgb = frame.reformat(width=width, height=height, format="rgb24")
+            arr = np.asarray(rgb.to_ndarray(), dtype=np.float32) / 255.0 * 2.0 - 1.0
+            frames_list.append(arr)
+
+    if not frames_list:
+        raise RuntimeError(f"No frames decoded from {video_path}")
+
+    stacked = np.stack(frames_list, axis=0)
+    # FHWC -> BCFHW
+    tensor = mx.array(stacked).transpose(3, 0, 1, 2)[None, ...]
+    return tensor.astype(mx.bfloat16)
+
+
+def vae_compatible_frame_count(num_frames: int) -> int:
+    """Round pixel frame count down to ``1 + 8k`` (LTX VAE temporal constraint)."""
+    n = max(1, int(num_frames))
+    k = max(1, (n - 1) // 8)
+    return 1 + k * 8
+
+
+def pixel_frames_to_latent_count(num_frames: int, *, temporal_compression: int = 8) -> int:
+    """Latent temporal length after VAE encode (matches ``compute_video_latent_shape``)."""
+    n = vae_compatible_frame_count(num_frames)
+    return max(1, (n + temporal_compression - 1) // temporal_compression)
+
+
+def summarize_video_for_retake(video_path: str | Path) -> dict[str, Any]:
+    """Probe a source clip and return Retake UI bounds (pixel + latent)."""
+    info = probe_video_info(str(video_path))
+    pixel_frames = vae_compatible_frame_count(int(info.num_frames))
+    latent_frames = pixel_frames_to_latent_count(pixel_frames)
+    fps = float(info.fps) if info.fps else 24.0
+    duration_s = (pixel_frames - 1) / fps if fps > 0 else 0.0
+    return {
+        "path": str(video_path),
+        "width": int(info.width),
+        "height": int(info.height),
+        "fps": fps,
+        "num_frames": pixel_frames,
+        "source_frames": int(info.num_frames),
+        "latent_frames": latent_frames,
+        "duration_s": round(duration_s, 3),
+        "has_audio": bool(info.has_audio),
+        # Sensible default: rewrite everything after the first latent token.
+        "suggested_start": 1 if latent_frames > 1 else 0,
+        "suggested_end": latent_frames,
+    }
+
+
 def probe_audio_duration(path: Path | str) -> float | None:
     """Return audio duration in seconds, or None when probing fails."""
     require_media()

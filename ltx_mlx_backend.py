@@ -111,11 +111,24 @@ _LOAD_AUDIO_STALE_IMPORTERS = (
     "ltx_pipelines_mlx.lipdub",
 )
 
-# Pipelines that bind video probe/load at import time.
+# Modules that bind video probe/load at import time (``from … import probe_video_info`` etc.).
 _VIDEO_IO_STALE_IMPORTERS = (
     "ltx_pipelines_mlx.iclora_utils",
     "ltx_pipelines_mlx.ic_lora",
     "ltx_pipelines_mlx.lipdub",
+    "ltx_pipelines_mlx.retake",
+    "ltx_ltxv_add_guide",
+)
+
+# Retake/Extend bind ``load_video_frames`` from ``ltx_core_mlx.utils.image``.
+_IMAGE_LOAD_VIDEO_STALE_IMPORTERS = (
+    "ltx_pipelines_mlx.retake",
+)
+
+_FFMPEG_DISABLED_MSG = (
+    "ltx-ws is PyAV-only for media I/O (pip install av). "
+    "System ffmpeg/ffprobe is disabled to avoid broken Homebrew dylibs. "
+    "If you see this error, an unpatched upstream code path was hit — report it."
 )
 
 
@@ -279,10 +292,12 @@ def _patch_video_io_pyav_only() -> None:
     """Replace upstream ffprobe/ffmpeg video probe and decode with PyAV."""
     try:
         import ltx_core_mlx.utils.ffmpeg as ffmpeg_mod
+        import ltx_core_mlx.utils.image as image_mod
         import ltx_core_mlx.utils.video as video_mod
     except ImportError:
         return
 
+    from ltx_media import load_video_frames as pyav_load_video_frames_encode
     from ltx_media import load_video_frames_normalized as pyav_load_video_frames
     from ltx_media import probe_video_info as pyav_probe_video_info
 
@@ -304,6 +319,14 @@ def _patch_video_io_pyav_only() -> None:
             stale_load = current_load
     video_mod.load_video_frames_normalized = pyav_load_video_frames
 
+    stale_encode_load = getattr(image_mod, "_ltx_ws_original_load_video_frames", None)
+    if stale_encode_load is None:
+        current_encode_load = image_mod.load_video_frames
+        if current_encode_load is not pyav_load_video_frames_encode:
+            image_mod._ltx_ws_original_load_video_frames = current_encode_load
+            stale_encode_load = current_encode_load
+    image_mod.load_video_frames = pyav_load_video_frames_encode
+
     if stale_probe is not None:
         for module_name in _VIDEO_IO_STALE_IMPORTERS:
             _rebind_module_attr(
@@ -320,10 +343,20 @@ def _patch_video_io_pyav_only() -> None:
                 pyav_load_video_frames,
                 stale=stale_load,
             )
+    if stale_encode_load is not None:
+        for module_name in _IMAGE_LOAD_VIDEO_STALE_IMPORTERS:
+            _rebind_module_attr(
+                module_name,
+                "load_video_frames",
+                pyav_load_video_frames_encode,
+                stale=stale_encode_load,
+            )
 
     ffmpeg_mod._ltx_ws_pyav_video_io_patched = True
     if first:
-        log.debug("PyAV video_io patch applied (IC-LoRA reference video probe/decode)")
+        log.debug(
+            "PyAV video_io patch applied (IC-LoRA + Retake probe/decode; no Homebrew ffprobe)"
+        )
 
 
 def _patch_iclora_stage2_x0_model() -> None:
@@ -385,6 +418,59 @@ def _patch_iclora_stage2_x0_model() -> None:
     log.info("Patched ICLoraPipeline Stage 2 to use clean X0Model after LoRA reload")
 
 
+def _patch_disable_system_ffmpeg() -> None:
+    """Make upstream ``find_ffmpeg`` / ``find_ffprobe`` fail loudly.
+
+    All production paths must use PyAV (``ltx_media``). Leaving Homebrew
+    discovery enabled silently resurfaces dyld errors (e.g. missing libx265)
+    when any unpatched call site remains.
+    """
+    try:
+        import ltx_core_mlx.utils.ffmpeg as ffmpeg_mod
+    except ImportError:
+        return
+
+    if getattr(ffmpeg_mod, "_ltx_ws_ffmpeg_disabled", False):
+        return
+
+    def _disabled_ffmpeg() -> str:
+        raise RuntimeError(_FFMPEG_DISABLED_MSG)
+
+    def _disabled_ffprobe() -> str:
+        raise RuntimeError(_FFMPEG_DISABLED_MSG)
+
+    if not hasattr(ffmpeg_mod, "_ltx_ws_original_find_ffmpeg"):
+        ffmpeg_mod._ltx_ws_original_find_ffmpeg = ffmpeg_mod.find_ffmpeg
+    if not hasattr(ffmpeg_mod, "_ltx_ws_original_find_ffprobe"):
+        ffmpeg_mod._ltx_ws_original_find_ffprobe = ffmpeg_mod.find_ffprobe
+
+    original_find = ffmpeg_mod._ltx_ws_original_find_ffmpeg
+    ffmpeg_mod.find_ffmpeg = _disabled_ffmpeg  # type: ignore[assignment]
+    ffmpeg_mod.find_ffprobe = _disabled_ffprobe  # type: ignore[assignment]
+
+    # Force-import known binders so we can rewrite their import-time aliases.
+    for module_name in (
+        "ltx_core_mlx.utils.image",
+        "ltx_core_mlx.utils.video",
+        "ltx_core_mlx.utils.audio",
+        "ltx_pipelines_mlx.utils.media_io",
+        "ltx_core_mlx.model.video_vae.video_vae",
+    ):
+        try:
+            __import__(module_name)
+        except ImportError:
+            continue
+        _rebind_module_attr(
+            module_name,
+            "find_ffmpeg",
+            _disabled_ffmpeg,
+            stale=original_find,
+        )
+
+    ffmpeg_mod._ltx_ws_ffmpeg_disabled = True
+    log.debug("System ffmpeg/ffprobe discovery disabled (PyAV-only)")
+
+
 def _apply_ltx_mlx_patches(*, default_fps: float = 24.0) -> None:
     """Apply all ltx-ws runtime patches (PyAV-only media, pipeline compat)."""
     _patch_media_io_pyav_only()
@@ -393,6 +479,8 @@ def _apply_ltx_mlx_patches(*, default_fps: float = 24.0) -> None:
     _patch_ltx_pipelines_compat(default_fps=default_fps)
     _patch_video_decode_pyav_only()
     _patch_iclora_stage2_x0_model()
+    # Last: tripwire so any remaining upstream ffmpeg body fails clearly.
+    _patch_disable_system_ffmpeg()
 
 
 def looks_like_hf_repo_id(model: str) -> bool:

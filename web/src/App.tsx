@@ -56,6 +56,17 @@ type LoraActivity =
   | { phase: "ready"; message: string }
   | { phase: "error"; message: string };
 
+type RetakeProbeInfo = {
+  latent_frames: number;
+  num_frames: number;
+  duration_s: number;
+  fps: number;
+  suggested_start: number;
+  suggested_end: number;
+  width?: number;
+  height?: number;
+};
+
 async function cacheVideoAsBlobUrl(serverUrl: string): Promise<string> {
   const res = await fetch(serverUrl);
   if (!res.ok) throw new Error(`Video download failed (${res.status})`);
@@ -351,7 +362,8 @@ export default function App() {
   const [referenceStrength, setReferenceStrength] = useState(1.0);
   const [sourceClipId, setSourceClipId] = useState<string | null>(null);
   const [retakeStart, setRetakeStart] = useState(1);
-  const [retakeEnd, setRetakeEnd] = useState(1);
+  const [retakeEnd, setRetakeEnd] = useState(13);
+  const [retakeProbe, setRetakeProbe] = useState<RetakeProbeInfo | null>(null);
   const [extendFrames, setExtendFrames] = useState(2);
   const [extendDirection, setExtendDirection] = useState("after");
   const [showOptions, setShowOptions] = useState(true);
@@ -661,6 +673,15 @@ export default function App() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- snapshot on mode enter only
   }, [mode, config?.ic_lora_preset_id, config?.ic_lora_motion_preset_id]);
+
+  useEffect(() => {
+    if (mode !== "retake") {
+      setRetakeProbe(null);
+      return;
+    }
+    void probeRetakeSource({ path: videoPath, sourceClipId });
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- probe when source changes
+  }, [mode, videoPath, sourceClipId]);
 
   useEffect(() => {
     if (mode !== "ic_lora" || !icLoraPresetId) return;
@@ -1250,6 +1271,14 @@ export default function App() {
   }
 
   async function uploadFile(file: File, kind: string): Promise<string> {
+    const data = await uploadFileDetailed(file, kind);
+    return data.path;
+  }
+
+  async function uploadFileDetailed(
+    file: File,
+    kind: string,
+  ): Promise<{ path: string; probe?: RetakeProbeInfo | null }> {
     const fd = new FormData();
     fd.append("file", file);
     const r = await fetch(`${API}/api/upload?kind=${kind}`, {
@@ -1267,8 +1296,45 @@ export default function App() {
             : `Upload failed: ${kind}`;
       throw new Error(message);
     }
-    const data = await r.json();
-    return data.path as string;
+    return (await r.json()) as { path: string; probe?: RetakeProbeInfo | null };
+  }
+
+  function applyRetakeProbe(probe: RetakeProbeInfo | null | undefined) {
+    if (!probe || !probe.latent_frames) {
+      setRetakeProbe(null);
+      return;
+    }
+    setRetakeProbe(probe);
+    setRetakeStart(probe.suggested_start);
+    setRetakeEnd(probe.suggested_end);
+  }
+
+  async function probeRetakeSource(opts: {
+    path?: string | null;
+    sourceClipId?: string | null;
+  }) {
+    const body: Record<string, string> = {};
+    if (opts.sourceClipId) body.source_clip_id = opts.sourceClipId;
+    else if (opts.path) body.path = opts.path;
+    else {
+      setRetakeProbe(null);
+      return;
+    }
+    try {
+      const r = await fetch(`${API}/api/probe-video`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) {
+        setRetakeProbe(null);
+        return;
+      }
+      const data = await r.json();
+      applyRetakeProbe(data.probe as RetakeProbeInfo);
+    } catch {
+      setRetakeProbe(null);
+    }
   }
 
   async function changeModel(newModel: string, restart: boolean) {
@@ -2877,8 +2943,15 @@ export default function App() {
                             const f = e.target.files?.[0];
                             if (f) {
                               setSourceClipId(null);
-                              setVideoPath(await uploadFile(f, "video"));
-                              setVideoName(f.name);
+                              if (mode === "retake") {
+                                const data = await uploadFileDetailed(f, "video");
+                                setVideoPath(data.path);
+                                setVideoName(f.name);
+                                applyRetakeProbe(data.probe);
+                              } else {
+                                setVideoPath(await uploadFile(f, "video"));
+                                setVideoName(f.name);
+                              }
                             }
                           }}
                         />
@@ -2937,22 +3010,80 @@ export default function App() {
                 <div className="options-grid">
                   {mode === "retake" && (
                     <>
+                      <p className="hint hint-inline" style={{ gridColumn: "1 / -1" }}>
+                        Retake regenerates a <strong>latent</strong> time range with your
+                        prompt (≈8 pixel frames per latent step). Start is inclusive, end
+                        is exclusive. Default keeps the opening latent and rewrites the
+                        rest of the clip.
+                      </p>
+                      {retakeProbe && (
+                        <p className="media-source-note" style={{ gridColumn: "1 / -1" }}>
+                          Source ≈{retakeProbe.duration_s.toFixed(1)}s ·{" "}
+                          {retakeProbe.num_frames} frames @ {retakeProbe.fps.toFixed(0)}fps
+                          → <strong>{retakeProbe.latent_frames}</strong> latent steps
+                          (valid range 0…{retakeProbe.latent_frames})
+                        </p>
+                      )}
                       <label>
-                        Retake start
+                        Start (latent, inclusive)
                         <input
                           type="number"
+                          min={0}
+                          max={Math.max(0, (retakeProbe?.latent_frames ?? 16) - 1)}
                           value={retakeStart}
-                          onChange={(e) => setRetakeStart(Number(e.target.value))}
+                          onChange={(e) => {
+                            const next = Number(e.target.value);
+                            setRetakeStart(next);
+                            if (retakeEnd <= next) {
+                              setRetakeEnd(
+                                Math.min(
+                                  (retakeProbe?.latent_frames ?? next + 1),
+                                  next + 1,
+                                ),
+                              );
+                            }
+                          }}
                         />
                       </label>
                       <label>
-                        Retake end
+                        End (latent, exclusive)
                         <input
                           type="number"
+                          min={1}
+                          max={retakeProbe?.latent_frames ?? 64}
                           value={retakeEnd}
                           onChange={(e) => setRetakeEnd(Number(e.target.value))}
                         />
                       </label>
+                      <div className="media-upload-row" style={{ gridColumn: "1 / -1" }}>
+                        <button
+                          type="button"
+                          className="btn secondary"
+                          disabled={!retakeProbe}
+                          onClick={() => {
+                            if (!retakeProbe) return;
+                            setRetakeStart(retakeProbe.suggested_start);
+                            setRetakeEnd(retakeProbe.suggested_end);
+                          }}
+                        >
+                          Full clip rewrite
+                        </button>
+                        <button
+                          type="button"
+                          className="btn secondary"
+                          disabled={!retakeProbe || retakeProbe.latent_frames < 3}
+                          onClick={() => {
+                            if (!retakeProbe) return;
+                            const mid = Math.floor(retakeProbe.latent_frames / 3);
+                            setRetakeStart(mid);
+                            setRetakeEnd(
+                              Math.min(retakeProbe.latent_frames, mid + Math.max(2, mid)),
+                            );
+                          }}
+                        >
+                          Middle third
+                        </button>
+                      </div>
                     </>
                   )}
                   {mode === "extend" && (
