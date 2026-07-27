@@ -2422,6 +2422,7 @@ class LocalVideoGenerator:
 
         legacy_t2v_cls = getattr(lpm, "TextToVideoPipeline", None)
         legacy_i2v_cls = getattr(lpm, "ImageToVideoPipeline", None)
+        one_stage_cls = getattr(lpm, "TI2VidOneStagePipeline", None)
 
         a2v_cls = getattr(lpm, "A2VidPipelineTwoStage", None)
         if a2v_cls is None:
@@ -2435,18 +2436,21 @@ class LocalVideoGenerator:
             self._pipe_classes["t2v"] = legacy_t2v_cls
         elif generate_cls is not None:
             self._pipe_classes["t2v"] = generate_cls
+        # Upstream: I2V is ``image=`` on the same generate pipeline — not a separate
+        # slow TI2VidOneStagePipeline. Keep ``i2v`` as an alias of the fast/default
+        # generate class; ``one_stage`` is opt-in via pipeline_profile.
         if legacy_i2v_cls is not None:
             self._pipe_classes["i2v"] = legacy_i2v_cls
-            log.info("Using ImageToVideoPipeline for i2v / autocontinue conditioning")
-        else:
-            one_stage_i2v_cls = getattr(lpm, "TI2VidOneStagePipeline", None)
-            if one_stage_i2v_cls is not None:
-                self._pipe_classes["i2v"] = one_stage_i2v_cls
-                log.info(
-                    "Using TI2VidOneStagePipeline for i2v / autocontinue conditioning"
-                )
-            elif generate_cls is not None:
-                self._pipe_classes["i2v"] = generate_cls
+            log.info("Using ImageToVideoPipeline for legacy i2v alias")
+        elif generate_cls is not None:
+            self._pipe_classes["i2v"] = generate_cls
+            log.info(
+                "I2V uses %s via image= (same pipeline as T2V; profile selects speed/quality)",
+                getattr(generate_cls, "__name__", generate_cls),
+            )
+        if one_stage_cls is not None:
+            self._pipe_classes["one_stage"] = one_stage_cls
+            log.info("Registered MLX pipeline one_stage (TI2VidOneStagePipeline)")
         if generate_cls is not None:
             self._pipe_classes["gen"] = generate_cls
         if a2v_cls is not None:
@@ -2521,20 +2525,24 @@ class LocalVideoGenerator:
         log.info("MLX pipeline ready ✓ (%s)", key)
         return pipe
 
-    def _resolve_generate_pipe_key(self, profile: str, *, has_image: bool) -> str:
+    def _resolve_generate_pipe_key(self, profile: str, *, has_image: bool = False) -> str:
+        """Pick generate pipeline from ``pipeline_profile`` (not from image presence).
+
+        Upstream ltx-2-mlx supports I2V on every generate pipeline via ``image=``.
+        Switching to TI2VidOneStagePipeline just because a start image is set was
+        causing I2V to run the slow full-res CFG/dev path while T2V stayed on
+        DistilledPipeline.
+        """
+        del has_image  # kept for call-site compatibility; image does not change pipe
         profile = _normalize_pipeline_profile(profile)
         if profile == PIPE_PROFILE_TWO_STAGE and "two_stage" in self._pipe_classes:
             return "two_stage"
         if profile == PIPE_PROFILE_HQ and "hq" in self._pipe_classes:
             return "hq"
-        if profile == PIPE_PROFILE_ONE_STAGE:
-            if has_image and "i2v" in self._pipe_classes:
-                return "i2v"
-            return "t2v"
+        if profile == PIPE_PROFILE_ONE_STAGE and "one_stage" in self._pipe_classes:
+            return "one_stage"
         if self.upscale and "two_stage" in self._pipe_classes:
             return "two_stage"
-        if has_image and "i2v" in self._pipe_classes:
-            return "i2v"
         return "t2v"
 
     def _resolve_lora_specs(self, specs: list[tuple[str, float]]) -> tuple[list[tuple[str, float]], list[str]]:
@@ -2984,7 +2992,10 @@ class LocalVideoGenerator:
                                 "(avoids A2V re-conditioning on autocontinue frame)"
                             )
                             silent_path = os.path.join(tmpdir, "output_silent.mp4")
-                            pipe = self._get_pipe("i2v")
+                            # Same profile pipe as T2V/I2V (distilled by default), not
+                            # a dedicated one-stage CFG pipeline.
+                            pipe_key = self._resolve_generate_pipe_key(profile, has_image=True)
+                            pipe = self._get_pipe(pipe_key)
                             last_pipe = pipe
                             _invoke_generate_and_save(
                                 pipe,
@@ -3290,10 +3301,15 @@ class LocalVideoGenerator:
                                 width,
                                 height,
                             )
-                        # Separate i2v/two-stage instance: do not reuse the t2v pipe cache entry.
+                        # I2V: same generate pipeline as T2V for this profile; pass image=.
                         pipe_key = self._resolve_generate_pipe_key(profile, has_image=True)
                         pipe = self._get_pipe(pipe_key)
                         last_pipe = pipe
+                        log.info(
+                            "I2V using pipeline key=%s (%s) with image conditioning",
+                            pipe_key,
+                            type(pipe).__name__,
+                        )
                         _invoke_generate_and_save(
                             pipe,
                             **common_gen_kwargs,
