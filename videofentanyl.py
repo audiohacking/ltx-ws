@@ -251,6 +251,7 @@ class GenerationParams:
     reference_strength: Optional[float] = None
     audio_start_seconds: Optional[float] = None
     negative_prompt: str = ""
+    skip_stage_2: bool = False
 
 
 @dataclasses.dataclass
@@ -390,6 +391,8 @@ def msg_simple_generate(p: GenerationParams) -> str:
         d["stg_scale"] = float(p.stg_scale)
     if p.stage2_steps is not None:
         d["stage2_steps"] = int(p.stage2_steps)
+    if getattr(p, "skip_stage_2", False):
+        d["skip_stage_2"] = True
     if p.no_regen_audio:
         d["no_regen_audio"] = True
     if p.reference_strength is not None:
@@ -1759,6 +1762,11 @@ examples:
     gen.add_argument("--stg-scale", type=float, default=None, metavar="F")
     gen.add_argument("--stage2-steps", type=int, default=None, metavar="N")
     gen.add_argument(
+        "--skip-stage-2",
+        action="store_true",
+        help="IC-LoRA / HDR: skip upscale stage (half-res output, faster)",
+    )
+    gen.add_argument(
         "--no-regen-audio",
         action="store_true",
         help="retake/extend: keep source audio instead of regenerating",
@@ -2109,6 +2117,7 @@ async def async_main(args: argparse.Namespace):
         "stage2_steps":            args.stage2_steps,
         "no_regen_audio":          bool(args.no_regen_audio),
         "reference_strength":      args.reference_strength,
+        "skip_stage_2":            bool(args.skip_stage_2),
     }
 
     # ── Build jobs ────────────────────────────────────────────────────────────

@@ -63,26 +63,119 @@ def test_prepare_ic_lora_video_conditioning_passthrough_hdr(tmp_path: Path):
     assert cleanup == []
 
 
-def test_prepare_ic_lora_video_conditioning_pose_extract(tmp_path: Path):
-    motion = tmp_path / "motion.mp4"
-    motion.write_bytes(b"x")
-    pose_out = tmp_path / "ic_lora_pose_control.mp4"
-    with patch("ltx_mlx_backend._ic_lora_uses_hdr_pipeline", return_value=False):
-        with patch("ltx_mlx_backend._ic_lora_reference_downscale_factor", return_value=2):
-            with patch("ltx_ic_lora_preprocess.require_pose_control"):
+def test_prepare_ic_lora_video_conditioning_empty_t2v(tmp_path: Path):
+    """HDR pure T2V: empty video_conditioning is valid (matches upstream hdr-ic-lora)."""
+    with patch("ltx_mlx_backend._ic_lora_uses_hdr_pipeline", return_value=True):
+        vc, cleanup = _prepare_ic_lora_video_conditioning(
+            [],
+            resolved_loras=[("/loras/ic-lora-hdr-0.9.safetensors", 1.0)],
+            width=512,
+            height=288,
+            num_frames=25,
+            fps=24.0,
+            tmpdir=str(tmp_path),
+        )
+    assert vc == []
+    assert cleanup == []
+
+
+def test_run_ic_lora_generation_hdr_t2v_allows_empty_vcond(tmp_path: Path):
+    """HDR path must not require a reference video."""
+    from unittest.mock import MagicMock
+
+    from ltx_mlx_backend import GenerationRequest, _run_ic_lora_generation
+
+    out = tmp_path / "out.mp4"
+    req = GenerationRequest(
+        prompt="hdr sunset",
+        mode="ic_lora",
+        skip_stage_2=True,
+        reference_strength=0.8,
+    )
+    gen = MagicMock()
+    gen.fps = 24.0
+    gen.spill_dir = None
+    pipe = MagicMock()
+    gen._get_pipe.return_value = pipe
+    captured: dict = {}
+
+    def _capture(p, **kwargs):
+        captured.update(kwargs)
+        captured["_pipe"] = p
+
+    with patch("ltx_mlx_backend._ic_lora_uses_hdr_pipeline", return_value=True):
+        with patch("ltx_mlx_backend._tune_ic_lora_strengths", side_effect=lambda x: x):
+            with patch(
+                "ltx_mlx_backend._prepare_ic_lora_video_conditioning",
+                return_value=([], []),
+            ):
                 with patch(
-                    "ltx_ic_lora_preprocess.render_pose_control_video",
-                    return_value=pose_out,
-                ) as render:
-                    vc, cleanup = _prepare_ic_lora_video_conditioning(
-                        [(str(motion), 0.85)],
-                        resolved_loras=[("/loras/union.safetensors", 1.0)],
-                        width=64,
-                        height=48,
-                        num_frames=25,
-                        fps=24.0,
+                    "ltx_mlx_backend._invoke_generate_and_save",
+                    side_effect=_capture,
+                ):
+                    _run_ic_lora_generation(
+                        gen,
+                        req=req,
+                        prompt="hdr sunset",
+                        resolved_loras=[("/loras/ic-lora-hdr-0.9.safetensors", 1.0)],
+                        vc_items=[],
+                        tmp_image=None,
                         tmpdir=str(tmp_path),
+                        out_path=str(out),
+                        width=512,
+                        height=288,
+                        nf=25,
+                        seed=1,
+                        steps=8,
+                        tmp_video_conditioning_cleanup=[],
                     )
-    render.assert_called_once()
-    assert vc == [(str(pose_out), 0.85)]
-    assert cleanup == [str(pose_out)]
+
+    gen._get_pipe.assert_called_once()
+    assert gen._get_pipe.call_args[0][0] == "hdr_ic_lora"
+    assert captured["video_conditioning"] == []
+    assert captured["skip_stage_2"] is True
+    assert captured["conditioning_attention_strength"] == pytest.approx(0.8)
+    assert "images" not in captured
+
+
+def test_run_ic_lora_generation_hdr_i2v_passes_image(tmp_path: Path):
+    from unittest.mock import MagicMock
+
+    from ltx_mlx_backend import GenerationRequest, _run_ic_lora_generation
+
+    img = tmp_path / "start.jpg"
+    img.write_bytes(b"x")
+    req = GenerationRequest(prompt="i2v", mode="ic_lora")
+    gen = MagicMock()
+    gen.fps = 24.0
+    gen.spill_dir = None
+    captured: dict = {}
+
+    with patch("ltx_mlx_backend._ic_lora_uses_hdr_pipeline", return_value=True):
+        with patch("ltx_mlx_backend._tune_ic_lora_strengths", side_effect=lambda x: x):
+            with patch(
+                "ltx_mlx_backend._prepare_ic_lora_video_conditioning",
+                return_value=([], []),
+            ):
+                with patch(
+                    "ltx_mlx_backend._invoke_generate_and_save",
+                    side_effect=lambda p, **kw: captured.update(kw),
+                ):
+                    _run_ic_lora_generation(
+                        gen,
+                        req=req,
+                        prompt="i2v",
+                        resolved_loras=[("/loras/ic-lora-hdr-0.9.safetensors", 1.0)],
+                        vc_items=[],
+                        tmp_image=str(img),
+                        tmpdir=str(tmp_path),
+                        out_path=str(tmp_path / "o.mp4"),
+                        width=512,
+                        height=288,
+                        nf=25,
+                        seed=1,
+                        steps=8,
+                        tmp_video_conditioning_cleanup=[],
+                    )
+
+    assert captured["images"] == [(str(img), 0, 1.0, IC_LORA_IMAGE_CRF)]

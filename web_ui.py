@@ -1561,9 +1561,33 @@ def _ic_lora_has_motion_reference(body: dict[str, Any]) -> bool:
     return False
 
 
-def _ic_lora_primary_spec(*, has_motion: bool, has_character: bool) -> str:
-    if has_motion and has_character:
+def _ic_lora_specs_list(body: dict[str, Any]) -> list[str]:
+    specs: list[str] = []
+    for item in body.get("lora_specs") or []:
+        if isinstance(item, (list, tuple)) and item:
+            spec = str(item[0]).strip()
+            if spec:
+                specs.append(spec)
+    return specs
+
+
+def _ic_lora_is_union_request(body: dict[str, Any]) -> bool:
+    """True when the user explicitly selected Union Control (not HDR)."""
+    return IC_LORA_UNION_MOTION_SPEC in _ic_lora_specs_list(body)
+
+
+def _ic_lora_primary_spec(*, selected_specs: list[str] | None = None) -> str:
+    """Choose built-in primary LoRA.
+
+    Upstream ``hdr-ic-lora`` defaults to the HDR adapter. Image and/or video are
+    optional inputs on that path — they must **not** auto-switch to Union Control.
+    Union is opt-in via the LoRA picker (or an explicit Union spec in the request).
+    """
+    selected = list(selected_specs or [])
+    if IC_LORA_UNION_MOTION_SPEC in selected:
         return IC_LORA_UNION_MOTION_SPEC
+    if IC_LORA_DEFAULT_SPEC in selected:
+        return IC_LORA_DEFAULT_SPEC
     return IC_LORA_DEFAULT_SPEC
 
 
@@ -1571,9 +1595,8 @@ def _apply_ic_lora_defaults(body: dict[str, Any]) -> dict[str, Any]:
     """Ensure a sensible primary IC-LoRA; keep extra user-selected LoRAs.
 
   - Custom-only LoRA list (e.g. CrossView Prompt) → leave as-is (no HDR/Union inject).
-  - Motion video + character image → Union Control (pose motion transfer).
-  - Motion video only → HDR IC-LoRA (V2V / T2V + reference video).
-  - No motion video → HDR IC-LoRA (pure T2V).
+  - Explicit Union Control selection → keep Union.
+  - Otherwise → HDR IC-LoRA (pure T2V, V2V, I2V, or I2V+V2V — image/video optional).
     """
     if (body.get("mode") or "generate").strip().lower() != "ic_lora":
         return body
@@ -1601,9 +1624,7 @@ def _apply_ic_lora_defaults(body: dict[str, Any]) -> dict[str, Any]:
         new_body["lora_specs"] = parsed
         return new_body
 
-    has_motion = _ic_lora_has_motion_reference(new_body)
-    has_character = bool(new_body.get("image_path"))
-    primary = _ic_lora_primary_spec(has_motion=has_motion, has_character=has_character)
+    primary = _ic_lora_primary_spec(selected_specs=[spec for spec, _ in parsed])
     merged: list[list[Any]] = [[primary, IC_LORA_DEFAULT_SCALE]]
     seen = {primary}
     for spec, scale in parsed:
@@ -1760,6 +1781,7 @@ def _build_params_from_request(body: dict[str, Any], *, state: AppState | None =
         reference_strength=_optional_float(body.get("reference_strength")),
         audio_start_seconds=audio_start_seconds,
         negative_prompt=str(body.get("negative_prompt") or "").strip(),
+        skip_stage_2=bool(body.get("skip_stage_2", False)),
     )
 
 
@@ -1942,6 +1964,7 @@ async def _run_clip_inprocess(
                         reference_strength=getattr(params, "reference_strength", None),
                         audio_start_seconds=getattr(params, "audio_start_seconds", None),
                         negative_prompt=str(getattr(params, "negative_prompt", "") or ""),
+                        skip_stage_2=bool(getattr(params, "skip_stage_2", False)),
                     )
                 )
                 while not gen_task.done():
@@ -1959,6 +1982,14 @@ async def _run_clip_inprocess(
 
             job.output_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(video_path, job.output_path)
+            hdr_src = Path(video_path).with_suffix(".hdr.npz")
+            if hdr_src.is_file():
+                hdr_dest = job.output_path.with_suffix(".hdr.npz")
+                try:
+                    shutil.copy2(hdr_src, hdr_dest)
+                    log.info("Saved HDR tensor next to clip: %s", hdr_dest)
+                except OSError as exc:
+                    log.warning("Could not save HDR .npz sidecar: %s", exc)
             job.file_bytes = job.output_path.stat().st_size
             job.chunk_count = 1
             job.ttff_ms = (time.time() - t0) * 1000
@@ -3170,16 +3201,16 @@ def create_app(
                     ) from exc
         if ui_mode == "ic_lora":
             body = _apply_ic_lora_defaults(body)
-            if not body.get("video_conditioning") and not body.get("image_path"):
-                # HDR T2V (upstream hdr-ic-lora without --video-conditioning).
-                pass
-            elif not body.get("video_conditioning"):
-                # Union / motion transfer always needs a reference clip.
+            is_union = _ic_lora_is_union_request(body)
+            if is_union and not body.get("video_conditioning"):
                 raise HTTPException(
                     400,
-                    "IC-LoRA with a character image requires a reference video "
-                    "(Union Control). For HDR text-to-video, omit the character image.",
+                    "Union Control requires a reference video for pose / motion transfer. "
+                    "For HDR text-to-video or image-to-video, select the HDR IC-LoRA preset "
+                    "(video optional).",
                 )
+            # HDR path (upstream hdr-ic-lora): video and image are independently optional
+            # → T2V / V2V / I2V / I2V+V2V.
             for lora_item in body.get("lora_specs") or []:
                 if not isinstance(lora_item, (list, tuple)) or not lora_item:
                     continue

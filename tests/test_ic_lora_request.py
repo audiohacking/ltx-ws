@@ -87,9 +87,11 @@ def test_apply_ic_lora_defaults_injects_hdr_lora():
     assert unchanged["lora_specs"] == [["x", 1.0]]
 
 
-def test_apply_ic_lora_defaults_union_for_motion_transfer(tmp_path: Path):
+def test_apply_ic_lora_defaults_hdr_when_image_and_video(tmp_path: Path):
+    """Image + video must stay on HDR unless Union is explicitly selected."""
     from web_ui import (
         IC_LORA_DEFAULT_SCALE,
+        IC_LORA_DEFAULT_SPEC,
         IC_LORA_UNION_MOTION_SPEC,
         _apply_ic_lora_defaults,
     )
@@ -104,6 +106,27 @@ def test_apply_ic_lora_defaults_union_for_motion_transfer(tmp_path: Path):
             "prompt": "portrait walking",
             "image_path": str(img),
             "video_conditioning": [[str(motion), 1.0]],
+        }
+    )
+    assert out["lora_specs"] == [[IC_LORA_DEFAULT_SPEC, IC_LORA_DEFAULT_SCALE]]
+    assert IC_LORA_UNION_MOTION_SPEC not in [row[0] for row in out["lora_specs"]]
+
+
+def test_apply_ic_lora_defaults_explicit_union(tmp_path: Path):
+    from web_ui import (
+        IC_LORA_DEFAULT_SCALE,
+        IC_LORA_UNION_MOTION_SPEC,
+        _apply_ic_lora_defaults,
+    )
+
+    motion = tmp_path / "motion.mp4"
+    motion.write_bytes(b"x")
+    out = _apply_ic_lora_defaults(
+        {
+            "mode": "ic_lora",
+            "prompt": "portrait walking",
+            "video_conditioning": [[str(motion), 1.0]],
+            "lora_specs": [[IC_LORA_UNION_MOTION_SPEC, 1.0]],
         }
     )
     assert out["lora_specs"] == [[IC_LORA_UNION_MOTION_SPEC, IC_LORA_DEFAULT_SCALE]]
@@ -258,7 +281,7 @@ def test_build_params_passes_reference_strength(tmp_path: Path):
     assert params.reference_strength == pytest.approx(1.25)
 
 
-def test_apply_ic_lora_defaults_strips_alternate_builtin():
+def test_apply_ic_lora_defaults_union_wins_over_hdr_when_both_selected():
     from web_ui import (
         IC_LORA_DEFAULT_SCALE,
         IC_LORA_DEFAULT_SPEC,
@@ -278,7 +301,8 @@ def test_apply_ic_lora_defaults_strips_alternate_builtin():
         }
     )
     specs = [row[0] for row in out["lora_specs"]]
-    assert specs == [IC_LORA_DEFAULT_SPEC]
+    assert specs == [IC_LORA_UNION_MOTION_SPEC]
+    assert out["lora_specs"][0][1] == IC_LORA_DEFAULT_SCALE
 
 
 def test_ic_lora_t2v_allows_missing_video_conditioning():
@@ -293,3 +317,52 @@ def test_ic_lora_t2v_allows_missing_video_conditioning():
     )
     assert params.generation_mode == "ic_lora"
     assert params.video_conditioning_specs == []
+    assert params.initial_image is None
+
+
+def test_ic_lora_i2v_without_video(tmp_path: Path):
+    from web_ui import IC_LORA_DEFAULT_SPEC, _build_params_from_request
+
+    img = tmp_path / "start.jpg"
+    img.write_bytes(b"\xff\xd8\xff\xd9")
+    params = _build_params_from_request(
+        {
+            "mode": "ic_lora",
+            "prompt": "cinematic push-in",
+            "image_path": str(img),
+            "lora_specs": [[IC_LORA_DEFAULT_SPEC, 1.0]],
+        }
+    )
+    assert params.generation_mode == "ic_lora"
+    assert params.initial_image is not None
+    assert params.video_conditioning_specs == []
+
+
+def test_build_params_passes_skip_stage_2():
+    from web_ui import IC_LORA_DEFAULT_SPEC, _build_params_from_request
+
+    params = _build_params_from_request(
+        {
+            "mode": "ic_lora",
+            "prompt": "hdr test",
+            "lora_specs": [[IC_LORA_DEFAULT_SPEC, 1.0]],
+            "skip_stage_2": True,
+        }
+    )
+    assert params.skip_stage_2 is True
+
+
+def test_ic_lora_is_union_request_detection():
+    from web_ui import (
+        IC_LORA_DEFAULT_SPEC,
+        IC_LORA_UNION_MOTION_SPEC,
+        _ic_lora_is_union_request,
+    )
+
+    assert _ic_lora_is_union_request(
+        {"lora_specs": [[IC_LORA_UNION_MOTION_SPEC, 1.0]]}
+    )
+    assert not _ic_lora_is_union_request(
+        {"lora_specs": [[IC_LORA_DEFAULT_SPEC, 1.0]]}
+    )
+    assert not _ic_lora_is_union_request({"lora_specs": []})

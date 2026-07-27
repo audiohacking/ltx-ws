@@ -864,6 +864,7 @@ class RequestHandler:
                         no_regen_audio=_msg_bool(msg, "no_regen_audio"),
                         reference_strength=_msg_float(msg, "reference_strength"),
                         audio_start_seconds=_msg_float(msg, "audio_start_seconds"),
+                        skip_stage_2=_msg_bool(msg, "skip_stage_2"),
                     )
                 )
                 try:
