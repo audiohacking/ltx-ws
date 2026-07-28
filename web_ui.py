@@ -3224,6 +3224,17 @@ def create_app(
                     ) from exc
         if ui_mode == "keyframe" and (not body.get("image_path") or not body.get("end_image_path")):
             raise HTTPException(400, "keyframe mode requires start and end image uploads")
+        if ui_mode == "retake":
+            try:
+                rs = int(body.get("retake_start", 0))
+                re_ = int(body.get("retake_end", rs + 1))
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(400, "retake_start and retake_end must be integers") from exc
+            if re_ <= rs:
+                raise HTTPException(
+                    400,
+                    "retake requires retake_end > retake_start (end frame is exclusive)",
+                )
         if ui_mode == "lipdub":
             lora_items = body.get("lora_specs") or []
             if len(lora_items) != 1:

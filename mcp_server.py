@@ -195,6 +195,11 @@ def _build_multi_job(
     video_conditioning_specs: list[tuple[dict, float]],
     output_path: Path,
     skip_stage_2: bool = False,
+    end_image_payload: dict | None = None,
+    no_regen_audio: bool = False,
+    reference_strength: float | None = None,
+    cfg_scale: float | None = None,
+    stg_scale: float | None = None,
 ) -> Job:
     params = GenerationParams(
         prompt=prompt.strip(),
@@ -204,6 +209,7 @@ def _build_multi_job(
         auto_extension_enabled=False,
         loop_generation_enabled=False,
         initial_image=image_payload,
+        end_image=end_image_payload,
         seed=seed,
         num_frames=num_frames,
         height=height,
@@ -219,6 +225,10 @@ def _build_multi_job(
         lora_specs=lora_specs,
         video_conditioning_specs=video_conditioning_specs,
         skip_stage_2=bool(skip_stage_2),
+        no_regen_audio=bool(no_regen_audio),
+        reference_strength=reference_strength,
+        cfg_scale=cfg_scale,
+        stg_scale=stg_scale,
     )
     return Job(
         id=job_id,
@@ -273,6 +283,8 @@ async def ltx_generate_video(
             raise ValueError("mode=retake requires video")
         if retake_start is None or retake_end is None:
             raise ValueError("mode=retake requires retake_start and retake_end")
+        if int(retake_end) <= int(retake_start):
+            raise ValueError("mode=retake requires retake_end > retake_start (end is exclusive)")
     if mode == "extend":
         if not video:
             raise ValueError("mode=extend requires video")
@@ -396,6 +408,8 @@ async def ltx_generate_sequence(
             raise ValueError("mode=retake requires video")
         if retake_start is None or retake_end is None:
             raise ValueError("mode=retake requires retake_start and retake_end")
+        if int(retake_end) <= int(retake_start):
+            raise ValueError("mode=retake requires retake_end > retake_start (end is exclusive)")
     if normalized_mode == "extend":
         if not video:
             raise ValueError("mode=extend requires video")
@@ -404,6 +418,21 @@ async def ltx_generate_sequence(
     if normalized_mode == "ic_lora":
         if not lora_specs:
             raise ValueError("mode=ic_lora requires lora_specs")
+    if normalized_mode == "keyframe":
+        if not image or not end_image:
+            raise ValueError("mode=keyframe requires image and end_image")
+    if normalized_mode == "lipdub":
+        if not video:
+            raise ValueError("mode=lipdub requires video (reference video)")
+        if not lora_specs or len(lora_specs) != 1:
+            raise ValueError("mode=lipdub requires exactly one lora_specs entry")
+    if normalized_mode == "face_swap":
+        if not video:
+            raise ValueError("mode=face_swap requires video (reference video)")
+        if not image:
+            raise ValueError("mode=face_swap requires image (face identity)")
+        if not lora_specs or len(lora_specs) != 1:
+            raise ValueError("mode=face_swap requires exactly one lora_specs entry (head swap LoRA)")
 
     method = (chain_method or CHAIN_METHOD_AUTOCONTINUE).strip().lower()
     if method not in VALID_CHAIN_METHODS:
@@ -417,6 +446,7 @@ async def ltx_generate_sequence(
             )
 
     image_payload = load_image_payload(image) if image else None
+    end_image_payload = load_image_payload(end_image) if end_image else None
     audio_payload = load_media_payload(audio, kind="audio") if audio else None
     video_payload = load_media_payload(video, kind="video") if video else None
 
@@ -459,6 +489,11 @@ async def ltx_generate_sequence(
                 video_conditioning_specs=parsed_vcond,
                 output_path=output_path,
                 skip_stage_2=skip_stage_2,
+                end_image_payload=end_image_payload,
+                no_regen_audio=no_regen_audio,
+                reference_strength=reference_strength,
+                cfg_scale=cfg_scale,
+                stg_scale=stg_scale,
             )
         )
 
@@ -523,6 +558,10 @@ async def ltx_generate_sequence(
                             f"autocontinue failed to extract last frame from clip {idx + 1}"
                         )
                     nxt.initial_image = next_frame
+                    prev_mode = (job.params.generation_mode or "").strip().lower()
+                    if prev_mode == "a2v":
+                        nxt.a2v_visual_i2v_continue = True
+                    nxt.seed = int(time.time_ns() % (2**31 - 1)) or 1
         if autoconcat:
             if method == CHAIN_METHOD_NATIVE_EXTEND:
                 await asyncio.to_thread(

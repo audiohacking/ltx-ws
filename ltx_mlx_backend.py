@@ -39,7 +39,17 @@ CHAIN_METHOD_AUTOCONTINUE = "autocontinue"
 CHAIN_METHOD_NATIVE_EXTEND = "native_extend"
 # ltx-2-mlx extend/retake: RetakePipeline + dev transformer + CFG (see docs/PIPELINES.md).
 RETAKE_EXTEND_DEFAULT_CFG = 3.0
-RETAKE_EXTEND_DEFAULT_STG = 0.0
+RETAKE_EXTEND_DEFAULT_STG = 1.0
+# Standalone extend: latent tokens (~8 pixel frames each). 15 ≈ ~5s added @ 24fps.
+DEFAULT_EXTEND_LATENT_FRAMES = 15
+# A2V is always two-stage CFG — distilled UI defaults (8 steps) under-step it.
+A2V_DEFAULT_STAGE1_STEPS = 30
+A2V_MIN_STAGE1_STEPS = 20
+# Keyframe interpolation requires upstream two-stage ctor filenames.
+KEYFRAME_DEV_TRANSFORMER = "transformer-dev.safetensors"
+KEYFRAME_DISTILLED_LORA = "ltx-2.3-22b-distilled-lora-384.safetensors"
+KEYFRAME_DISTILLED_LORA_ALT = "ltx-2.3-22b-distilled-lora-384-1.1.safetensors"
+KEYFRAME_DEFAULT_CFG = 3.0
 VALID_CHAIN_METHODS = frozenset({CHAIN_METHOD_AUTOCONTINUE, CHAIN_METHOD_NATIVE_EXTEND})
 
 PIPE_PROFILE_DISTILLED = "distilled"
@@ -1352,7 +1362,8 @@ def _apply_optional_generate_kwargs(call_kwargs: dict[str, Any], req: Generation
     if req.stage2_steps is not None:
         call_kwargs["stage2_steps"] = int(req.stage2_steps)
     if req.no_regen_audio:
-        call_kwargs["no_regen_audio"] = True
+        # Upstream RetakePipeline uses regenerate_audio= (default True).
+        call_kwargs["regenerate_audio"] = False
     if req.reference_strength is not None:
         call_kwargs["reference_strength"] = float(req.reference_strength)
     if req.audio_start_seconds is not None and float(req.audio_start_seconds) > 0:
@@ -1360,6 +1371,45 @@ def _apply_optional_generate_kwargs(call_kwargs: dict[str, Any], req: Generation
     neg = (req.negative_prompt or "").strip()
     if neg:
         call_kwargs["negative_prompt"] = neg
+
+
+def _keyframe_pipe_kwargs(model_dir: str | Path | None) -> dict[str, Any]:
+    """Ctor kwargs for KeyframeInterpolationPipeline (dev DiT + distilled LoRA)."""
+    root = Path(model_dir) if model_dir else None
+    distilled = KEYFRAME_DISTILLED_LORA
+    if root is not None:
+        if not (root / KEYFRAME_DEV_TRANSFORMER).is_file():
+            raise RuntimeError(
+                "Keyframe interpolation requires transformer-dev.safetensors in the model "
+                "directory (dgrauet/ltx-2.3-mlx or ltx-2.3-mlx-q8 — not distilled-only)."
+            )
+        if (root / KEYFRAME_DISTILLED_LORA).is_file():
+            distilled = KEYFRAME_DISTILLED_LORA
+        elif (root / KEYFRAME_DISTILLED_LORA_ALT).is_file():
+            distilled = KEYFRAME_DISTILLED_LORA_ALT
+        else:
+            raise RuntimeError(
+                "Keyframe interpolation requires a distilled LoRA for stage 2 "
+                f"({KEYFRAME_DISTILLED_LORA} or {KEYFRAME_DISTILLED_LORA_ALT}) in the model directory."
+            )
+    return {
+        "dev_transformer": KEYFRAME_DEV_TRANSFORMER,
+        "distilled_lora": distilled,
+        "distilled_lora_strength": 1.0,
+    }
+
+
+def _clamp_a2v_stage1_steps(steps: int) -> int:
+    """A2V is CFG two-stage; distilled UI defaults (8) are too low."""
+    n = max(1, int(steps))
+    if n < A2V_MIN_STAGE1_STEPS:
+        log.warning(
+            "a2v: raising stage1 steps from %d to %d (CFG two-stage; UI distilled defaults under-step)",
+            n,
+            A2V_DEFAULT_STAGE1_STEPS,
+        )
+        return A2V_DEFAULT_STAGE1_STEPS
+    return n
 
 
 def _frame_rate_from_kwargs(kwargs: dict[str, Any], default: float) -> float:
@@ -2890,10 +2940,10 @@ class LocalVideoGenerator:
                     media_cleanups.append(cleanup)
                 elif path and marker in path:
                     media_cleanups.append(path)
-            if mode in ("face_swap", "face-swap", "lipdub", "lip_dub", "ic_lora"):
+            if mode in ("face_swap", "face-swap", "lipdub", "lip_dub", "ic_lora", "keyframe"):
                 # Exclusive adapter modes: never stack global OmniNFT defaults.
                 # V2V maps to ic_lora — empty request = pure reference conditioning.
-                # CrossView / HDR / Union come only from the request (Web UI / MCP).
+                # CrossView / HDR / Union / keyframe come only from the request.
                 for lora_spec, lora_scale in (req.lora_specs or []):
                     lora_path, lora_cleanup = _resolve_lora_path(str(lora_spec))
                     resolved_loras.append((lora_path, float(lora_scale)))
@@ -2972,6 +3022,8 @@ class LocalVideoGenerator:
                     if mode == "a2v":
                         if not tmp_audio:
                             raise RuntimeError("a2v mode requires audio input")
+                        steps = _clamp_a2v_stage1_steps(steps)
+                        common_gen_kwargs["num_steps"] = steps
                         _apply_ltx_mlx_patches(default_fps=self.fps)
                         from ltx_media import load_audio_for_inference
 
@@ -3021,8 +3073,15 @@ class LocalVideoGenerator:
                     elif mode == "retake":
                         if not tmp_video:
                             raise RuntimeError("retake mode requires source video input")
-                        start_frame = int(req.retake_start if req.retake_start is not None else 1)
-                        end_frame = int(req.retake_end if req.retake_end is not None else start_frame)
+                        start_frame = int(req.retake_start if req.retake_start is not None else 0)
+                        end_frame = int(
+                            req.retake_end if req.retake_end is not None else start_frame + 1
+                        )
+                        if end_frame <= start_frame:
+                            raise RuntimeError(
+                                f"retake requires end_frame > start_frame "
+                                f"(got start={start_frame}, end={end_frame}; end is exclusive)"
+                            )
                         pipe = self._get_pipe("retake")
                         last_pipe = pipe
                         retake_steps = steps
@@ -3056,12 +3115,14 @@ class LocalVideoGenerator:
                                 "update ltx-2-mlx"
                             )
                         log.info(
-                            "Retake via retake_from_video (frames %s-%s, steps=%s, cfg=%.1f, stg=%.1f)",
+                            "Retake via retake_from_video (frames %s-%s exclusive end, "
+                            "steps=%s, cfg=%.1f, stg=%.1f, regenerate_audio=%s)",
                             start_frame,
                             end_frame,
                             retake_steps,
                             retake_cfg,
                             retake_stg,
+                            retake_kwargs.get("regenerate_audio", True),
                         )
                         _invoke_retake_and_save(
                             pipe,
@@ -3071,7 +3132,11 @@ class LocalVideoGenerator:
                     elif mode == "extend":
                         if not tmp_video:
                             raise RuntimeError("extend mode requires source video input")
-                        ext_frames = int(req.extend_frames if req.extend_frames is not None else 2)
+                        ext_frames = int(
+                            req.extend_frames
+                            if req.extend_frames is not None
+                            else DEFAULT_EXTEND_LATENT_FRAMES
+                        )
                         direction = (req.extend_direction or "after").strip().lower()
                         pipe = self._get_pipe("extend")
                         last_pipe = pipe
@@ -3107,8 +3172,10 @@ class LocalVideoGenerator:
                             )
                         log.info(
                             "Extend via extend_from_video "
-                            "(extend_frames=%s, direction=%s, steps=%s, cfg=%.1f, stg=%.1f)",
+                            "(latent_frames=%s ≈ ~%d pixel frames, direction=%s, "
+                            "steps=%s, cfg=%.1f, stg=%.1f)",
                             ext_frames,
+                            ext_frames * 8,
                             direction,
                             extend_steps,
                             extend_cfg,
@@ -3144,13 +3211,29 @@ class LocalVideoGenerator:
                     elif mode == "keyframe":
                         if not tmp_image or not tmp_end_image:
                             raise RuntimeError("keyframe mode requires start and end images")
-                        pipe = self._get_pipe("keyframe")
+                        pipe = self._get_pipe(
+                            "keyframe",
+                            pipe_kwargs=_keyframe_pipe_kwargs(self._model_path),
+                        )
                         last_pipe = pipe
+                        last_idx = max(0, int(nf) - 1)
+                        kf_cfg = float(
+                            req.cfg_scale if req.cfg_scale is not None else KEYFRAME_DEFAULT_CFG
+                        )
+                        kf_kwargs = dict(common_gen_kwargs)
+                        kf_kwargs.pop("image", None)
+                        kf_kwargs.pop("end_image", None)
+                        kf_kwargs["cfg_scale"] = kf_cfg
+                        log.info(
+                            "Keyframe interpolation: images=2 → indices [0, %d], cfg=%.1f",
+                            last_idx,
+                            kf_cfg,
+                        )
                         _invoke_generate_and_save(
                             pipe,
-                            **common_gen_kwargs,
-                            image=tmp_image,
-                            end_image=tmp_end_image,
+                            **kf_kwargs,
+                            keyframe_images=[tmp_image, tmp_end_image],
+                            keyframe_indices=[0, last_idx],
                         )
                     elif mode in ("lipdub", "lip_dub"):
                         if not tmp_video:

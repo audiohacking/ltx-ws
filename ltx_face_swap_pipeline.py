@@ -55,10 +55,12 @@ DEFAULT_GUIDE_STRENGTH = 1.0
 
 
 def _resolve_dev_transformer(model_dir: Path) -> str:
-    for name in ("transformer-dev.safetensors", "transformer.safetensors"):
-        if (model_dir / name).exists():
-            return name
-    return "transformer-dev.safetensors"
+    if (model_dir / "transformer-dev.safetensors").exists():
+        return "transformer-dev.safetensors"
+    raise RuntimeError(
+        "Face swap requires transformer-dev.safetensors in the model directory "
+        "(use dgrauet/ltx-2.3-mlx or ltx-2.3-mlx-q8 — distilled-only checkpoints are not enough)."
+    )
 
 
 def _count_lora_matches(model_sd: StateDict, lora_sd: StateDict) -> tuple[int, int]:
