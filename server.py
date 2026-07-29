@@ -85,9 +85,13 @@ def _ensure(pkg: str, import_as: str | None = None):
 websockets = _ensure("websockets")
 
 from ltx_mlx_backend import (
+    ENV_PRUNA_VAED_REPO,
+    ENV_VAE_DECODER,
     LocalVideoGenerator,
+    PRUNA_VAED_HF_REPO,
     looks_like_hf_repo_id,
     preview_mlx_weights_source,
+    set_vae_decoder_variant,
 )
 
 # ── Constants / defaults ───────────────────────────────────────────────────────
@@ -1192,6 +1196,16 @@ examples:
         ),
     )
     mdl.add_argument(
+        "--vae-decoder",
+        choices=["stock", "pruna"],
+        default=None,
+        help=(
+            "Video VAE decoder: 'stock' (default) or 'pruna' (PrunaVAED pruned decoder). "
+            f"Override via {ENV_VAE_DECODER}=pruna. Weights from "
+            f"{PRUNA_VAED_HF_REPO} (override with {ENV_PRUNA_VAED_REPO})."
+        ),
+    )
+    mdl.add_argument(
         "--lora",
         action="append",
         nargs=2,
@@ -1341,6 +1355,12 @@ def main() -> None:
                 parser.error("--lora path/repo cannot be empty")
             default_loras.append((path, scale))
 
+    vae_decoder = (args.vae_decoder or os.environ.get(ENV_VAE_DECODER, "stock") or "stock").strip().lower()
+    try:
+        set_vae_decoder_variant(vae_decoder)
+    except ValueError as exc:
+        parser.error(str(exc))
+
     # ── Validate / adjust num_frames ─────────────────────────────────────────
     valid_frames = _nearest_valid_frames(args.num_frames)
     if valid_frames != args.num_frames:
@@ -1406,6 +1426,7 @@ def main() -> None:
         print("  LoRA     : enabled (no defaults configured)")
     else:
         print("  LoRA     : disabled (use --enable-lora)")
+    print(f"  VAE dec  : {vae_decoder}")
     print(f"  low_mem  : {args.mlx_low_memory}")
     if args.upscale:
         print(

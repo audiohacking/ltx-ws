@@ -246,6 +246,151 @@ def _patch_video_decode_pyav_only() -> None:
 
     vv_mod.VideoDecoder.decode_and_stream = decode_and_stream
     vv_mod._ltx_ws_pyav_decode_patched = True
+    try:
+        from ltx_video_decoder_pruna import VideoDecoderPruna
+
+        VideoDecoderPruna.decode_and_stream = decode_and_stream  # type: ignore[method-assign]
+    except ImportError:
+        pass
+
+
+ENV_VAE_DECODER = "LTX_WS_VAE_DECODER"
+ENV_PRUNA_VAED_REPO = "LTX_WS_PRUNA_VAED_REPO"
+PRUNA_VAED_HF_REPO = "audiohacking/pruna-vaed-mlx"
+_VAE_DECODER_VARIANT: str = "stock"
+
+
+def set_vae_decoder_variant(variant: str) -> None:
+    """Select ``stock`` (default) or ``pruna`` VAE decoder for pipeline loads."""
+    global _VAE_DECODER_VARIANT
+    v = (variant or "stock").strip().lower()
+    if v not in ("stock", "pruna"):
+        raise ValueError(f"vae decoder variant must be 'stock' or 'pruna', got {variant!r}")
+    _VAE_DECODER_VARIANT = v
+
+
+def get_vae_decoder_variant() -> str:
+    return _VAE_DECODER_VARIANT
+
+
+def pruna_vaed_repo_id() -> str:
+    return (os.environ.get(ENV_PRUNA_VAED_REPO) or PRUNA_VAED_HF_REPO).strip() or PRUNA_VAED_HF_REPO
+
+
+def _pruna_vae_paths_in_dir(root: Path) -> tuple[Path, Path] | None:
+    """Return (weights, config) if both exist under ``root`` (or one level nested)."""
+    candidates = [
+        root,
+        root / "pruna-vaed-mlx",
+    ]
+    for base in candidates:
+        w = base / "vae_decoder_pruna.safetensors"
+        c = base / "vae_decoder_pruna_config.json"
+        if w.is_file() and c.is_file():
+            return w, c
+        if w.is_file():
+            return w, c  # config optional at construct time
+    return None
+
+
+def ensure_pruna_vae_decoder_files(model_dir: Path | None = None) -> tuple[Path, Path | None]:
+    """Locate or download PrunaVAED MLX weights from the Hub.
+
+    Search order:
+    1. ``model_dir`` / nested ``pruna-vaed-mlx``
+    2. ``REPO_ROOT/models/pruna-vaed-mlx`` (local convert output)
+    3. Cached Hub snapshot under ``models/audiohacking__pruna-vaed-mlx``
+    4. ``snapshot_download`` of :data:`PRUNA_VAED_HF_REPO` (overridable via
+       :data:`ENV_PRUNA_VAED_REPO`)
+    """
+    roots: list[Path] = []
+    if model_dir is not None:
+        roots.append(Path(model_dir))
+    roots.append(REPO_ROOT / "models" / "pruna-vaed-mlx")
+    roots.append(hf_local_weights_directory(pruna_vaed_repo_id(), None))
+
+    for root in roots:
+        found = _pruna_vae_paths_in_dir(root)
+        if found is not None:
+            w, c = found
+            return w, c if c.is_file() else None
+
+    # Download Hub package
+    from huggingface_hub import snapshot_download
+
+    dest = hf_local_weights_directory(pruna_vaed_repo_id(), None)
+    dest.mkdir(parents=True, exist_ok=True)
+    repo = pruna_vaed_repo_id()
+    log.info("Downloading PrunaVAED MLX decoder from %s → %s", repo, dest)
+    _snapshot_download_weights(snapshot_download, repo, dest)
+    found = _pruna_vae_paths_in_dir(dest)
+    if found is None:
+        raise FileNotFoundError(
+            f"Downloaded {repo} to {dest} but vae_decoder_pruna.safetensors is missing"
+        )
+    w, c = found
+    return w, c if c.is_file() else None
+
+
+def _patch_pruna_vae_decoder_loader() -> None:
+    """Swap TextToVideoPipeline._load_decoders to opt into VideoDecoderPruna."""
+    try:
+        from ltx_pipelines_mlx.ti2vid_one_stage import TextToVideoPipeline
+    except ImportError:
+        return
+    if getattr(TextToVideoPipeline, "_ltx_ws_pruna_vae_patched", False):
+        return
+
+    from ltx_core_mlx.model.audio_vae import AudioVAEDecoder, VocoderWithBWE
+    from ltx_core_mlx.utils.memory import aggressive_cleanup
+    from ltx_core_mlx.utils.weights import load_split_safetensors, remap_audio_vae_keys
+
+    _orig = TextToVideoPipeline._load_decoders
+
+    def _load_decoders(self) -> None:
+        if get_vae_decoder_variant() != "pruna":
+            return _orig(self)
+
+        model_dir = self.model_dir
+        if self.vae_decoder is None:
+            from ltx_video_decoder_pruna import VideoDecoderPruna
+
+            weights_path, cfg_path = ensure_pruna_vae_decoder_files(model_dir)
+            if cfg_path is not None:
+                self.vae_decoder = VideoDecoderPruna.from_config(cfg_path)
+            else:
+                self.vae_decoder = VideoDecoderPruna()
+            vae_weights = load_split_safetensors(weights_path, prefix="vae_decoder.")
+            self.vae_decoder.load_weights(list(vae_weights.items()))
+            aggressive_cleanup()
+            log.info("Loaded PrunaVAED decoder from %s", weights_path)
+
+        if self.audio_decoder is None:
+            self.audio_decoder = AudioVAEDecoder()
+            audio_weights = load_split_safetensors(
+                model_dir / "audio_vae.safetensors", prefix="audio_vae.decoder."
+            )
+            all_audio = load_split_safetensors(
+                model_dir / "audio_vae.safetensors", prefix="audio_vae."
+            )
+            for k, v in all_audio.items():
+                if k.startswith("per_channel_statistics."):
+                    audio_weights[k] = v
+            audio_weights = remap_audio_vae_keys(audio_weights)
+            self.audio_decoder.load_weights(list(audio_weights.items()))
+            aggressive_cleanup()
+
+        if self.vocoder is None:
+            self.vocoder = VocoderWithBWE()
+            vocoder_weights = load_split_safetensors(
+                model_dir / "vocoder.safetensors", prefix="vocoder."
+            )
+            self.vocoder.load_weights(list(vocoder_weights.items()))
+            self.vocoder.upcast_weights_to_fp32()
+            aggressive_cleanup()
+
+    TextToVideoPipeline._load_decoders = _load_decoders  # type: ignore[method-assign]
+    TextToVideoPipeline._ltx_ws_pruna_vae_patched = True
 
 
 def _patch_media_io_pyav_only() -> None:
@@ -393,6 +538,7 @@ def _apply_ltx_mlx_patches(*, default_fps: float = 24.0) -> None:
     _patch_video_io_pyav_only()
     _patch_ltx_pipelines_compat(default_fps=default_fps)
     _patch_video_decode_pyav_only()
+    _patch_pruna_vae_decoder_loader()
     _patch_iclora_stage2_x0_model()
 
 
