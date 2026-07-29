@@ -277,51 +277,79 @@ def pruna_vaed_repo_id() -> str:
     return (os.environ.get(ENV_PRUNA_VAED_REPO) or PRUNA_VAED_HF_REPO).strip() or PRUNA_VAED_HF_REPO
 
 
-def _pruna_vae_paths_in_dir(root: Path) -> tuple[Path, Path] | None:
-    """Return (weights, config) if both exist under ``root`` (or one level nested)."""
+def _pruna_vae_paths_in_dir(root: Path) -> tuple[Path, Path | None] | None:
+    """Return (weights, config_or_None) if weights exist under ``root`` (or one nested level)."""
     candidates = [
         root,
         root / "pruna-vaed-mlx",
     ]
     for base in candidates:
         w = base / "vae_decoder_pruna.safetensors"
+        if not w.is_file():
+            continue
         c = base / "vae_decoder_pruna_config.json"
-        if w.is_file() and c.is_file():
-            return w, c
-        if w.is_file():
-            return w, c  # config optional at construct time
+        return w, c if c.is_file() else None
     return None
 
 
+def preview_pruna_vae_source() -> str:
+    """Filesystem path where PrunaVAED MLX weights are or will be stored."""
+    for root in (
+        REPO_ROOT / "models" / "pruna-vaed-mlx",
+        hf_local_weights_directory(pruna_vaed_repo_id(), None),
+    ):
+        found = _pruna_vae_paths_in_dir(root)
+        if found is not None:
+            return str(found[0].parent)
+    return str(hf_local_weights_directory(pruna_vaed_repo_id(), None))
+
+
 def ensure_pruna_vae_decoder_files(model_dir: Path | None = None) -> tuple[Path, Path | None]:
-    """Locate or download PrunaVAED MLX weights from the Hub.
+    """Locate or download PrunaVAED MLX weights the same way as main MLX models.
 
     Search order:
-    1. ``model_dir`` / nested ``pruna-vaed-mlx``
-    2. ``REPO_ROOT/models/pruna-vaed-mlx`` (local convert output)
-    3. Cached Hub snapshot under ``models/audiohacking__pruna-vaed-mlx``
-    4. ``snapshot_download`` of :data:`PRUNA_VAED_HF_REPO` (overridable via
-       :data:`ENV_PRUNA_VAED_REPO`)
+    1. ``model_dir`` / nested ``pruna-vaed-mlx`` (optional co-located weights)
+    2. ``REPO_ROOT/models/pruna-vaed-mlx`` (local mlx-forge convert output)
+    3. Cached Hub snapshot under ``models/<org>__<name>/`` (same layout as
+       :func:`resolve_mlx_weights_directory`)
+    4. ``huggingface_hub.snapshot_download`` of :func:`pruna_vaed_repo_id`
     """
     roots: list[Path] = []
     if model_dir is not None:
         roots.append(Path(model_dir))
     roots.append(REPO_ROOT / "models" / "pruna-vaed-mlx")
-    roots.append(hf_local_weights_directory(pruna_vaed_repo_id(), None))
 
     for root in roots:
         found = _pruna_vae_paths_in_dir(root)
         if found is not None:
             w, c = found
-            return w, c if c.is_file() else None
+            log.info("Using existing local PrunaVAED MLX weights at %s", w)
+            return w, c
 
-    # Download Hub package
-    from huggingface_hub import snapshot_download
-
-    dest = hf_local_weights_directory(pruna_vaed_repo_id(), None)
-    dest.mkdir(parents=True, exist_ok=True)
     repo = pruna_vaed_repo_id()
-    log.info("Downloading PrunaVAED MLX decoder from %s → %s", repo, dest)
+    dest = hf_local_weights_directory(repo, None)
+    dest.mkdir(parents=True, exist_ok=True)
+    found = _pruna_vae_paths_in_dir(dest)
+    if found is not None:
+        w, c = found
+        log.info("Using existing local MLX snapshot for %r at %s", repo, dest)
+        return w, c
+
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as e:
+        raise RuntimeError(
+            "huggingface_hub is required to download PrunaVAED MLX weights from Hugging Face. "
+            "Install with:  pip install huggingface_hub\n"
+            f"Or place vae_decoder_pruna.safetensors under {dest}."
+        ) from e
+
+    log.info(
+        "Ensuring Hugging Face weights %r under %s "
+        "(huggingface_hub.snapshot_download; same payload as `huggingface-cli download`) …",
+        repo,
+        dest,
+    )
     _snapshot_download_weights(snapshot_download, repo, dest)
     found = _pruna_vae_paths_in_dir(dest)
     if found is None:
@@ -329,7 +357,8 @@ def ensure_pruna_vae_decoder_files(model_dir: Path | None = None) -> tuple[Path,
             f"Downloaded {repo} to {dest} but vae_decoder_pruna.safetensors is missing"
         )
     w, c = found
-    return w, c if c.is_file() else None
+    log.info("PrunaVAED MLX decoder ready at %s", w)
+    return w, c
 
 
 def _patch_pruna_vae_decoder_loader() -> None:
@@ -2556,6 +2585,10 @@ class LocalVideoGenerator:
         path = self._resolve_model_dir()
         self._model_path = path
         self._lpm_module = lpm
+
+        if get_vae_decoder_variant() == "pruna":
+            log.info("Resolving PrunaVAED MLX decoder weights (same Hub flow as --model) …")
+            ensure_pruna_vae_decoder_files(Path(path))
 
         generate_cls = getattr(lpm, "DistilledPipeline", None)
         if generate_cls is None:

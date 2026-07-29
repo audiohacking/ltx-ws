@@ -29,6 +29,40 @@ def test_ensure_pruna_resolves_local_or_hub():
     assert cfg is None or cfg.is_file()
 
 
+def test_ensure_pruna_downloads_via_snapshot_like_main_model(tmp_path, monkeypatch):
+    """When no local cache exists, use the same Hub snapshot_download path as --model."""
+    from pathlib import Path
+
+    import ltx_mlx_backend as backend
+
+    hub_dest = tmp_path / "audiohacking__pruna-vaed-mlx"
+    monkeypatch.setattr(backend, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(
+        backend,
+        "hf_local_weights_directory",
+        lambda repo_id, explicit: hub_dest,
+    )
+
+    def fake_snapshot(snapshot_download, repo_id, dest):
+        dest_p = Path(dest)
+        dest_p.mkdir(parents=True, exist_ok=True)
+        (dest_p / "vae_decoder_pruna.safetensors").write_bytes(b"fake")
+        (dest_p / "vae_decoder_pruna_config.json").write_text("{}")
+        assert repo_id == "audiohacking/pruna-vaed-mlx"
+        return str(dest_p)
+
+    monkeypatch.setattr(backend, "_snapshot_download_weights", fake_snapshot)
+    import sys
+    import types
+
+    if "huggingface_hub" not in sys.modules:
+        sys.modules["huggingface_hub"] = types.SimpleNamespace(snapshot_download=lambda **kw: None)
+
+    w, c = backend.ensure_pruna_vae_decoder_files()
+    assert w == hub_dest / "vae_decoder_pruna.safetensors"
+    assert c == hub_dest / "vae_decoder_pruna_config.json"
+
+
 def test_load_converted_weights_and_decode():
     from ltx_core_mlx.utils.weights import load_split_safetensors
 

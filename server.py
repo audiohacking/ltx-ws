@@ -91,6 +91,8 @@ from ltx_mlx_backend import (
     PRUNA_VAED_HF_REPO,
     looks_like_hf_repo_id,
     preview_mlx_weights_source,
+    preview_pruna_vae_source,
+    pruna_vaed_repo_id,
     set_vae_decoder_variant,
 )
 
@@ -1426,7 +1428,13 @@ def main() -> None:
         print("  LoRA     : enabled (no defaults configured)")
     else:
         print("  LoRA     : disabled (use --enable-lora)")
-    print(f"  VAE dec  : {vae_decoder}")
+    if vae_decoder == "pruna":
+        _pruna_preview = preview_pruna_vae_source()
+        print(
+            f"  VAE dec  : pruna  (HuggingFace → {_pruna_preview}  ({pruna_vaed_repo_id()}))"
+        )
+    else:
+        print(f"  VAE dec  : {vae_decoder}")
     print(f"  low_mem  : {args.mlx_low_memory}")
     if args.upscale:
         print(
@@ -1467,6 +1475,12 @@ def main() -> None:
     if default_loras:
         log.info("Resolving global LoRA(s) before accepting connections …")
         generator.ensure_default_loras_ready()
+    if vae_decoder == "pruna":
+        log.info(
+            "PrunaVAED decoder ready (%s → %s)",
+            pruna_vaed_repo_id(),
+            preview_pruna_vae_source(),
+        )
     log.info("Server ready — model path resolved; first used pipeline loads on demand.")
 
     # ── Start server ──────────────────────────────────────────────────────────
