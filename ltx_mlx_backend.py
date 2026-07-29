@@ -377,7 +377,11 @@ def _patch_pruna_vae_decoder_loader() -> None:
     _orig = TextToVideoPipeline._load_decoders
 
     def _load_decoders(self) -> None:
-        if get_vae_decoder_variant() != "pruna":
+        variant = get_vae_decoder_variant()
+        if variant != "pruna":
+            log.info(
+                "VAE decoder: stock  (pipeline default vae_decoder.safetensors)"
+            )
             return _orig(self)
 
         model_dir = self.model_dir
@@ -385,6 +389,10 @@ def _patch_pruna_vae_decoder_loader() -> None:
             from ltx_video_decoder_pruna import VideoDecoderPruna
 
             weights_path, cfg_path = ensure_pruna_vae_decoder_files(model_dir)
+            log.info(
+                "VAE decoder: pruna  (loading VideoDecoderPruna from %s)",
+                weights_path,
+            )
             if cfg_path is not None:
                 self.vae_decoder = VideoDecoderPruna.from_config(cfg_path)
             else:
@@ -392,7 +400,11 @@ def _patch_pruna_vae_decoder_loader() -> None:
             vae_weights = load_split_safetensors(weights_path, prefix="vae_decoder.")
             self.vae_decoder.load_weights(list(vae_weights.items()))
             aggressive_cleanup()
-            log.info("Loaded PrunaVAED decoder from %s", weights_path)
+            log.info("VAE decoder: pruna ready  (%s)", weights_path)
+        else:
+            log.info(
+                "VAE decoder: pruna  (reusing already-loaded VideoDecoderPruna)"
+            )
 
         if self.audio_decoder is None:
             self.audio_decoder = AudioVAEDecoder()
@@ -3097,7 +3109,7 @@ class LocalVideoGenerator:
                 "Generation effective params: mode=%s profile=%s enhance=%s seed=%s (requested=%s) "
                 "size=%sx%s frames=%s steps=%s fps=%s (requested size=%sx%s frames=%s steps=%s) "
                 "image=%s end_image=%s audio=%s video=%s retake=%s-%s extend=%s/%s vcond=%s loras=%s "
-                "model_path=%s",
+                "vae_decoder=%s model_path=%s",
                 mode,
                 profile if mode not in ("extend", "retake") else "dev+CFG",
                 "yes" if req.enhance_prompt else "no",
@@ -3122,6 +3134,7 @@ class LocalVideoGenerator:
                 (req.extend_direction or "after").strip().lower(),
                 len(vc_items),
                 len(resolved_loras),
+                get_vae_decoder_variant(),
                 self._model_path,
             )
             if resolved_loras:
