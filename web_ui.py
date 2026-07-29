@@ -2361,6 +2361,7 @@ async def _execute_run_embedded(state: AppState, run_id: str) -> None:
     run = state.runs[run_id]
     state.set_active_run(run_id)
     run.status = RunStatus.RUNNING.value
+    run_t0 = time.time()
     await state.emit(
         run_id,
         {
@@ -2507,6 +2508,17 @@ async def _execute_run_embedded(state: AppState, run_id: str) -> None:
                     if c.chain_id == run.chain_id and c.label == "CURRENT":
                         c.label = "EDIT"
                 clip.label = "CURRENT"
+                log.info(
+                    "Web UI clip e2e: run=%s clip=%d/%d status=ok elapsed=%.3fs "
+                    "gen_ms=%s e2e_ms=%s output_kb=%s",
+                    run_id,
+                    i + 1,
+                    total_clips,
+                    job.elapsed,
+                    int(job.gen_latency_ms) if job.gen_latency_ms is not None else "-",
+                    int(job.e2e_latency_ms) if job.e2e_latency_ms is not None else "-",
+                    (job.file_bytes or 0) // 1024,
+                )
                 await state.emit(
                     run_id,
                     _build_clip_done_event(run, clip_id, clip, i, total_clips),
@@ -2517,9 +2529,27 @@ async def _execute_run_embedded(state: AppState, run_id: str) -> None:
                 run.status = RunStatus.FAILED.value
                 run.error = clip.error
                 state.save_index()
+                log.info(
+                    "Web UI clip e2e: run=%s clip=%d/%d status=failed elapsed=%.3fs error=%r",
+                    run_id,
+                    i + 1,
+                    total_clips,
+                    job.elapsed,
+                    clip.error,
+                )
                 await state.emit(
                     run_id,
                     {"type": "clip_failed", "clip_id": clip_id, "error": clip.error},
+                )
+                log.info(
+                    "Web UI run e2e grandtotal: run=%s chain=%s clips=%d/%d status=failed "
+                    "wall=%.3fs (%dms)",
+                    run_id,
+                    run.chain_id,
+                    i + 1,
+                    total_clips,
+                    time.time() - run_t0,
+                    int((time.time() - run_t0) * 1000),
                 )
                 return
 
@@ -2537,6 +2567,18 @@ async def _execute_run_embedded(state: AppState, run_id: str) -> None:
 
         run.status = RunStatus.DONE.value
         state.save_index()
+        wall_s = time.time() - run_t0
+        log.info(
+            "Web UI run e2e grandtotal: run=%s chain=%s clips=%d/%d status=ok "
+            "wall=%.3fs (%dms) clip_elapsed_s=%s",
+            run_id,
+            run.chain_id,
+            total_clips,
+            total_clips,
+            wall_s,
+            int(wall_s * 1000),
+            [round(j.elapsed, 2) for j in jobs],
+        )
         await state.emit(
             run_id,
             {"type": "run_done", "run_id": run_id, "chain_id": run.chain_id},
@@ -2567,6 +2609,7 @@ async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
     run = state.runs[run_id]
     state.set_active_run(run_id)
     run.status = RunStatus.RUNNING.value
+    run_t0 = time.time()
     await state.emit(
         run_id,
         {
@@ -2712,6 +2755,17 @@ async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
                     if c.chain_id == run.chain_id and c.label == "CURRENT":
                         c.label = "EDIT"
                 clip.label = "CURRENT"
+                log.info(
+                    "Web UI clip e2e: run=%s clip=%d/%d status=ok elapsed=%.3fs "
+                    "gen_ms=%s e2e_ms=%s output_kb=%s",
+                    run_id,
+                    i + 1,
+                    total_clips,
+                    job.elapsed,
+                    int(job.gen_latency_ms) if job.gen_latency_ms is not None else "-",
+                    int(job.e2e_latency_ms) if job.e2e_latency_ms is not None else "-",
+                    (job.file_bytes or 0) // 1024,
+                )
                 await state.emit(
                     run_id,
                     _build_clip_done_event(run, clip_id, clip, i, total_clips),
@@ -2722,9 +2776,27 @@ async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
                 run.status = RunStatus.FAILED.value
                 run.error = clip.error
                 state.save_index()
+                log.info(
+                    "Web UI clip e2e: run=%s clip=%d/%d status=failed elapsed=%.3fs error=%r",
+                    run_id,
+                    i + 1,
+                    total_clips,
+                    job.elapsed,
+                    clip.error,
+                )
                 await state.emit(
                     run_id,
                     {"type": "clip_failed", "clip_id": clip_id, "error": clip.error},
+                )
+                log.info(
+                    "Web UI run e2e grandtotal: run=%s chain=%s clips=%d/%d status=failed "
+                    "wall=%.3fs (%dms)",
+                    run_id,
+                    run.chain_id,
+                    i + 1,
+                    total_clips,
+                    time.time() - run_t0,
+                    int((time.time() - run_t0) * 1000),
                 )
                 return
 
@@ -2742,6 +2814,18 @@ async def _execute_run_via_ws(state: AppState, run_id: str) -> None:
 
         run.status = RunStatus.DONE.value
         state.save_index()
+        wall_s = time.time() - run_t0
+        log.info(
+            "Web UI run e2e grandtotal: run=%s chain=%s clips=%d/%d status=ok "
+            "wall=%.3fs (%dms) clip_elapsed_s=%s",
+            run_id,
+            run.chain_id,
+            total_clips,
+            total_clips,
+            wall_s,
+            int(wall_s * 1000),
+            [round(j.elapsed, 2) for j in jobs],
+        )
         await state.emit(
             run_id,
             {"type": "run_done", "run_id": run_id, "chain_id": run.chain_id},

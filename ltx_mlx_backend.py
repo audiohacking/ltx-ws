@@ -2978,7 +2978,88 @@ class LocalVideoGenerator:
         except OSError as exc:
             log.error("  ✗ spill salvage failed: %s", exc)
 
+    def _log_generation_e2e_grandtotal(
+        self,
+        *,
+        status: str,
+        req: GenerationRequest,
+        t_e2e0: float,
+        mode: str,
+        height: int | str,
+        width: int | str,
+        frames: int | str,
+        steps: int | str,
+        seed: int | str,
+        output_path: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        """Single greppable wall-clock line for every generation attempt."""
+        e2e_s = time.time() - t_e2e0
+        e2e_ms = int(round(e2e_s * 1000))
+        out_kb: int | str = "-"
+        if output_path and os.path.isfile(output_path):
+            out_kb = os.path.getsize(output_path) // 1024
+        err_bit = f" error={error!r}" if error else ""
+        log.info(
+            "Generation e2e grandtotal: status=%s job=%s mode=%s vae_decoder=%s "
+            "seed=%s size=%sx%s frames=%s steps=%s e2e=%.3fs (%dms) output_kb=%s%s",
+            status,
+            (req.job_id[:8] if req.job_id else "-"),
+            mode,
+            get_vae_decoder_variant(),
+            seed,
+            height,
+            width,
+            frames,
+            steps,
+            e2e_s,
+            e2e_ms,
+            out_kb,
+            err_bit,
+        )
+
     def _generate_sync(self, req: GenerationRequest) -> str:
+        t_e2e0 = time.time()
+        ctx: dict[str, Any] = {
+            "mode": (req.mode or "generate").strip().lower(),
+            "height": "?",
+            "width": "?",
+            "frames": "?",
+            "steps": "?",
+            "seed": req.seed,
+            "status": "failed",
+            "output_path": None,
+            "error": None,
+        }
+        try:
+            result = self._generate_sync_timed(req, ctx=ctx)
+            ctx["status"] = "ok"
+            ctx["output_path"] = result
+            return result
+        except GenerationCancelledError as exc:
+            ctx["status"] = "cancelled"
+            ctx["error"] = str(exc)[:200]
+            raise
+        except BaseException as exc:
+            ctx["status"] = "failed"
+            ctx["error"] = str(exc)[:200]
+            raise
+        finally:
+            self._log_generation_e2e_grandtotal(
+                status=str(ctx["status"]),
+                req=req,
+                t_e2e0=t_e2e0,
+                mode=str(ctx["mode"]),
+                height=ctx["height"],
+                width=ctx["width"],
+                frames=ctx["frames"],
+                steps=ctx["steps"],
+                seed=ctx["seed"],
+                output_path=ctx.get("output_path"),
+                error=ctx.get("error"),
+            )
+
+    def _generate_sync_timed(self, req: GenerationRequest, *, ctx: dict[str, Any]) -> str:
         self._check_cancel()
         self.load()
         self._check_cancel()
@@ -3018,6 +3099,14 @@ class LocalVideoGenerator:
             # videofentanyl commonly sends -1 for "auto/random seed".
             seed = random.randint(0, 2**31 - 1)
             log.info("LTX random seed requested (%s); using generated seed %s", requested_seed, seed)
+        ctx.update(
+            mode=mode,
+            height=height,
+            width=width,
+            frames=nf,
+            steps=steps,
+            seed=seed,
+        )
         effective_loras: list[tuple[str, float]] = []
         if self._resolved_default_loras is not None:
             effective_loras.extend(self._resolved_default_loras)

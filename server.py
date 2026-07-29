@@ -964,11 +964,13 @@ class RequestHandler:
                 )
 
                 log.info(
-                    "  ✓ generation %s  sent %d KB in %.1fs  (gen=%.1fs)  prompt=%r",
+                    "Generation e2e grandtotal (ws): status=ok id=%s "
+                    "sent_kb=%d gen=%.3fs e2e=%.3fs (%dms) prompt=%r",
                     generation_id,
                     total_bytes // 1024,
-                    e2e_ms / 1000,
                     t_gen,
+                    e2e_ms / 1000,
+                    int(e2e_ms),
                     prompt[:72],
                 )
             except websockets.exceptions.ConnectionClosed:
