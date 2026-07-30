@@ -256,6 +256,192 @@ def _patch_video_decode_pyav_only() -> None:
 
     vv_mod.VideoDecoder.decode_and_stream = decode_and_stream
     vv_mod._ltx_ws_pyav_decode_patched = True
+    try:
+        from ltx_video_decoder_pruna import VideoDecoderPruna
+
+        VideoDecoderPruna.decode_and_stream = decode_and_stream  # type: ignore[method-assign]
+    except ImportError:
+        pass
+
+
+ENV_VAE_DECODER = "LTX_WS_VAE_DECODER"
+ENV_PRUNA_VAED_REPO = "LTX_WS_PRUNA_VAED_REPO"
+PRUNA_VAED_HF_REPO = "audiohacking/pruna-vaed-mlx"
+_VAE_DECODER_VARIANT: str = "stock"
+
+
+def set_vae_decoder_variant(variant: str) -> None:
+    """Select ``stock`` (default) or ``pruna`` VAE decoder for pipeline loads."""
+    global _VAE_DECODER_VARIANT
+    v = (variant or "stock").strip().lower()
+    if v not in ("stock", "pruna"):
+        raise ValueError(f"vae decoder variant must be 'stock' or 'pruna', got {variant!r}")
+    _VAE_DECODER_VARIANT = v
+
+
+def get_vae_decoder_variant() -> str:
+    return _VAE_DECODER_VARIANT
+
+
+def pruna_vaed_repo_id() -> str:
+    return (os.environ.get(ENV_PRUNA_VAED_REPO) or PRUNA_VAED_HF_REPO).strip() or PRUNA_VAED_HF_REPO
+
+
+def _pruna_vae_paths_in_dir(root: Path) -> tuple[Path, Path | None] | None:
+    """Return (weights, config_or_None) if weights exist under ``root`` (or one nested level)."""
+    candidates = [
+        root,
+        root / "pruna-vaed-mlx",
+    ]
+    for base in candidates:
+        w = base / "vae_decoder_pruna.safetensors"
+        if not w.is_file():
+            continue
+        c = base / "vae_decoder_pruna_config.json"
+        return w, c if c.is_file() else None
+    return None
+
+
+def preview_pruna_vae_source() -> str:
+    """Filesystem path where PrunaVAED MLX weights are or will be stored."""
+    for root in (
+        REPO_ROOT / "models" / "pruna-vaed-mlx",
+        hf_local_weights_directory(pruna_vaed_repo_id(), None),
+    ):
+        found = _pruna_vae_paths_in_dir(root)
+        if found is not None:
+            return str(found[0].parent)
+    return str(hf_local_weights_directory(pruna_vaed_repo_id(), None))
+
+
+def ensure_pruna_vae_decoder_files(model_dir: Path | None = None) -> tuple[Path, Path | None]:
+    """Locate or download PrunaVAED MLX weights the same way as main MLX models.
+
+    Search order:
+    1. ``model_dir`` / nested ``pruna-vaed-mlx`` (optional co-located weights)
+    2. ``REPO_ROOT/models/pruna-vaed-mlx`` (local mlx-forge convert output)
+    3. Cached Hub snapshot under ``models/<org>__<name>/`` (same layout as
+       :func:`resolve_mlx_weights_directory`)
+    4. ``huggingface_hub.snapshot_download`` of :func:`pruna_vaed_repo_id`
+    """
+    roots: list[Path] = []
+    if model_dir is not None:
+        roots.append(Path(model_dir))
+    roots.append(REPO_ROOT / "models" / "pruna-vaed-mlx")
+
+    for root in roots:
+        found = _pruna_vae_paths_in_dir(root)
+        if found is not None:
+            w, c = found
+            log.info("Using existing local PrunaVAED MLX weights at %s", w)
+            return w, c
+
+    repo = pruna_vaed_repo_id()
+    dest = hf_local_weights_directory(repo, None)
+    dest.mkdir(parents=True, exist_ok=True)
+    found = _pruna_vae_paths_in_dir(dest)
+    if found is not None:
+        w, c = found
+        log.info("Using existing local MLX snapshot for %r at %s", repo, dest)
+        return w, c
+
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as e:
+        raise RuntimeError(
+            "huggingface_hub is required to download PrunaVAED MLX weights from Hugging Face. "
+            "Install with:  pip install huggingface_hub\n"
+            f"Or place vae_decoder_pruna.safetensors under {dest}."
+        ) from e
+
+    log.info(
+        "Ensuring Hugging Face weights %r under %s "
+        "(huggingface_hub.snapshot_download; same payload as `huggingface-cli download`) …",
+        repo,
+        dest,
+    )
+    _snapshot_download_weights(snapshot_download, repo, dest)
+    found = _pruna_vae_paths_in_dir(dest)
+    if found is None:
+        raise FileNotFoundError(
+            f"Downloaded {repo} to {dest} but vae_decoder_pruna.safetensors is missing"
+        )
+    w, c = found
+    log.info("PrunaVAED MLX decoder ready at %s", w)
+    return w, c
+
+
+def _patch_pruna_vae_decoder_loader() -> None:
+    """Swap TextToVideoPipeline._load_decoders to opt into VideoDecoderPruna."""
+    try:
+        from ltx_pipelines_mlx.ti2vid_one_stage import TextToVideoPipeline
+    except ImportError:
+        return
+    if getattr(TextToVideoPipeline, "_ltx_ws_pruna_vae_patched", False):
+        return
+
+    from ltx_core_mlx.model.audio_vae import AudioVAEDecoder, VocoderWithBWE
+    from ltx_core_mlx.utils.memory import aggressive_cleanup
+    from ltx_core_mlx.utils.weights import load_split_safetensors, remap_audio_vae_keys
+
+    _orig = TextToVideoPipeline._load_decoders
+
+    def _load_decoders(self) -> None:
+        variant = get_vae_decoder_variant()
+        if variant != "pruna":
+            log.info(
+                "VAE decoder: stock  (pipeline default vae_decoder.safetensors)"
+            )
+            return _orig(self)
+
+        model_dir = self.model_dir
+        if self.vae_decoder is None:
+            from ltx_video_decoder_pruna import VideoDecoderPruna
+
+            weights_path, cfg_path = ensure_pruna_vae_decoder_files(model_dir)
+            log.info(
+                "VAE decoder: pruna  (loading VideoDecoderPruna from %s)",
+                weights_path,
+            )
+            if cfg_path is not None:
+                self.vae_decoder = VideoDecoderPruna.from_config(cfg_path)
+            else:
+                self.vae_decoder = VideoDecoderPruna()
+            vae_weights = load_split_safetensors(weights_path, prefix="vae_decoder.")
+            self.vae_decoder.load_weights(list(vae_weights.items()))
+            aggressive_cleanup()
+            log.info("VAE decoder: pruna ready  (%s)", weights_path)
+        else:
+            log.info(
+                "VAE decoder: pruna  (reusing already-loaded VideoDecoderPruna)"
+            )
+
+        if self.audio_decoder is None:
+            self.audio_decoder = AudioVAEDecoder()
+            audio_weights = load_split_safetensors(
+                model_dir / "audio_vae.safetensors", prefix="audio_vae.decoder."
+            )
+            all_audio = load_split_safetensors(
+                model_dir / "audio_vae.safetensors", prefix="audio_vae."
+            )
+            for k, v in all_audio.items():
+                if k.startswith("per_channel_statistics."):
+                    audio_weights[k] = v
+            audio_weights = remap_audio_vae_keys(audio_weights)
+            self.audio_decoder.load_weights(list(audio_weights.items()))
+            aggressive_cleanup()
+
+        if self.vocoder is None:
+            self.vocoder = VocoderWithBWE()
+            vocoder_weights = load_split_safetensors(
+                model_dir / "vocoder.safetensors", prefix="vocoder."
+            )
+            self.vocoder.load_weights(list(vocoder_weights.items()))
+            self.vocoder.upcast_weights_to_fp32()
+            aggressive_cleanup()
+
+    TextToVideoPipeline._load_decoders = _load_decoders  # type: ignore[method-assign]
+    TextToVideoPipeline._ltx_ws_pruna_vae_patched = True
 
 
 def _patch_media_io_pyav_only() -> None:
@@ -403,6 +589,7 @@ def _apply_ltx_mlx_patches(*, default_fps: float = 24.0) -> None:
     _patch_video_io_pyav_only()
     _patch_ltx_pipelines_compat(default_fps=default_fps)
     _patch_video_decode_pyav_only()
+    _patch_pruna_vae_decoder_loader()
     _patch_iclora_stage2_x0_model()
 
 
@@ -2461,6 +2648,10 @@ class LocalVideoGenerator:
         self._model_path = path
         self._lpm_module = lpm
 
+        if get_vae_decoder_variant() == "pruna":
+            log.info("Resolving PrunaVAED MLX decoder weights (same Hub flow as --model) …")
+            ensure_pruna_vae_decoder_files(Path(path))
+
         generate_cls = getattr(lpm, "DistilledPipeline", None)
         if generate_cls is None:
             generate_cls = getattr(lpm, "TextToVideoPipeline", None)
@@ -2837,7 +3028,88 @@ class LocalVideoGenerator:
         except OSError as exc:
             log.error("  ✗ spill salvage failed: %s", exc)
 
+    def _log_generation_e2e_grandtotal(
+        self,
+        *,
+        status: str,
+        req: GenerationRequest,
+        t_e2e0: float,
+        mode: str,
+        height: int | str,
+        width: int | str,
+        frames: int | str,
+        steps: int | str,
+        seed: int | str,
+        output_path: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        """Single greppable wall-clock line for every generation attempt."""
+        e2e_s = time.time() - t_e2e0
+        e2e_ms = int(round(e2e_s * 1000))
+        out_kb: int | str = "-"
+        if output_path and os.path.isfile(output_path):
+            out_kb = os.path.getsize(output_path) // 1024
+        err_bit = f" error={error!r}" if error else ""
+        log.info(
+            "Generation e2e grandtotal: status=%s job=%s mode=%s vae_decoder=%s "
+            "seed=%s size=%sx%s frames=%s steps=%s e2e=%.3fs (%dms) output_kb=%s%s",
+            status,
+            (req.job_id[:8] if req.job_id else "-"),
+            mode,
+            get_vae_decoder_variant(),
+            seed,
+            height,
+            width,
+            frames,
+            steps,
+            e2e_s,
+            e2e_ms,
+            out_kb,
+            err_bit,
+        )
+
     def _generate_sync(self, req: GenerationRequest) -> str:
+        t_e2e0 = time.time()
+        ctx: dict[str, Any] = {
+            "mode": (req.mode or "generate").strip().lower(),
+            "height": "?",
+            "width": "?",
+            "frames": "?",
+            "steps": "?",
+            "seed": req.seed,
+            "status": "failed",
+            "output_path": None,
+            "error": None,
+        }
+        try:
+            result = self._generate_sync_timed(req, ctx=ctx)
+            ctx["status"] = "ok"
+            ctx["output_path"] = result
+            return result
+        except GenerationCancelledError as exc:
+            ctx["status"] = "cancelled"
+            ctx["error"] = str(exc)[:200]
+            raise
+        except BaseException as exc:
+            ctx["status"] = "failed"
+            ctx["error"] = str(exc)[:200]
+            raise
+        finally:
+            self._log_generation_e2e_grandtotal(
+                status=str(ctx["status"]),
+                req=req,
+                t_e2e0=t_e2e0,
+                mode=str(ctx["mode"]),
+                height=ctx["height"],
+                width=ctx["width"],
+                frames=ctx["frames"],
+                steps=ctx["steps"],
+                seed=ctx["seed"],
+                output_path=ctx.get("output_path"),
+                error=ctx.get("error"),
+            )
+
+    def _generate_sync_timed(self, req: GenerationRequest, *, ctx: dict[str, Any]) -> str:
         self._check_cancel()
         self.load()
         self._check_cancel()
@@ -2877,6 +3149,14 @@ class LocalVideoGenerator:
             # videofentanyl commonly sends -1 for "auto/random seed".
             seed = random.randint(0, 2**31 - 1)
             log.info("LTX random seed requested (%s); using generated seed %s", requested_seed, seed)
+        ctx.update(
+            mode=mode,
+            height=height,
+            width=width,
+            frames=nf,
+            steps=steps,
+            seed=seed,
+        )
         effective_loras: list[tuple[str, float]] = []
         if self._resolved_default_loras is not None:
             effective_loras.extend(self._resolved_default_loras)
@@ -2968,7 +3248,7 @@ class LocalVideoGenerator:
                 "Generation effective params: mode=%s profile=%s enhance=%s seed=%s (requested=%s) "
                 "size=%sx%s frames=%s steps=%s fps=%s (requested size=%sx%s frames=%s steps=%s) "
                 "image=%s end_image=%s audio=%s video=%s retake=%s-%s extend=%s/%s vcond=%s loras=%s "
-                "model_path=%s",
+                "vae_decoder=%s model_path=%s",
                 mode,
                 profile if mode not in ("extend", "retake") else "dev+CFG",
                 "yes" if req.enhance_prompt else "no",
@@ -2993,6 +3273,7 @@ class LocalVideoGenerator:
                 (req.extend_direction or "after").strip().lower(),
                 len(vc_items),
                 len(resolved_loras),
+                get_vae_decoder_variant(),
                 self._model_path,
             )
             if resolved_loras:
