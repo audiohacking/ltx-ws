@@ -582,6 +582,73 @@ def _patch_iclora_stage2_x0_model() -> None:
     log.info("Patched ICLoraPipeline Stage 2 to use clean X0Model after LoRA reload")
 
 
+def _pad_audio_latent_to_token_count(audio_latent: Any, audio_T: int) -> Any:
+    """Pad/truncate audio VAE latent time dim to ``audio_T`` (silence = zeros)."""
+    import mlx.core as mx
+
+    t = int(audio_latent.shape[2])
+    target = int(audio_T)
+    if t == target:
+        return audio_latent
+    if t > target:
+        return audio_latent[:, :, :target, :]
+    pad = mx.zeros(
+        (audio_latent.shape[0], audio_latent.shape[1], target - t, audio_latent.shape[3]),
+        dtype=audio_latent.dtype,
+    )
+    return mx.concatenate([audio_latent, pad], axis=2)
+
+
+def _patch_a2v_short_audio_pad() -> None:
+    """Pad short A2V audio latents to the video token length (RoPE shape match).
+
+    Upstream ``A2VidPipelineTwoStage`` computes ``audio_T`` from ``num_frames`` but
+    only truncates encoded audio — it does not pad when the clip is shorter than
+    the requested video. That yields ``audio_tokens`` shorter than
+    ``compute_audio_positions(audio_T)`` and crashes in RoPE.
+    """
+    try:
+        from ltx_pipelines_mlx.a2vid_two_stage import A2VidPipelineTwoStage
+        import ltx_pipelines_mlx.a2vid_two_stage as a2v_mod
+    except ImportError:
+        return
+    if getattr(A2VidPipelineTwoStage, "_ltx_ws_short_audio_padded", False):
+        return
+
+    from ltx_core_mlx.utils.positions import compute_audio_token_count
+
+    orig = A2VidPipelineTwoStage.generate_and_save
+
+    @functools.wraps(orig)
+    def generate_and_save(self: Any, *args: Any, **kwargs: Any) -> Any:
+        bound = inspect.signature(orig).bind(self, *args, **kwargs)
+        bound.apply_defaults()
+        num_frames = int(bound.arguments["num_frames"])
+        frame_rate = float(bound.arguments["frame_rate"])
+        audio_T = compute_audio_token_count(num_frames, frame_rate)
+        real_encode = a2v_mod.encode_audio
+
+        def encode_audio(waveform: Any, sample_rate: Any, encoder: Any, processor: Any = None) -> Any:
+            lat = real_encode(waveform, sample_rate, encoder, processor)
+            t = int(lat.shape[2])
+            if t < audio_T:
+                log.info(
+                    "a2v: audio shorter than video — padded latent tokens %d → %d (silence)",
+                    t,
+                    audio_T,
+                )
+            return _pad_audio_latent_to_token_count(lat, audio_T)
+
+        a2v_mod.encode_audio = encode_audio  # type: ignore[assignment]
+        try:
+            return orig(self, *args, **kwargs)
+        finally:
+            a2v_mod.encode_audio = real_encode  # type: ignore[assignment]
+
+    A2VidPipelineTwoStage.generate_and_save = generate_and_save  # type: ignore[method-assign]
+    A2VidPipelineTwoStage._ltx_ws_short_audio_padded = True
+
+
 def _apply_ltx_mlx_patches(*, default_fps: float = 24.0) -> None:
     """Apply all ltx-ws runtime patches (PyAV-only media, pipeline compat)."""
     _patch_media_io_pyav_only()
@@ -591,6 +658,7 @@ def _apply_ltx_mlx_patches(*, default_fps: float = 24.0) -> None:
     _patch_video_decode_pyav_only()
     _patch_pruna_vae_decoder_loader()
     _patch_iclora_stage2_x0_model()
+    _patch_a2v_short_audio_pad()
 
 
 def looks_like_hf_repo_id(model: str) -> bool:

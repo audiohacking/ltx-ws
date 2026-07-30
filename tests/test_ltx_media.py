@@ -103,3 +103,18 @@ def test_load_audio_for_inference_trim(wav_174s: Path):
     assert loaded is not None
     assert loaded.sample_rate == 16000
     assert int(loaded.waveform.shape[-1]) == pytest.approx(15 * 16000, rel=0.05)
+
+
+def test_load_audio_for_inference_pads_short_clip(tmp_path: Path):
+    """A2V passes max_duration=video length; short audio must silence-pad, not stay short."""
+    pytest.importorskip("mlx.core")
+    pytest.importorskip("ltx_core_mlx")
+    src = tmp_path / "short.wav"
+    _write_wav(src, seconds=2.0, rate=16000)
+    loaded = ltx_media.load_audio_for_inference(
+        src,
+        target_sample_rate=16000,
+        max_duration=5.0,
+    )
+    assert loaded is not None
+    assert int(loaded.waveform.shape[-1]) == 5 * 16000

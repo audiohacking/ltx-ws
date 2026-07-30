@@ -44,6 +44,21 @@ def test_a2v_visual_continue_keeps_distilled_steps():
     assert _a2v_effective_stage1_steps(24, visual_i2v_continue=False) == 24
 
 
+def test_pad_audio_latent_to_token_count_pads_and_trims():
+    pytest.importorskip("mlx.core")
+    import mlx.core as mx
+
+    from ltx_mlx_backend import _pad_audio_latent_to_token_count
+
+    short = mx.zeros((1, 8, 338, 16))
+    padded = _pad_audio_latent_to_token_count(short, 376)
+    assert padded.shape == (1, 8, 376, 16)
+
+    long = mx.ones((1, 8, 400, 16))
+    trimmed = _pad_audio_latent_to_token_count(long, 376)
+    assert trimmed.shape == (1, 8, 376, 16)
+
+
 def test_a2v_with_image_uses_a2v_pipe_not_one_stage():
     """Optional start image stays on A2VidPipelineTwoStage — not TI2VidOneStagePipeline."""
     gen = LocalVideoGenerator.__new__(LocalVideoGenerator)

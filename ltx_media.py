@@ -1256,8 +1256,20 @@ def load_audio_for_inference(
         return None
     data = data[:, start_sample:]
     if max_duration is not None:
-        end_sample = int(float(max_duration) * sample_rate)
-        data = data[:, : max(0, end_sample)]
+        # Match A2V video length: truncate when longer, silence-pad when shorter.
+        # Upstream a2vid slices/pads token counts to ``compute_audio_token_count``;
+        # short audio without pad → RoPE broadcast errors (e.g. 338 vs 376 tokens).
+        target_samples = max(0, int(round(float(max_duration) * sample_rate)))
+        cur = int(data.shape[1])
+        if target_samples == 0:
+            return None
+        if cur > target_samples:
+            data = data[:, :target_samples]
+        elif cur < target_samples:
+            import numpy as np
+
+            pad = np.zeros((data.shape[0], target_samples - cur), dtype=data.dtype)
+            data = np.concatenate([data, pad], axis=1)
     if data.shape[1] == 0:
         return None
 
