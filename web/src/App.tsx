@@ -351,9 +351,9 @@ export default function App() {
   const [referenceStrength, setReferenceStrength] = useState(1.0);
   const [skipStage2, setSkipStage2] = useState(false);
   const [sourceClipId, setSourceClipId] = useState<string | null>(null);
-  const [retakeStart, setRetakeStart] = useState(1);
-  const [retakeEnd, setRetakeEnd] = useState(1);
-  const [extendFrames, setExtendFrames] = useState(2);
+  const [retakeStart, setRetakeStart] = useState(0);
+  const [retakeEnd, setRetakeEnd] = useState(12);
+  const [extendFrames, setExtendFrames] = useState(15);
   const [extendDirection, setExtendDirection] = useState("after");
   const [showOptions, setShowOptions] = useState(true);
   const [loraPresetIds, setLoraPresetIds] = useState<string[]>([]);
@@ -1592,13 +1592,15 @@ export default function App() {
     if (mode === "lipdub" && resolvedAudioPath) {
       body.audio_path = resolvedAudioPath;
     }
-    if (mode === "ic_lora" || mode === "v2v") {
-      if (conditioningVideoPath) {
-        body.conditioning_video_path = conditioningVideoPath;
-        body.conditioning_video_scale = conditioningVideoScale;
-      } else if (conditioningClipId) {
-        body.conditioning_clip_id = conditioningClipId;
-        body.conditioning_video_scale = conditioningVideoScale;
+    if (mode === "ic_lora" || mode === "v2v" || mode === "lipdub") {
+      if (mode === "ic_lora" || mode === "v2v") {
+        if (conditioningVideoPath) {
+          body.conditioning_video_path = conditioningVideoPath;
+          body.conditioning_video_scale = conditioningVideoScale;
+        } else if (conditioningClipId) {
+          body.conditioning_clip_id = conditioningClipId;
+          body.conditioning_video_scale = conditioningVideoScale;
+        }
       }
       body.reference_strength = referenceStrength;
     }
@@ -1699,6 +1701,8 @@ export default function App() {
     if ((mode === "retake" || mode === "extend" || mode === "lipdub" || mode === "face_swap") && !hasVideoSource) {
       return false;
     }
+    if (mode === "retake" && retakeEnd <= retakeStart) return false;
+    if (mode === "keyframe" && (!imagePath || !endImagePath)) return false;
     return true;
   }, [
     prompt,
@@ -1708,6 +1712,7 @@ export default function App() {
     isV2v,
     isIcLora,
     imagePath,
+    endImagePath,
     audioPath,
     audioFile,
     audiocontinue,
@@ -1726,6 +1731,8 @@ export default function App() {
     loraBusy,
     willContinueChain,
     audioStartSeconds,
+    retakeStart,
+    retakeEnd,
   ]);
 
   const fitPromptHeight = useCallback(() => {
@@ -2048,6 +2055,12 @@ export default function App() {
                   <select
                     value={durationId}
                     onChange={(e) => setDurationId(e.target.value)}
+                    disabled={isLipDub}
+                    title={
+                      isLipDub
+                        ? "LipDub length follows the reference video"
+                        : undefined
+                    }
                   >
                     {config.duration_presets.map((d) => (
                       <option key={d.id} value={d.id} title={d.label}>
@@ -2264,6 +2277,10 @@ export default function App() {
                       value={extendFrames}
                       onChange={(e) => setExtendFrames(Number(e.target.value))}
                     />
+                    <span className="hint hint-inline">
+                      ≈ ~{((extendFrames * 8) / 24).toFixed(1)}s added @ 24fps ({extendFrames * 8}{" "}
+                      pixel frames)
+                    </span>
                   </label>
                   <label>
                     Direction
@@ -2287,8 +2304,24 @@ export default function App() {
                         Lip-sync / dub a reference clip: visual motion from the video,
                         voice tone from uploaded audio (or the video&apos;s audio track),
                         and new dialogue in your prompt. Frame count follows the reference
-                        video. Requires the LipDub IC-LoRA.
+                        video (duration control disabled). Requires the LipDub IC-LoRA.
                       </p>
+                      <label className="ic-lora-scale">
+                        Reference attention strength
+                        <input
+                          type="number"
+                          min={0}
+                          max={1}
+                          step={0.05}
+                          value={referenceStrength}
+                          title="LipDub reference_strength (0–1)"
+                          onChange={(e) =>
+                            setReferenceStrength(
+                              Math.min(1, Math.max(0, Number(e.target.value) || 0)),
+                            )
+                          }
+                        />
+                      </label>
                       {!config?.lipdub_default_spec?.includes("buckets/audiohacking") && (
                         <p className="hint hint-inline">
                           LipDub weights are gated on Hugging Face — accept access at{" "}
@@ -2948,49 +2981,28 @@ export default function App() {
                 </div>
               )}
 
-              {(mode === "retake" || mode === "extend") && (
+              {mode === "retake" && (
                 <div className="options-grid">
-                  {mode === "retake" && (
-                    <>
-                      <label>
-                        Retake start
-                        <input
-                          type="number"
-                          value={retakeStart}
-                          onChange={(e) => setRetakeStart(Number(e.target.value))}
-                        />
-                      </label>
-                      <label>
-                        Retake end
-                        <input
-                          type="number"
-                          value={retakeEnd}
-                          onChange={(e) => setRetakeEnd(Number(e.target.value))}
-                        />
-                      </label>
-                    </>
-                  )}
-                  {mode === "extend" && (
-                    <>
-                      <label>
-                        Extend frames
-                        <input
-                          type="number"
-                          value={extendFrames}
-                          onChange={(e) => setExtendFrames(Number(e.target.value))}
-                        />
-                      </label>
-                      <label>
-                        Direction
-                        <select
-                          value={extendDirection}
-                          onChange={(e) => setExtendDirection(e.target.value)}
-                        >
-                          <option value="after">After</option>
-                          <option value="before">Before</option>
-                        </select>
-                      </label>
-                    </>
+                  <label>
+                    Retake start (latent, inclusive)
+                    <input
+                      type="number"
+                      min={0}
+                      value={retakeStart}
+                      onChange={(e) => setRetakeStart(Number(e.target.value))}
+                    />
+                  </label>
+                  <label>
+                    Retake end (latent, exclusive)
+                    <input
+                      type="number"
+                      min={retakeStart + 1}
+                      value={retakeEnd}
+                      onChange={(e) => setRetakeEnd(Number(e.target.value))}
+                    />
+                  </label>
+                  {retakeEnd <= retakeStart && (
+                    <p className="hint hint-inline">End must be greater than start (exclusive end).</p>
                   )}
                 </div>
               )}

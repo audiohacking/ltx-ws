@@ -1012,6 +1012,10 @@ class GenerationQueue:
                             nxt.initial_image = frame
                             # Vary seed so a missed i2v path does not reproduce the same noise as clip 1.
                             nxt.seed = int(time.time_ns() % (2**31 - 1)) or 1
+                            prev_mode = (job.params.generation_mode or "").strip().lower()
+                            if prev_mode == "a2v":
+                                # Match Web UI: avoid re-entering A2Vid with last-frame image.
+                                nxt.a2v_visual_i2v_continue = True
                             print(f"  → autocontinue: last frame → job {i + 2:02d}  seed={nxt.seed}")
             else:
                 failed += 1

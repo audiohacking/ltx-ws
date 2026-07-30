@@ -743,9 +743,9 @@ class RequestHandler:
         gen_height = _msg_int("height", self.generator.height)
         gen_width = _msg_int("width", self.generator.width)
         gen_num_steps = _msg_int("num_steps", self.generator.inference_steps)
-        gen_retake_start = _msg_int("retake_start", 1)
-        gen_retake_end = _msg_int("retake_end", gen_retake_start)
-        gen_extend_frames = _msg_int("extend_frames", 2)
+        gen_retake_start = _msg_int("retake_start", 0)
+        gen_retake_end = _msg_int("retake_end", max(gen_retake_start + 1, 12))
+        gen_extend_frames = _msg_int("extend_frames", 15)
         gen_extend_direction = str(msg.get("extend_direction") or "after").strip().lower()
 
         mode = str(msg.get("mode") or msg.get("generation_mode") or "").strip().lower()
