@@ -85,9 +85,15 @@ def _ensure(pkg: str, import_as: str | None = None):
 websockets = _ensure("websockets")
 
 from ltx_mlx_backend import (
+    ENV_PRUNA_VAED_REPO,
+    ENV_VAE_DECODER,
     LocalVideoGenerator,
+    PRUNA_VAED_HF_REPO,
     looks_like_hf_repo_id,
     preview_mlx_weights_source,
+    preview_pruna_vae_source,
+    pruna_vaed_repo_id,
+    set_vae_decoder_variant,
 )
 
 # ── Constants / defaults ───────────────────────────────────────────────────────
@@ -958,11 +964,13 @@ class RequestHandler:
                 )
 
                 log.info(
-                    "  ✓ generation %s  sent %d KB in %.1fs  (gen=%.1fs)  prompt=%r",
+                    "Generation e2e grandtotal (ws): status=ok id=%s "
+                    "sent_kb=%d gen=%.3fs e2e=%.3fs (%dms) prompt=%r",
                     generation_id,
                     total_bytes // 1024,
-                    e2e_ms / 1000,
                     t_gen,
+                    e2e_ms / 1000,
+                    int(e2e_ms),
                     prompt[:72],
                 )
             except websockets.exceptions.ConnectionClosed:
@@ -1192,6 +1200,16 @@ examples:
         ),
     )
     mdl.add_argument(
+        "--vae-decoder",
+        choices=["stock", "pruna"],
+        default=None,
+        help=(
+            "Video VAE decoder: 'stock' (default) or 'pruna' (PrunaVAED pruned decoder). "
+            f"Override via {ENV_VAE_DECODER}=pruna. Weights from "
+            f"{PRUNA_VAED_HF_REPO} (override with {ENV_PRUNA_VAED_REPO})."
+        ),
+    )
+    mdl.add_argument(
         "--lora",
         action="append",
         nargs=2,
@@ -1341,6 +1359,12 @@ def main() -> None:
                 parser.error("--lora path/repo cannot be empty")
             default_loras.append((path, scale))
 
+    vae_decoder = (args.vae_decoder or os.environ.get(ENV_VAE_DECODER, "stock") or "stock").strip().lower()
+    try:
+        set_vae_decoder_variant(vae_decoder)
+    except ValueError as exc:
+        parser.error(str(exc))
+
     # ── Validate / adjust num_frames ─────────────────────────────────────────
     valid_frames = _nearest_valid_frames(args.num_frames)
     if valid_frames != args.num_frames:
@@ -1406,6 +1430,13 @@ def main() -> None:
         print("  LoRA     : enabled (no defaults configured)")
     else:
         print("  LoRA     : disabled (use --enable-lora)")
+    if vae_decoder == "pruna":
+        _pruna_preview = preview_pruna_vae_source()
+        print(
+            f"  VAE dec  : pruna  (HuggingFace → {_pruna_preview}  ({pruna_vaed_repo_id()}))"
+        )
+    else:
+        print(f"  VAE dec  : {vae_decoder}")
     print(f"  low_mem  : {args.mlx_low_memory}")
     if args.upscale:
         print(
@@ -1446,6 +1477,12 @@ def main() -> None:
     if default_loras:
         log.info("Resolving global LoRA(s) before accepting connections …")
         generator.ensure_default_loras_ready()
+    if vae_decoder == "pruna":
+        log.info(
+            "PrunaVAED decoder ready (%s → %s)",
+            pruna_vaed_repo_id(),
+            preview_pruna_vae_source(),
+        )
     log.info("Server ready — model path resolved; first used pipeline loads on demand.")
 
     # ── Start server ──────────────────────────────────────────────────────────
