@@ -14,6 +14,7 @@ from ltx_mlx_backend import (
     KEYFRAME_DEFAULT_CFG,
     KEYFRAME_DEV_TRANSFORMER,
     KEYFRAME_DISTILLED_LORA,
+    LocalVideoGenerator,
     RETAKE_EXTEND_DEFAULT_STG,
     _apply_optional_generate_kwargs,
     _clamp_a2v_stage1_steps,
@@ -32,6 +33,32 @@ def test_no_regen_audio_maps_to_regenerate_audio_false():
 def test_clamp_a2v_stage1_steps_raises_distilled_default():
     assert _clamp_a2v_stage1_steps(8) == A2V_DEFAULT_STAGE1_STEPS
     assert _clamp_a2v_stage1_steps(24) == 24
+
+
+def test_a2v_visual_continue_keeps_distilled_steps():
+    """I2V+mux continue must not inherit A2V CFG step clamp (same class of bug as I2V→one_stage)."""
+    from ltx_mlx_backend import _a2v_effective_stage1_steps
+
+    assert _a2v_effective_stage1_steps(8, visual_i2v_continue=True) == 8
+    assert _a2v_effective_stage1_steps(8, visual_i2v_continue=False) == A2V_DEFAULT_STAGE1_STEPS
+    assert _a2v_effective_stage1_steps(24, visual_i2v_continue=False) == 24
+
+
+def test_a2v_with_image_uses_a2v_pipe_not_one_stage():
+    """Optional start image stays on A2VidPipelineTwoStage — not TI2VidOneStagePipeline."""
+    gen = LocalVideoGenerator.__new__(LocalVideoGenerator)
+    gen.upscale = False
+    gen._pipe_classes = {
+        "t2v": object(),
+        "a2v": object(),
+        "one_stage": object(),
+        "i2v": object(),
+    }
+    # Native a2v never goes through _resolve_generate_pipe_key; visual continue does.
+    assert gen._resolve_generate_pipe_key("distilled", has_image=True) == "t2v"
+    assert gen._resolve_generate_pipe_key("distilled", has_image=True) != "one_stage"
+    assert "a2v" in gen._pipe_classes
+    assert gen._pipe_classes["a2v"] is not gen._pipe_classes["one_stage"]
 
 
 def test_retake_extend_default_stg_matches_upstream():

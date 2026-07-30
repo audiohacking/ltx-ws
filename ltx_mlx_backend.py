@@ -1599,6 +1599,19 @@ def _clamp_a2v_stage1_steps(steps: int) -> int:
     return n
 
 
+def _a2v_effective_stage1_steps(steps: int, *, visual_i2v_continue: bool) -> int:
+    """Steps for an a2v job.
+
+    Native A2V (``A2VidPipelineTwoStage``) needs CFG stage-1 depth (~30).
+    Visual autocontinue uses the *generate* profile pipe (distilled I2V by
+    default) + audio mux — keep the caller's steps so we do not re-introduce
+    the slow CFG/one-stage path the I2V profile fix removed.
+    """
+    if visual_i2v_continue:
+        return max(1, int(steps))
+    return _clamp_a2v_stage1_steps(steps)
+
+
 def _frame_rate_from_kwargs(kwargs: dict[str, Any], default: float) -> float:
     if "frame_rate" in kwargs:
         return float(kwargs.pop("frame_rate"))
@@ -3303,7 +3316,10 @@ class LocalVideoGenerator:
                     if mode == "a2v":
                         if not tmp_audio:
                             raise RuntimeError("a2v mode requires audio input")
-                        steps = _clamp_a2v_stage1_steps(steps)
+                        visual_continue = bool(req.a2v_visual_i2v_continue and tmp_image)
+                        steps = _a2v_effective_stage1_steps(
+                            steps, visual_i2v_continue=visual_continue
+                        )
                         common_gen_kwargs["num_steps"] = steps
                         _apply_ltx_mlx_patches(default_fps=self.fps)
                         from ltx_media import load_audio_for_inference
@@ -3319,17 +3335,23 @@ class LocalVideoGenerator:
                                 f"Could not decode audio for a2v (PyAV): {tmp_audio}"
                             )
                         video_duration_s = nf / float(self.fps)
-                        if req.a2v_visual_i2v_continue and tmp_image:
-                            log.info(
-                                "A2V chain continue: i2v visual + audio mux "
-                                "(avoids A2V re-conditioning on autocontinue frame)"
-                            )
+                        if visual_continue:
                             silent_path = os.path.join(tmpdir, "output_silent.mp4")
                             # Same profile pipe as T2V/I2V (distilled by default), not
-                            # a dedicated one-stage CFG pipeline.
-                            pipe_key = self._resolve_generate_pipe_key(profile, has_image=True)
+                            # A2V CFG clamp and not TI2VidOneStagePipeline.
+                            pipe_key = self._resolve_generate_pipe_key(
+                                profile, has_image=True
+                            )
                             pipe = self._get_pipe(pipe_key)
                             last_pipe = pipe
+                            log.info(
+                                "A2V visual continue: I2V profile pipe key=%s (%s) "
+                                "steps=%s image=yes + audio mux "
+                                "(skips A2V CFG clamp / one_stage)",
+                                pipe_key,
+                                type(pipe).__name__,
+                                steps,
+                            )
                             _invoke_generate_and_save(
                                 pipe,
                                 **common_gen_kwargs,
@@ -3345,6 +3367,14 @@ class LocalVideoGenerator:
                         else:
                             pipe = self._get_pipe("a2v")
                             last_pipe = pipe
+                            log.info(
+                                "A2V native: pipe=a2v (%s) steps=%s image=%s "
+                                "(start image is conditioning inside A2VidPipelineTwoStage; "
+                                "not TI2VidOneStagePipeline)",
+                                type(pipe).__name__,
+                                steps,
+                                "yes" if tmp_image else "no",
+                            )
                             _invoke_generate_and_save(
                                 pipe,
                                 **common_gen_kwargs,
